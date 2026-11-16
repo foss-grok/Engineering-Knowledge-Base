@@ -59,6 +59,15 @@ Open [http://localhost:8080](http://localhost:8080).
 
 Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and-Retrieval/`).
 
+### CS Fundamentals
+
+| Track | Path | Pages |
+|-------|------|------:|
+| Hub | [`CS-Fundamentals/cs-fundamentals.html`](CS-Fundamentals/cs-fundamentals.html) | 1 |
+| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 4 |
+
+Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`).
+
 ## Project structure
 
 ```
@@ -72,7 +81,9 @@ Engineering-Knowledge-Base/
 │   ├── search-index.js      # Generated index (commit with content changes)
 │   └── search-index.json
 ├── scripts/
-│   └── build-search-index.ps1
+│   ├── build-search-index.py   # Search index builder (Python 3, no dependencies)
+│   ├── build-search-index.ps1  # Wrapper that calls the Python builder
+│   └── check-links.py          # Internal link and #anchor checker
 └── AI Engineer/
     ├── ai-engineering.html
     ├── index.html           # Redirects to subject hub
@@ -94,11 +105,18 @@ Engineering-Knowledge-Base/
 
 After adding or renaming pages:
 
-```powershell
-powershell -File scripts/build-search-index.ps1
+```bash
+python3 scripts/build-search-index.py
 ```
 
-Commit the updated `assets/search-index.js` and `assets/search-index.json` with your changes.
+(`powershell -File scripts/build-search-index.ps1` still works and calls the same script.) Commit the updated `assets/search-index.js` and `assets/search-index.json` with your changes.
+
+## Checking links
+
+```bash
+python3 scripts/check-links.py            # whole site; exits 1 if any internal link or #anchor is broken
+python3 scripts/check-links.py AI\ Engineer   # one folder
+```
 
 ## Contributing
 

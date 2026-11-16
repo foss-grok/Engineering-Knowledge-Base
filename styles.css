@@ -859,3 +859,18 @@ header .badge-interview {
     transition: none !important;
   }
 }
+
+/* Small screens: let wide tables scroll sideways instead of overflowing the page */
+@media (max-width: 720px) {
+  .learn-page table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+/* Keep in-page anchor targets from sitting flush against the top edge */
+main section[id] {
+  scroll-margin-top: 1rem;
+}

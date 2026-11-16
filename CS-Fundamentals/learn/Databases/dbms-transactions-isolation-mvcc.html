@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Transactions, Isolation Levels &amp; MVCC | CS Fundamentals</title>
+  <meta name="description" content="Database transactions from zero: ACID in plain words, write-ahead logging, every concurrency anomaly drawn as a timeline, SQL isolation levels and what PostgreSQL and MySQL really do, MVCC internals, locking, deadlocks, and a double-booking scenario fixed four ways.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Transactions &amp; MVCC</p>
+  </nav>
+  <h1>Transactions, Isolation Levels &amp; MVCC</h1>
+  <p>Why two people withdrawing money at the same time can break a bank, and the exact tools databases use to stop it. Every anomaly is shown as a step-by-step timeline you can reproduce in two terminals.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Transactions Exist</a></li>
+    <li><a href="#acid">ACID in Plain Words</a></li>
+    <li><a href="#wal">Atomicity and Durability: the Write-Ahead Log</a></li>
+    <li><a href="#anomalies">Concurrency Anomalies, One Timeline Each</a></li>
+    <li><a href="#levels">Isolation Levels</a></li>
+    <li><a href="#mvcc">MVCC: How Readers and Writers Stop Blocking Each Other</a></li>
+    <li><a href="#locking">Locks, Two-Phase Locking, and Deadlocks</a></li>
+    <li><a href="#lab">Hands-On Lab: Reproduce It in PostgreSQL</a></li>
+    <li><a href="#scenario">Scenario: The Double-Booked Seat</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Transactions Exist</h2>
+    <p>Moving 100 from Alice to Bob takes two writes:</p>
+    <pre><code>UPDATE accounts SET balance = balance - 100 WHERE owner = 'alice';
+UPDATE accounts SET balance = balance + 100 WHERE owner = 'bob';</code></pre>
+    <p>Two things can go wrong:</p>
+    <ol>
+      <li><strong>Failure in the middle.</strong> The server crashes after the first line. Alice lost 100, Bob got nothing. Money vanished.</li>
+      <li><strong>Interference.</strong> While this runs, another request reads both balances and sees the "in between" state, or changes Alice's balance at the same moment.</li>
+    </ol>
+    <p>A <strong>transaction</strong> groups several operations into one logical unit. Either all of them happen or none do, and concurrent transactions are kept from stepping on each other.</p>
+    <pre><code>BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE owner = 'alice';
+UPDATE accounts SET balance = balance + 100 WHERE owner = 'bob';
+COMMIT;      -- make it permanent
+-- or ROLLBACK;  to undo everything since BEGIN</code></pre>
+  </section>
+
+  <section id="acid">
+    <h2>2. ACID in Plain Words</h2>
+    <table>
+      <thead><tr><th>Letter</th><th>Promise</th><th>How databases keep it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A</strong>tomicity</td><td>All or nothing. A half-done transaction never stays.</td><td>Undo information and the write-ahead log; on crash, unfinished work is discarded</td></tr>
+        <tr><td><strong>C</strong>onsistency</td><td>A transaction takes the data from one valid state to another valid state.</td><td>Constraints (<code>NOT NULL</code>, <code>UNIQUE</code>, <code>CHECK</code>, foreign keys) plus <em>your</em> application logic</td></tr>
+        <tr><td><strong>I</strong>solation</td><td>Concurrent transactions do not see each other's half-done work, as if they ran one at a time (to a configurable degree).</td><td>Locks and/or MVCC snapshots</td></tr>
+        <tr><td><strong>D</strong>urability</td><td>Once <code>COMMIT</code> returns, the change survives a crash or power loss.</td><td>Flushing the log to stable storage (<code>fsync</code>) before acknowledging commit; replication</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Note:</strong> the "C" is partly your job. The database cannot know that "total money must stay constant" unless you encode it. A <code>CHECK (balance &gt;= 0)</code> constraint is something it <em>can</em> enforce for you.
+    </div>
+  </section>
+
+  <section id="wal">
+    <h2>3. Atomicity and Durability: the Write-Ahead Log</h2>
+    <p>Data files are big and written in pages (8 KiB in PostgreSQL, 16 KiB in InnoDB). Writing every changed page to disk at every commit would be slow and random. Instead, databases use a <strong>write-ahead log (WAL)</strong>, also called a redo log or journal.</p>
+    <h3>The one rule</h3>
+    <p><strong>Before a changed data page is written to disk, the log record describing that change must already be on disk.</strong></p>
+    <h3>Commit, step by step</h3>
+    <ol>
+      <li>The transaction changes pages <em>in memory</em> (the buffer pool). They are now "dirty".</li>
+      <li>Each change also appends a small record to the WAL buffer: "in page 42, slot 3, balance 500 became 400".</li>
+      <li>On <code>COMMIT</code>, the database appends a commit record and flushes the WAL up to that point with <code>fsync</code>. The log is sequential, so this is fast.</li>
+      <li>Only now does <code>COMMIT</code> return success to the client.</li>
+      <li>Dirty data pages are written later, in the background, at a <strong>checkpoint</strong>.</li>
+    </ol>
+    <h3>Crash recovery</h3>
+    <p>After a crash, the database reads the WAL from the last checkpoint and <strong>redoes</strong> every logged change. Transactions with a commit record are restored (durability). Transactions without one never become visible (atomicity): in PostgreSQL their row versions are simply ignored as "aborted"; in InnoDB they are rolled back using the undo log.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> the WAL is a chef's order slip. Before cooking anything, the order is written down. If the kitchen catches fire, you rebuild from the slips. Writing a slip is much faster than finishing the dish, so you can promise the customer "your order is safe" early.
+    </div>
+    <p>The same log also feeds <strong>replication</strong> (replicas replay the WAL) and <strong>change data capture</strong> (tools like Debezium read it to stream changes to Kafka).</p>
+  </section>
+
+  <section id="anomalies">
+    <h2>4. Concurrency Anomalies, One Timeline Each</h2>
+    <p>Start state for all examples: Alice has 500, Bob has 300. T1 and T2 are two transactions running at the same time. Time goes down.</p>
+
+    <h3>4.1 Dirty read: reading uncommitted data</h3>
+    <table>
+      <thead><tr><th>Step</th><th>T1</th><th>T2</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>UPDATE ... alice = 400</code></td><td></td></tr>
+        <tr><td>2</td><td></td><td><code>SELECT alice</code> sees <strong>400</strong></td></tr>
+        <tr><td>3</td><td><code>ROLLBACK</code></td><td></td></tr>
+        <tr><td>4</td><td></td><td>Acts on 400, a value that never officially existed</td></tr>
+      </tbody>
+    </table>
+
+    <h3>4.2 Non-repeatable read: same row, two different answers</h3>
+    <table>
+      <thead><tr><th>Step</th><th>T1</th><th>T2</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>SELECT alice</code> = 500</td><td></td></tr>
+        <tr><td>2</td><td></td><td><code>UPDATE alice = 400; COMMIT</code></td></tr>
+        <tr><td>3</td><td><code>SELECT alice</code> = <strong>400</strong></td><td></td></tr>
+      </tbody>
+    </table>
+    <p>Inside one transaction, the same question gave two answers. A report that sums rows while they change will be wrong.</p>
+
+    <h3>4.3 Phantom read: new rows appear</h3>
+    <table>
+      <thead><tr><th>Step</th><th>T1</th><th>T2</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>SELECT count(*) WHERE balance &gt; 100</code> = 2</td><td></td></tr>
+        <tr><td>2</td><td></td><td><code>INSERT carol, 900; COMMIT</code></td></tr>
+        <tr><td>3</td><td>Same query = <strong>3</strong></td><td></td></tr>
+      </tbody>
+    </table>
+    <p>No existing row changed. A new row matching the condition appeared, a "phantom".</p>
+
+    <h3>4.4 Lost update: one write silently overwrites another</h3>
+    <p>Two withdrawals of 100 and 50 from Alice. The application reads, computes in code, then writes the result.</p>
+    <table>
+      <thead><tr><th>Step</th><th>T1 (withdraw 100)</th><th>T2 (withdraw 50)</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>SELECT</code> = 500</td><td></td></tr>
+        <tr><td>2</td><td></td><td><code>SELECT</code> = 500</td></tr>
+        <tr><td>3</td><td><code>UPDATE SET balance = 400</code></td><td></td></tr>
+        <tr><td>4</td><td></td><td><code>UPDATE SET balance = 450</code> (waits for T1's row lock)</td></tr>
+        <tr><td>5</td><td><code>COMMIT</code></td><td></td></tr>
+        <tr><td>6</td><td></td><td>update proceeds; <code>COMMIT</code></td></tr>
+      </tbody>
+    </table>
+    <p>Final balance <strong>450</strong>. It should be 350. T1's withdrawal was lost. This is one of the most common real bugs in web apps, and the default isolation level of PostgreSQL does not prevent it when you compute values in application code.</p>
+
+    <h3>4.5 Write skew: two valid decisions, one invalid result</h3>
+    <p>Rule: at least one doctor must be on call. Alice and Bob are both on call. Both feel sick at the same time.</p>
+    <table>
+      <thead><tr><th>Step</th><th>T1 (Alice)</th><th>T2 (Bob)</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>SELECT count(*) WHERE on_call</code> = 2</td><td></td></tr>
+        <tr><td>2</td><td></td><td><code>SELECT count(*) WHERE on_call</code> = 2</td></tr>
+        <tr><td>3</td><td>2 &gt; 1, OK. <code>UPDATE alice SET on_call = false</code></td><td></td></tr>
+        <tr><td>4</td><td></td><td>2 &gt; 1, OK. <code>UPDATE bob SET on_call = false</code></td></tr>
+        <tr><td>5</td><td><code>COMMIT</code></td><td><code>COMMIT</code></td></tr>
+      </tbody>
+    </table>
+    <p>Nobody is on call. The two transactions wrote <em>different</em> rows, so there was no write conflict and no lock to wait for. Each decision was correct given what it read, but the reads became stale. Only true serializable isolation (or explicit locking) catches this.</p>
+  </section>
+
+  <section id="levels">
+    <h2>5. Isolation Levels</h2>
+    <p>Full isolation costs performance, so SQL lets you choose. The SQL standard defines four levels by which anomalies they allow:</p>
+    <table>
+      <thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th></tr></thead>
+      <tbody>
+        <tr><td>Read Uncommitted</td><td>possible</td><td>possible</td><td>possible</td></tr>
+        <tr><td>Read Committed</td><td>prevented</td><td>possible</td><td>possible</td></tr>
+        <tr><td>Repeatable Read</td><td>prevented</td><td>prevented</td><td>possible</td></tr>
+        <tr><td>Serializable</td><td>prevented</td><td>prevented</td><td>prevented</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Serializable</strong> means the result equals <em>some</em> one-at-a-time order of the transactions. It prevents every anomaly above, including lost update and write skew.</p>
+
+    <h3>What real databases actually do</h3>
+    <p>The standard table is a minimum. Real engines differ, and these details matter in production:</p>
+    <table>
+      <thead><tr><th>Level</th><th>PostgreSQL</th><th>MySQL InnoDB</th></tr></thead>
+      <tbody>
+        <tr><td>Default</td><td><strong>Read Committed</strong></td><td><strong>Repeatable Read</strong></td></tr>
+        <tr><td>Read Uncommitted</td><td>Behaves exactly like Read Committed (no dirty reads ever)</td><td>Allows dirty reads</td></tr>
+        <tr><td>Read Committed</td><td>Each <em>statement</em> sees a fresh snapshot of committed data</td><td>Each consistent read sees a fresh snapshot</td></tr>
+        <tr><td>Repeatable Read</td><td><strong>Snapshot isolation</strong>: one snapshot for the whole transaction, so no phantoms either. If you try to update a row someone else changed and committed after your snapshot, you get a serialization error. Write skew is still possible.</td><td>Plain <code>SELECT</code>s read one snapshot. But <code>UPDATE</code>, <code>DELETE</code>, and locking reads act on the <em>latest committed</em> rows and take next-key locks. Lost updates in read-then-write code are not detected.</td></tr>
+        <tr><td>Serializable</td><td><strong>Serializable Snapshot Isolation (SSI)</strong>: tracks read/write dependencies and aborts a transaction if a cycle could form. No extra blocking.</td><td>Like Repeatable Read, but plain <code>SELECT</code>s become locking reads (<code>FOR SHARE</code>) when autocommit is off, so conflicts block instead of abort.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Rule for app code:</strong> at Repeatable Read or Serializable in PostgreSQL, a transaction can fail with SQLSTATE <code>40001</code> (<code>serialization_failure</code>). This is expected, not a bug. Your code must <strong>retry the whole transaction</strong>.
+    </div>
+    <pre><code>BEGIN ISOLATION LEVEL SERIALIZABLE;
+-- ...
+COMMIT;
+
+-- or for the session
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;</code></pre>
+  </section>
+
+  <section id="mvcc">
+    <h2>6. MVCC: How Readers and Writers Stop Blocking Each Other</h2>
+    <p>Old databases used only locks: a writer locks a row, and readers wait. Reports would freeze the checkout page. <strong>Multi-Version Concurrency Control (MVCC)</strong> keeps <em>several versions</em> of each row. Writers create new versions; readers look at the version that was current for them. <strong>Readers never block writers, and writers never block readers.</strong> Writers still block other writers of the same row.</p>
+
+    <h3>How PostgreSQL does it</h3>
+    <p>Every transaction gets a transaction ID (XID). Every row version (a "tuple") carries two hidden fields:</p>
+    <ul>
+      <li><code>xmin</code>: the XID that created this version.</li>
+      <li><code>xmax</code>: the XID that deleted or replaced it (0 if still live).</li>
+    </ul>
+    <p>An <code>UPDATE</code> does not overwrite. It marks the old version's <code>xmax</code> and inserts a new version with a new <code>xmin</code>.</p>
+    <pre><code>Alice's row after: XID 100 inserts it, XID 205 updates 500 -&gt; 400
+
+  version   xmin   xmax   balance
+  v1        100    205    500       (old, replaced by 205)
+  v2        205    0      400       (current)</code></pre>
+    <p>A <strong>snapshot</strong> records which transactions had committed when it was taken. The visibility rule, simplified: <em>a version is visible if its creator (xmin) had committed as of my snapshot, and its deleter (xmax) had not.</em></p>
+    <ul>
+      <li>A snapshot taken before XID 205 committed sees v1 (500): v2's creator is not visible yet, and v1's deleter is not visible yet.</li>
+      <li>A snapshot taken after sees v2 (400).</li>
+    </ul>
+    <p>You can see these fields yourself:</p>
+    <pre><code>SELECT xmin, xmax, * FROM accounts;
+SELECT txid_current();     -- or pg_current_xact_id() on PostgreSQL 13+</code></pre>
+    <h3>The cost: dead versions and VACUUM</h3>
+    <p>Old versions that no running transaction can see anymore are "dead tuples". They waste space and slow scans. PostgreSQL's <strong>VACUUM</strong> (run automatically by <em>autovacuum</em>) reclaims them. A transaction left open for hours keeps an old snapshot alive, so VACUUM cannot clean anything newer than it, and tables bloat.</p>
+    <h3>How InnoDB does it</h3>
+    <p>InnoDB (MySQL) updates rows <em>in place</em> and writes the old values to an <strong>undo log</strong>. A reader that needs an older version follows the undo chain backwards to rebuild it. A background "purge" thread removes undo records no one needs. Oracle uses a similar undo-based design.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> MVCC is like a shared document with full version history. Each reader is handed a frozen copy as of the moment they started. Writers keep editing the live copy. The cleanup crew deletes old versions once nobody is looking at them.
+    </div>
+  </section>
+
+  <section id="locking">
+    <h2>7. Locks, Two-Phase Locking, and Deadlocks</h2>
+    <h3>Lock modes</h3>
+    <ul>
+      <li><strong>Shared (S) lock:</strong> "I am reading this; do not change it." Many transactions can hold S on the same row.</li>
+      <li><strong>Exclusive (X) lock:</strong> "I am changing this." Conflicts with everything else.</li>
+    </ul>
+    <p>In MVCC databases, plain reads take no row locks. Writes take X locks on the rows they change, held until commit. You can ask for locks explicitly:</p>
+    <pre><code>SELECT * FROM accounts WHERE owner = 'alice' FOR UPDATE;  -- X-style row lock
+SELECT * FROM accounts WHERE owner = 'alice' FOR SHARE;   -- S-style row lock
+SELECT * FROM jobs WHERE status = 'new'
+  ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;            -- job-queue pattern</code></pre>
+    <h3>Two-Phase Locking (2PL)</h3>
+    <p>Classic serializability via locks: a transaction has a <strong>growing phase</strong> (it may acquire locks, never release) followed by a <strong>shrinking phase</strong> (it may release, never acquire). <strong>Strict 2PL</strong>, used in practice, holds all write locks until commit or abort, so nobody reads uncommitted data. 2PL guarantees serializable schedules, but readers and writers block each other and deadlocks are possible.</p>
+    <h3>Deadlock, step by step</h3>
+    <table>
+      <thead><tr><th>Step</th><th>T1 (Alice pays Bob)</th><th>T2 (Bob pays Alice)</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>lock Alice's row (update)</td><td></td></tr>
+        <tr><td>2</td><td></td><td>lock Bob's row (update)</td></tr>
+        <tr><td>3</td><td>wants Bob's row: <strong>waits for T2</strong></td><td></td></tr>
+        <tr><td>4</td><td></td><td>wants Alice's row: <strong>waits for T1</strong></td></tr>
+      </tbody>
+    </table>
+    <p>A cycle in the "waits-for" graph: T1 &rarr; T2 &rarr; T1. Neither can ever proceed. PostgreSQL checks for cycles after a lock wait exceeds <code>deadlock_timeout</code> (default 1 second) and aborts one transaction with <code>ERROR: deadlock detected</code> (SQLSTATE <code>40P01</code>). InnoDB detects deadlocks immediately by default.</p>
+    <p><strong>Prevention:</strong> always lock rows in a consistent order, for example by ascending account ID. Then T2 would also lock Alice first, wait at step 2, and no cycle can form.</p>
+    <pre><code>-- transfer(from, to): lock both rows in id order first
+SELECT id FROM accounts WHERE id IN (:from, :to) ORDER BY id FOR UPDATE;</code></pre>
+  </section>
+
+  <section id="lab">
+    <h2>8. Hands-On Lab: Reproduce It in PostgreSQL</h2>
+    <p>You only need Docker and two terminals. Doing this once teaches more than reading about it ten times. (Every result below was reproduced on PostgreSQL 17.5 while writing this page.)</p>
+    <pre><code>docker run -d --name pglab -e POSTGRES_PASSWORD=pw postgres:17
+docker exec -it pglab psql -U postgres     # run this in TWO terminals: A and B</code></pre>
+    <pre><code>-- in A, once
+CREATE TABLE accounts (id int PRIMARY KEY, owner text, balance int CHECK (balance &gt;= 0));
+INSERT INTO accounts VALUES (1, 'alice', 500), (2, 'bob', 300);
+CREATE TABLE doctors (name text PRIMARY KEY, on_call boolean);
+INSERT INTO doctors VALUES ('alice', true), ('bob', true);</code></pre>
+
+    <h3>Experiment 1: lost update at Read Committed</h3>
+    <table>
+      <thead><tr><th>Terminal A</th><th>Terminal B</th></tr></thead>
+      <tbody>
+        <tr><td><code>BEGIN;</code><br><code>SELECT balance FROM accounts WHERE id=1;</code> (500)</td><td></td></tr>
+        <tr><td></td><td><code>BEGIN;</code><br><code>SELECT balance FROM accounts WHERE id=1;</code> (500)</td></tr>
+        <tr><td><code>UPDATE accounts SET balance=400 WHERE id=1;</code></td><td></td></tr>
+        <tr><td></td><td><code>UPDATE accounts SET balance=450 WHERE id=1;</code> (hangs)</td></tr>
+        <tr><td><code>COMMIT;</code></td><td>(unblocks) <code>COMMIT;</code></td></tr>
+      </tbody>
+    </table>
+    <p>Check: <code>SELECT balance FROM accounts WHERE id=1;</code> gives 450. Lost update reproduced. Reset with <code>UPDATE accounts SET balance=500 WHERE id=1;</code></p>
+
+    <h3>Experiment 2: the same thing, fixed by an atomic update</h3>
+    <p>Repeat, but write <code>UPDATE accounts SET balance = balance - 100 WHERE id=1;</code> in A and <code>... balance - 50 ...</code> in B. When B unblocks, PostgreSQL re-reads the <em>newly committed</em> row (400) and applies <code>- 50</code> to it. Final: 350. Correct.</p>
+
+    <h3>Experiment 3: Repeatable Read catches the conflict</h3>
+    <p>Repeat Experiment 1 but start both with <code>BEGIN ISOLATION LEVEL REPEATABLE READ;</code>. When A commits, B's update fails:</p>
+    <pre><code>ERROR:  could not serialize access due to concurrent update</code></pre>
+    <p>B must <code>ROLLBACK</code> and retry from the beginning, now reading 400.</p>
+
+    <h3>Experiment 4: write skew passes Repeatable Read, fails Serializable</h3>
+    <ol>
+      <li>Both terminals: <code>BEGIN ISOLATION LEVEL REPEATABLE READ;</code> and <code>SELECT count(*) FROM doctors WHERE on_call;</code> (2).</li>
+      <li>A: <code>UPDATE doctors SET on_call=false WHERE name='alice';</code> B: same for <code>'bob'</code>.</li>
+      <li>Both <code>COMMIT;</code>. Both succeed. Zero doctors on call.</li>
+      <li>Reset both to true and repeat with <code>ISOLATION LEVEL SERIALIZABLE</code>. Now the second <code>COMMIT</code> fails with <code>ERROR: could not serialize access due to read/write dependencies among transactions</code>. Retry it, and it will see only 1 doctor on call and refuse.</li>
+    </ol>
+  </section>
+
+  <section id="scenario">
+    <h2>9. Scenario: The Double-Booked Seat</h2>
+    <p><strong>Situation.</strong> A ticketing site sells concert seats. The booking code does:</p>
+    <pre><code>seat = db.query("SELECT status FROM seats WHERE id = 42")
+if seat.status == "free":
+    db.execute("UPDATE seats SET status='sold', buyer=%s WHERE id = 42", user)
+    charge_card(user)</code></pre>
+    <p>On a busy launch, support tickets arrive: two people paid for seat 42. The logs show both requests within the same 20 ms.</p>
+    <h3>Diagnosis</h3>
+    <p>This is check-then-act across two statements, the lost-update pattern. Both requests read "free" before either wrote "sold". At Read Committed, nothing stops it.</p>
+    <h3>Four fixes, from simplest</h3>
+    <ol>
+      <li><strong>Make the check part of the write (conditional update).</strong> Then check how many rows changed.
+        <pre><code>UPDATE seats SET status='sold', buyer=$1
+WHERE id = 42 AND status = 'free';
+-- 1 row updated: you got it. 0 rows: someone else did.</code></pre>
+        The second request waits on the row lock, then re-checks <code>status = 'free'</code> on the new version, finds it false, and updates 0 rows.</li>
+      <li><strong>Lock the row while deciding:</strong> <code>SELECT ... FOR UPDATE</code> inside a transaction. The second request blocks until the first commits, then sees "sold".</li>
+      <li><strong>Let a constraint enforce it.</strong> A table <code>bookings(seat_id PRIMARY KEY, ...)</code>: a second <code>INSERT</code> for the same seat fails with a unique violation. Constraints are the most robust guard, because they hold no matter which code path writes.</li>
+      <li><strong>Run at <code>SERIALIZABLE</code> and retry on 40001.</strong> The most general fix, and it also covers write-skew cases that span many rows.</li>
+    </ol>
+    <p>Also: charge the card <em>after</em> the booking commits (or use a payment hold), never inside a transaction that might roll back.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>10. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Assuming the default level is serializable.</strong> PostgreSQL, SQL Server, and Oracle default to Read Committed; MySQL to Repeatable Read. None defaults to Serializable.</li>
+      <li><strong>No retry logic.</strong> Using Repeatable Read or Serializable without retrying on serialization failures turns safe aborts into user-facing errors.</li>
+      <li><strong>Long or idle transactions.</strong> They hold locks and old snapshots, block VACUUM, and cause bloat. Watch for <code>idle in transaction</code> in <code>pg_stat_activity</code> and set <code>idle_in_transaction_session_timeout</code>.</li>
+      <li><strong>Slow external calls inside a transaction.</strong> An HTTP call to a payment API while holding row locks makes every other request wait.</li>
+      <li><strong>Inconsistent lock order.</strong> The main cause of deadlocks.</li>
+      <li><strong>Trusting ORMs blindly.</strong> "Load object, change field, save" is read-then-write. Use atomic updates, <code>select_for_update</code>, or optimistic locking with a version column (<code>UPDATE ... SET version = version + 1 WHERE id = ? AND version = ?</code>).</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>11. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Need</th><th>Tool</th></tr></thead>
+      <tbody>
+        <tr><td>Increment or decrement safely</td><td><code>UPDATE ... SET x = x - 1</code></td></tr>
+        <tr><td>Check then act on one row</td><td>Conditional <code>UPDATE ... WHERE state = 'expected'</code>, or <code>SELECT ... FOR UPDATE</code></td></tr>
+        <tr><td>Uniqueness</td><td><code>UNIQUE</code> / <code>PRIMARY KEY</code> constraint</td></tr>
+        <tr><td>Rules across many rows</td><td><code>SERIALIZABLE</code> + retry on <code>40001</code></td></tr>
+        <tr><td>Work queue with many workers</td><td><code>FOR UPDATE SKIP LOCKED</code></td></tr>
+        <tr><td>Avoid deadlocks</td><td>Lock in a fixed order; keep transactions short</td></tr>
+        <tr><td>Durability</td><td>WAL flushed on commit</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="noopener noreferrer">PostgreSQL docs: Transaction Isolation</a> &middot; <a href="https://www.postgresql.org/docs/current/mvcc.html" rel="noopener noreferrer">PostgreSQL docs: Concurrency Control</a> &middot; <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html" rel="noopener noreferrer">MySQL InnoDB isolation levels</a> &middot; <a href="https://dataintensive.net/" rel="noopener noreferrer">Designing Data-Intensive Applications, chapter 7</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> &middot; <a href="../../../AI Engineer/learn/Prompting-and-Retrieval/ai-engineering-vector-databases.html">Vector Databases</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-storage.html">Kubernetes Storage</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

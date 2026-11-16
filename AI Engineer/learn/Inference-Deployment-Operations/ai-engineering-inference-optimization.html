@@ -5,84 +5,287 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
   <title>Inference Optimization | AI Engineering</title>
+  <meta name="description" content="LLM inference from zero: prefill vs decode, why decoding is memory-bound, KV cache memory math, PagedAttention, continuous batching, chunked prefill, prefix caching, speculative decoding, quantization, disaggregated serving, latency metrics, and GPU capacity planning with worked numbers.">
   <link rel="stylesheet" href="../../../styles.css">
 </head>
 <body class="learn-page">
 <header>
   <nav aria-label="Breadcrumb">
-    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; Inference Optimization</p>
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Inference Optimization</p>
   </nav>
   <h1>Inference Optimization</h1>
-  <p>Techniques to reduce latency, memory, and cost when serving language models in production.</p>
+  <p>How LLM servers turn one expensive GPU into hundreds of fast chat sessions. Built up from first principles: what happens per token, where the memory goes, and every major trick (KV cache, PagedAttention, batching, speculative decoding, quantization) with worked numbers.</p>
 </header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#how-generation-works">How Generation Works: Prefill and Decode</a></li>
+    <li><a href="#metrics">Latency and Throughput Metrics</a></li>
+    <li><a href="#memory-bound">Why Decoding Is Memory-Bound</a></li>
+    <li><a href="#kv-cache">The KV Cache and Its Memory Math</a></li>
+    <li><a href="#paged-attention">PagedAttention: Virtual Memory for the KV Cache</a></li>
+    <li><a href="#batching">Batching and Scheduling</a></li>
+    <li><a href="#speculative">Speculative Decoding</a></li>
+    <li><a href="#quantization">Quantization</a></li>
+    <li><a href="#parallelism">Multi-GPU Serving and Disaggregation</a></li>
+    <li><a href="#capacity">Worked Example: Capacity Planning One GPU</a></li>
+    <li><a href="#scenario">Scenario: p95 Latency Spikes in a Chatbot</a></li>
+    <li><a href="#frameworks">Kernels and Frameworks</a></li>
+    <li><a href="#app-level">Application-Level Optimizations</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+  </ol>
+</nav>
+
 <main class="article">
 
-  <section>
-    <h2>Inference vs Training</h2>
-    <p>Training is throughput-bound over many epochs. Inference is latency and cost per request. The dominant cost at serving time is autoregressive decoding: each generated token requires a forward pass through the full model, and long contexts amplify memory via the KV cache.</p>
-    <p>Optimization targets include time-to-first-token (TTFT), inter-token latency, tokens per second per dollar, and maximum concurrent users on fixed hardware.</p>
+  <section id="how-generation-works">
+    <h2>1. How Generation Works: Prefill and Decode</h2>
+    <p>An LLM generates text one <strong>token</strong> (a word piece, roughly 3 to 4 characters of English) at a time. Each new token depends on all tokens before it. Serving a request has two very different phases:</p>
+    <ol>
+      <li><strong>Prefill:</strong> the model reads the whole prompt (say 2,000 tokens) in <em>one</em> forward pass, processing all prompt tokens in parallel. It produces the first output token.</li>
+      <li><strong>Decode:</strong> the model generates the remaining tokens <em>one per forward pass</em>. Token 2 needs a pass, token 3 another pass, and so on. A 500-token answer needs about 500 sequential passes.</li>
+    </ol>
+    <pre><code>Prompt: "Explain TCP in one line"           (6 tokens)
+
+prefill:  [Explain][TCP][in][one][line] ... -&gt; "TCP"        1 pass, all prompt tokens at once
+decode:   ... + "TCP"                       -&gt; "is"         1 pass
+decode:   ... + "is"                        -&gt; "a"          1 pass
+decode:   ... + "a"                         -&gt; "reliable"   1 pass
+...until an end-of-sequence token or max_tokens</code></pre>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> prefill is reading the question; decode is writing the answer one word at a time while re-checking everything written so far. Reading is fast because you can scan many words at once. Writing is slow because each word waits for the previous one.
+    </div>
+    <p>The two phases stress the hardware differently, which explains almost every optimization on this page. For the model architecture behind it, see <a href="../Foundations-and-Architecture/ai-engineering-transformers.html">Transformers</a>.</p>
   </section>
 
-  <section>
-    <h2>KV Cache</h2>
-    <p>During decoding, keys and values from prior tokens need not be recomputed. The KV cache stores them per layer and head, growing linearly with sequence length. Memory scales roughly as:</p>
-    <pre><code>2 * num_layers * num_kv_heads * head_dim * seq_len * bytes_per_element</code></pre>
-    <p>GQA and MQA reduce KV heads and shrink cache size. PagedAttention (vLLM) stores KV blocks in non-contiguous pages like OS virtual memory, reducing fragmentation and enabling larger batch concurrency on the same GPU.</p>
-    <pre><code># Launch vLLM with continuous batching and prefix caching
-python -m vllm.entrypoints.openai.api_server \
-  --model meta-llama/Llama-3.2-3B-Instruct \
-  --dtype bfloat16 \
-  --max-model-len 8192 \
-  --enable-prefix-caching \
-  --gpu-memory-utilization 0.90</code></pre>
+  <section id="metrics">
+    <h2>2. Latency and Throughput Metrics</h2>
+    <table>
+      <thead><tr><th>Metric</th><th>Meaning</th><th>Dominated by</th></tr></thead>
+      <tbody>
+        <tr><td><strong>TTFT</strong> (time to first token)</td><td>From request arrival to first output token. What users feel as "it started answering".</td><td>Queueing + prefill</td></tr>
+        <tr><td><strong>TPOT</strong> / ITL (time per output token / inter-token latency)</td><td>Gap between consecutive tokens while streaming</td><td>Decode step time</td></tr>
+        <tr><td><strong>End-to-end latency</strong></td><td><code>TTFT + TPOT * (output_tokens - 1)</code></td><td>Both</td></tr>
+        <tr><td><strong>Throughput</strong></td><td>Total output tokens per second across all users</td><td>Batch size</td></tr>
+        <tr><td><strong>Goodput</strong></td><td>Requests per second that <em>meet</em> the latency targets (SLOs)</td><td>The real business metric</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Worked example:</strong> TTFT 300 ms, TPOT 25 ms, 400 output tokens: <code>0.3 + 0.025 * 399 = 10.3 s</code> end to end. Users read at roughly 5 to 10 tokens per second, so a TPOT of 25 ms (40 tokens/s) streams faster than anyone reads. For chat, TTFT is usually the latency that matters most; for agents and batch jobs, total time and throughput matter more.</p>
+    <p>There is a fundamental <strong>trade-off</strong>: bigger batches raise throughput (cheaper per token) but make each step slower (higher TPOT). Serving is the art of choosing where on that curve to sit.</p>
   </section>
 
-  <section>
-    <h2>Quantization</h2>
-    <p>Lower precision weights and activations cut memory and increase throughput:</p>
+  <section id="memory-bound">
+    <h2>3. Why Decoding Is Memory-Bound</h2>
+    <p>A GPU has two key limits: how fast it <strong>computes</strong> (FLOP/s) and how fast it <strong>moves data</strong> from its memory (HBM) to the compute units (bytes/s).</p>
+    <p>During one decode step with batch size 1, the model must read <strong>every weight once</strong> to produce a single token. Each weight is used for only about 2 floating-point operations (a multiply and an add).</p>
+    <h3>Worked numbers (H100 SXM, Llama 3.1 8B in BF16)</h3>
+    <pre><code>Weights:      8.03 B params * 2 bytes = ~16 GB
+HBM bandwidth: ~3.35 TB/s
+Compute:      ~989 TFLOP/s dense BF16
+
+Time to read all weights once = 16 GB / 3.35 TB/s = ~4.8 ms
+=&gt; upper bound at batch 1: ~1 / 4.8 ms = ~209 tokens/s
+
+Arithmetic intensity at batch 1: ~2 FLOPs per 2 bytes = ~1 FLOP/byte
+GPU "ridge point":               989e12 / 3.35e12  = ~295 FLOP/byte</code></pre>
+    <p>The GPU could do about 295 operations per byte it loads, but decode at batch 1 only does about 1. So the compute units sit idle more than 99% of the time, waiting for memory. This is what <strong>memory-bound</strong> means.</p>
+    <p><strong>The key insight:</strong> if we decode for 64 users in the same step, we read the weights once and use them 64 times. The step takes only a little longer, but we get 64 tokens instead of 1. <strong>Batching is the single biggest lever in LLM serving.</strong></p>
+    <p>Prefill is different: a 2,000-token prompt reuses each weight 2,000 times, so prefill is <strong>compute-bound</strong>. Rough cost: <code>2 * params * prompt_tokens = 2 * 8e9 * 2000 = 32 TFLOP</code>, about 65 ms at 50% of peak compute.</p>
+  </section>
+
+  <section id="kv-cache">
+    <h2>4. The KV Cache and Its Memory Math</h2>
+    <h3>Why it exists</h3>
+    <p>In attention, each new token computes a <strong>query</strong> and compares it with the <strong>keys</strong> of all previous tokens, then takes a weighted mix of their <strong>values</strong>. The keys and values of old tokens never change. Recomputing them at every step would make generation quadratic. So we compute each token's K and V once and <strong>cache</strong> them. That cache is the <strong>KV cache</strong>.</p>
+    <h3>The formula</h3>
+    <pre><code>KV bytes per token = 2 (K and V) * num_layers * num_kv_heads * head_dim * bytes_per_element
+KV bytes per sequence = KV bytes per token * sequence_length</code></pre>
+    <h3>Worked examples</h3>
+    <table>
+      <thead><tr><th>Model</th><th>Layers</th><th>KV heads</th><th>Head dim</th><th>Per token (BF16)</th><th>8K-token sequence</th></tr></thead>
+      <tbody>
+        <tr><td>Llama 3.1 8B (GQA)</td><td>32</td><td>8</td><td>128</td><td>2*32*8*128*2 = 131,072 B = <strong>128 KiB</strong></td><td><strong>1 GiB</strong></td></tr>
+        <tr><td>Same model if it had full multi-head (32 KV heads)</td><td>32</td><td>32</td><td>128</td><td>512 KiB</td><td>4 GiB</td></tr>
+        <tr><td>Llama 3.1 70B (GQA)</td><td>80</td><td>8</td><td>128</td><td>2*80*8*128*2 = 327,680 B = <strong>320 KiB</strong></td><td>2.5 GiB</td></tr>
+      </tbody>
+    </table>
+    <p>So for the 8B model, 50 users each with 8K tokens of context need 50 GiB of KV cache, <strong>three times the size of the model weights</strong>. In long-context serving, the KV cache, not the weights, decides how many users fit on a GPU.</p>
+    <h3>Ways to shrink it</h3>
     <ul>
-      <li><strong>FP16 / BF16</strong> - standard serving baselines</li>
-      <li><strong>INT8 weight-only</strong> - good speedups with modest accuracy loss on many models</li>
-      <li><strong>INT4 / GPTQ / AWQ / GGUF</strong> - aggressive compression for edge and cost-sensitive cloud</li>
-      <li><strong>FP8</strong> - emerging on H100-class hardware with kernel support</li>
+      <li><strong>GQA / MQA</strong> (grouped-query / multi-query attention): many query heads share fewer KV heads. Llama 3 uses 8 KV heads for 32 query heads: 4x smaller cache. This is decided at training time.</li>
+      <li><strong>MLA</strong> (multi-head latent attention, DeepSeek-V2/V3): stores a compressed latent vector per token instead of full K and V.</li>
+      <li><strong>KV cache quantization:</strong> store K and V in FP8 instead of BF16: half the memory, usually small quality loss.</li>
+      <li><strong>Sliding-window attention</strong> on some layers (used by several model families): those layers only keep the last N tokens.</li>
     </ul>
-    <p>Quantization sensitivity varies by model size and task. Always eval after quantizing; math and JSON tasks are often more fragile than open chat.</p>
+    <p class="refer-link"><small>Refer: <a href="https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/blob/main/config.json" rel="noopener noreferrer">Llama 3.1 8B config</a> &middot; <a href="https://arxiv.org/abs/2305.13245" rel="noopener noreferrer">GQA paper</a></small></p>
+  </section>
+
+  <section id="paged-attention">
+    <h2>5. PagedAttention: Virtual Memory for the KV Cache</h2>
+    <h3>The problem</h3>
+    <p>Early servers allocated one <em>contiguous</em> KV buffer per request, sized for the maximum possible length (say 8K tokens), because the final answer length is unknown. A request that ends after 300 tokens wastes the rest. The vLLM authors measured that existing systems used only about <strong>20% to 38%</strong> of KV memory for actual token data. The rest was reserved-but-unused space and fragmentation.</p>
+    <h3>The fix, borrowed from operating systems</h3>
+    <p><strong>PagedAttention</strong> (vLLM, 2023) splits the KV cache into fixed-size <strong>blocks</strong> (for example 16 tokens each), exactly like an OS splits memory into pages. Each request has a <strong>block table</strong> mapping its logical blocks to physical blocks anywhere in GPU memory. A new block is allocated only when the previous one fills up.</p>
+    <pre><code>Request A logical blocks:   [A0][A1][A2]          block table A: 0-&gt;7, 1-&gt;2, 2-&gt;9
+Request B logical blocks:   [B0][B1]              block table B: 0-&gt;4, 1-&gt;11
+
+Physical GPU KV memory:
+ slot:  0   1   2   3   4   5   6   7   8   9   10  11
+       [ ] [ ] [A1][ ] [B0][ ] [ ] [A0][ ] [A2][ ] [B1]
+Waste: at most one partially filled block per request.</code></pre>
+    <p>Results reported in the paper: under 4% KV memory waste and 2 to 4 times higher throughput than earlier systems at the same latency. If you know OS paging, this is the same design: see <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a>.</p>
+    <h3>Bonus: sharing via copy-on-write</h3>
+    <p>Because blocks are referenced through tables, two requests can point at the <strong>same physical blocks</strong>. When you sample 4 answers for one prompt, the prompt's KV blocks are stored once. When requests share a long system prompt, <strong>prefix caching</strong> reuses those blocks across requests, skipping their prefill entirely. SGLang's RadixAttention organizes cached prefixes in a radix tree for the same purpose.</p>
+  </section>
+
+  <section id="batching">
+    <h2>6. Batching and Scheduling</h2>
+    <h3>Static batching (the old way)</h3>
+    <p>Collect N requests, run them together until <em>all</em> finish. A 20-token answer waits for a 1,000-token answer in the same batch, and new arrivals wait for the whole batch. GPU slots sit empty.</p>
+    <h3>Continuous batching (iteration-level scheduling)</h3>
+    <p>Introduced by the Orca paper (2022): the scheduler decides batch membership <strong>at every decode step</strong>. When a sequence finishes, its slot is filled by a waiting request in the very next step. All modern servers (vLLM, SGLang, TensorRT-LLM, TGI) do this. Typical gain over static batching: several times higher throughput.</p>
+    <pre><code>step:      1    2    3    4    5    6    7
+slot 1:   A    A    A    A(done) D  D    D
+slot 2:   B    B(done) E    E    E    E   E
+slot 3:   C    C    C    C    C    F    F       (C done at 5, F joins at 6)</code></pre>
+    <h3>Chunked prefill</h3>
+    <p>A new request with a 30,000-token prompt has a long prefill. If the GPU runs it all at once, every user currently streaming sees a long pause. <strong>Chunked prefill</strong> splits big prefills into chunks (say 2,048 tokens) and mixes each chunk into a normal decode step. Decode users keep streaming smoothly; the long prompt finishes over several steps. It trades a slightly higher TTFT for the big request for stable TPOT for everyone.</p>
+    <h3>Preemption</h3>
+    <p>If KV memory runs out mid-generation, the scheduler pauses some requests and frees their blocks, either swapping them to CPU memory or recomputing them later. You see this in logs as preemption warnings. It is a sign the server is overloaded or <code>max_num_seqs</code> is too high.</p>
+  </section>
+
+  <section id="speculative">
+    <h2>7. Speculative Decoding</h2>
+    <p>Decode is memory-bound: checking 5 tokens costs about the same time as generating 1, because the weights are read once either way. Speculative decoding exploits this:</p>
+    <ol>
+      <li>A cheap <strong>draft</strong> (a small model, extra prediction heads like Medusa/EAGLE, or n-gram lookup from the prompt) guesses the next <code>k</code> tokens.</li>
+      <li>The big <strong>target</strong> model checks all <code>k</code> guesses in <strong>one</strong> forward pass.</li>
+      <li>Guesses are accepted left to right until the first one the target disagrees with. The target supplies the correct token there, so every pass yields at least 1 token.</li>
+    </ol>
+    <p>With the rejection-sampling acceptance rule from the original papers, the output distribution is <strong>exactly the same</strong> as the target model alone. It is a pure speed trick, not an approximation.</p>
+    <h4>Worked example</h4>
+    <p>If each draft token is accepted with probability <code>a</code> (independently) and the draft proposes <code>k</code> tokens, the expected tokens produced per target pass are <code>(1 - a<sup>k+1</sup>) / (1 - a)</code>.</p>
+    <pre><code>a = 0.8, k = 4:  (1 - 0.8^5) / (1 - 0.8) = (1 - 0.328) / 0.2 = ~3.36 tokens per pass</code></pre>
+    <p>Minus the draft's own cost, real speedups are typically 2 to 3 times on predictable text (code, structured output) and less on creative text. It helps most at <strong>small batch sizes</strong>; at large batches the GPU is already busy, so the extra verification work competes with other users.</p>
+  </section>
+
+  <section id="quantization">
+    <h2>8. Quantization</h2>
+    <p>Lower precision weights and activations cut memory and increase throughput, because decode speed is set by bytes moved:</p>
+    <table>
+      <thead><tr><th>Format</th><th>Bytes per weight</th><th>8B model weights</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>FP16 / BF16</td><td>2</td><td>~16 GB</td><td>Standard serving baseline</td></tr>
+        <tr><td>FP8 (W8A8)</td><td>1</td><td>~8 GB</td><td>Native on H100/H200/B200-class GPUs; usually near-lossless</td></tr>
+        <tr><td>INT8 weight-only</td><td>1</td><td>~8 GB</td><td>Good speedups with modest accuracy loss on many models</td></tr>
+        <tr><td>INT4 (GPTQ, AWQ, GGUF Q4)</td><td>~0.5</td><td>~4.5 GB</td><td>Aggressive; great for edge and small batches; check quality</td></tr>
+      </tbody>
+    </table>
+    <p>Quantization sensitivity varies by model size and task. Always evaluate after quantizing; math, code, and strict JSON tasks are often more fragile than open chat. See <a href="ai-engineering-evaluation.html">Evaluation</a>.</p>
     <div class="callout">
-      <strong>Rule:</strong> Quantize weights for memory; consider KV cache quantization separately for very long contexts where cache dominates VRAM.
+      <strong>Rule:</strong> quantize weights to fit and speed up the model; quantize the KV cache separately when long contexts make the cache dominate memory.
     </div>
   </section>
 
-  <section>
-    <h2>Batching and Scheduling</h2>
-    <h3>Continuous batching</h3>
-    <p>Dynamic batching adds new requests to in-flight GPU work as others finish sequences, unlike static batching that waits for padding alignment. Essential for high GPU utilization in chat APIs.</p>
-    <h3>Speculative decoding</h3>
-    <p>A small draft model proposes multiple tokens; the large model verifies them in parallel. Accepted tokens advance faster than one-by-one decoding. Works best when draft and target distributions align.</p>
-    <h3>Prefix caching</h3>
-    <p>Shared system prompts and RAG contexts hash to reused KV blocks across requests, slashing TTFT for repeated prefixes.</p>
+  <section id="parallelism">
+    <h2>9. Multi-GPU Serving and Disaggregation</h2>
+    <ul>
+      <li><strong>Tensor parallelism (TP):</strong> split each layer's matrices across GPUs in one node; they exchange partial results every layer, so they need fast links (NVLink). Used when a model does not fit on one GPU, or to cut per-token latency.</li>
+      <li><strong>Pipeline parallelism (PP):</strong> different layers on different GPUs or nodes. Less communication, but adds pipeline bubbles.</li>
+      <li><strong>Data parallelism (replicas):</strong> full copies behind a load balancer. Simplest way to scale throughput.</li>
+      <li><strong>Expert parallelism (EP):</strong> for mixture-of-experts models, experts live on different GPUs and tokens are routed to them.</li>
+    </ul>
+    <h3>Trend: disaggregated prefill and decode</h3>
+    <p>Prefill is compute-bound; decode is memory-bound. Putting both on the same GPU means they interfere. <strong>Disaggregated serving</strong> runs prefill on one pool of GPUs and decode on another, and transfers the KV cache between them over fast networking. Research systems (DistServe, Splitwise) showed large goodput gains, and production stacks such as NVIDIA Dynamo and llm-d (Kubernetes-native) adopted the idea in 2025. KV-cache-aware routing (sending a request to the replica that already holds its prefix) is part of the same trend.</p>
+    <p>For running these on Kubernetes, see <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-gpu-scheduling.html">GPU Scheduling on Kubernetes</a> and <a href="ai-engineering-deployment.html">Deployment</a>.</p>
   </section>
 
-  <section>
-    <h2>Kernel and Framework Choices</h2>
-    <p>FlashAttention-2/3, fused MLP kernels, and tensor parallel inference reduce memory bandwidth pressure. Serving frameworks (vLLM, TensorRT-LLM, TGI, llama.cpp) implement these optimizations out of the box compared to naive PyTorch generate loops.</p>
-    <p>Pick frameworks matching your hardware (CUDA vs ROCm vs Apple), need for OpenAI-compatible APIs, LoRA hot-swapping, and multi-modal inputs.</p>
+  <section id="capacity">
+    <h2>10. Worked Example: Capacity Planning One GPU</h2>
+    <p><strong>Question:</strong> one H100 80 GB, Llama 3.1 8B in BF16, average request uses 4,096 tokens of context (prompt + answer). Roughly how many requests can be in flight at once?</p>
+    <ol>
+      <li><strong>Usable memory.</strong> vLLM's <code>--gpu-memory-utilization 0.90</code> lets it use 0.9 * 80 = 72 GB.</li>
+      <li><strong>Weights.</strong> ~16 GB. Left: 56 GB.</li>
+      <li><strong>Activations, CUDA graphs, framework overhead.</strong> Budget ~4 GB. Left for KV: ~52 GB.</li>
+      <li><strong>KV per token:</strong> 128 KiB (section 4). Tokens that fit: 52e9 / 131,072 = ~396,000 tokens.</li>
+      <li><strong>Concurrent requests:</strong> 396,000 / 4,096 = <strong>~96 sequences</strong>.</li>
+    </ol>
+    <p>What changes the answer:</p>
+    <ul>
+      <li>FP8 KV cache: about <strong>2x</strong> the sequences (~190).</li>
+      <li>FP8 weights: frees ~8 GB, about +15% more KV.</li>
+      <li>Average context 16K instead of 4K: only ~24 sequences.</li>
+      <li>Shared prefixes with prefix caching: effective capacity goes up, since shared blocks are stored once.</li>
+    </ul>
+    <p>vLLM prints the real number at startup (a line reporting the GPU KV cache size in tokens and the maximum concurrency for your <code>max_model_len</code>). Always check it against your estimate.</p>
+    <pre><code># Serve with an OpenAI-compatible API
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8 \
+  --max-num-seqs 128</code></pre>
   </section>
 
-  <section>
-    <h2>Application-Level Optimizations</h2>
+  <section id="scenario">
+    <h2>11. Scenario: p95 Latency Spikes in a Chatbot</h2>
+    <p><strong>Situation.</strong> A support chatbot runs on 2 replicas. Median TTFT is 250 ms, but p95 TTFT jumps to 6 seconds every few minutes, and users complain the stream "freezes".</p>
+    <h3>Step 1: split the latency</h3>
+    <p>Look at server metrics (vLLM exposes Prometheus metrics such as time to first token, time per output token, number of running and waiting requests, and KV cache usage). Findings: during spikes, <em>waiting</em> requests rise and KV cache usage is near 100%. TPOT for running users also jumps.</p>
+    <h3>Step 2: find the trigger</h3>
+    <p>Request logs show the spikes line up with a few requests that paste whole log files: 40,000-token prompts.</p>
+    <h3>Step 3: explain it</h3>
+    <ul>
+      <li>A 40K-token prefill is a big compute job. Without chunking, all decode users stall until it finishes: frozen streams.</li>
+      <li>Its KV cache needs 40,000 * 128 KiB = ~5 GB, evicting or preempting other requests: queueing for everyone, so TTFT spikes.</li>
+    </ul>
+    <h3>Step 4: fix it (in order of effort)</h3>
+    <ol>
+      <li>Enable or tune <strong>chunked prefill</strong> so long prompts are interleaved with decode steps.</li>
+      <li>Cap input length at the API, or <a href="../Prompting-and-Retrieval/ai-engineering-prompt-compression.html">compress</a> or summarize huge pastes first.</li>
+      <li>Turn on <strong>prefix caching</strong> so the shared system prompt is not recomputed for every request.</li>
+      <li>Route long-context requests to a separate replica pool, so they cannot hurt the short-chat SLO.</li>
+      <li>Autoscale on <em>queue length or KV usage</em>, not GPU utilization, which reads near 100% even when the server is healthy.</li>
+    </ol>
+  </section>
+
+  <section id="frameworks">
+    <h2>12. Kernels and Frameworks</h2>
+    <p>FlashAttention (2 and 3) computes attention in tiles that stay in fast on-chip memory, avoiding writing the full attention matrix to HBM. Fused kernels, CUDA graphs, and optimized attention backends reduce overhead per decode step. Serving frameworks (vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp, Ollama) implement these optimizations out of the box, compared with a naive PyTorch <code>generate</code> loop.</p>
+    <p>Pick a framework matching your hardware (CUDA vs ROCm vs Apple vs CPU), need for an OpenAI-compatible API, LoRA adapter hot-swapping, structured output, and multimodal inputs.</p>
+  </section>
+
+  <section id="app-level">
+    <h2>13. Application-Level Optimizations</h2>
     <ul>
       <li>Route easy queries to smaller models</li>
       <li>Cache exact prompt completions where safe</li>
-      <li>Truncate, summarize, or <a href="learn/ai-engineering-prompt-compression.html">compress context</a> before model call</li>
+      <li>Put stable content (system prompt, tool definitions) at the <em>start</em> of the prompt so prefix caching can reuse it; put changing content at the end</li>
+      <li>Truncate, summarize, or <a href="../Prompting-and-Retrieval/ai-engineering-prompt-compression.html">compress context</a> before the model call</li>
       <li>Stream tokens to improve perceived latency</li>
-      <li>Set max_tokens aggressively per use case</li>
+      <li>Set <code>max_tokens</code> per use case</li>
       <li>Batch offline jobs separately from interactive traffic</li>
     </ul>
-    <p>Profile end-to-end: embedding, retrieval, and reranking often dominate before the LLM is even called. Optimizing only the model server leaves money on the table.</p>
+    <p>Profile end to end: embedding, retrieval, and reranking often dominate before the LLM is even called. Optimizing only the model server leaves money on the table.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Judging load by GPU utilization.</strong> A decode-heavy server shows high "utilization" while compute units are mostly waiting on memory. Use queue depth, KV cache usage, TTFT, and TPOT.</li>
+      <li><strong>Setting max_model_len to the model's maximum by default.</strong> A 128K limit you never need reduces how many sequences can be scheduled and invites huge requests.</li>
+      <li><strong>Benchmarking with one request at a time.</strong> Serving performance is about concurrency. Use a load generator with realistic prompt and output length distributions.</li>
+      <li><strong>Putting a timestamp at the start of the system prompt.</strong> It changes every request and destroys prefix cache hits.</li>
+      <li><strong>Quantizing without evaluation.</strong> Always rerun task evals on the quantized model.</li>
+      <li><strong>Mixing GiB and GB in capacity math.</strong> A 7% error is enough to cause unexpected preemption.</li>
+    </ul>
+    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/abs/2309.06180" rel="noopener noreferrer">PagedAttention / vLLM paper</a> &middot; <a href="https://www.usenix.org/conference/osdi22/presentation/yu" rel="noopener noreferrer">Orca (continuous batching)</a> &middot; <a href="https://arxiv.org/abs/2211.17192" rel="noopener noreferrer">Speculative decoding (Leviathan et al.)</a> &middot; <a href="https://arxiv.org/abs/2401.09670" rel="noopener noreferrer">DistServe</a> &middot; <a href="https://docs.vllm.ai/en/latest/" rel="noopener noreferrer">vLLM docs</a></small></p>
   </section>
 
   <nav class="page-footer-nav">
     <p><a class="interview-link" href="../../interview/Inference-Deployment-Operations/ai-engineering-interview-inference-optimization.html">Interview questions on Inference Optimization</a></p>
+    <p>Related: <a href="ai-engineering-deployment.html">Deployment</a> &middot; <a href="ai-engineering-llmops-monitoring.html">LLMOps &amp; Monitoring</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-gpu-scheduling.html">GPU Scheduling on Kubernetes</a> &middot; <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
   </nav>
 </main>
@@ -93,5 +296,3 @@ python -m vllm.entrypoints.openai.api_server \
   <script src="../../../assets/search.js" defer></script>
 </body>
 </html>
-
-

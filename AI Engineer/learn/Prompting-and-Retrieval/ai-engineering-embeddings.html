@@ -40,7 +40,7 @@ query_embedding = model.encode(
     "query: " + user_query, normalize_embeddings=True
 )
 
-# cosine similarity � dot product when vectors are normalized
+# cosine similarity == dot product when vectors are normalized
 scores = query_embedding @ doc_embeddings.T</code></pre>
     <h3>Matryoshka and flexible dimensions</h3>
     <p>Some models support truncating vectors to fewer dimensions with modest quality loss, letting you tune the cost-quality tradeoff without retraining separate models.</p>

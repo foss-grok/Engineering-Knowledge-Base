@@ -33,7 +33,12 @@
       <li>
         <a href="Docker-Kubernetes/docker-kubernetes.html"><strong>Docker &amp; Kubernetes</strong></a>
         <br>
-        Containers, Docker Compose, image security, Kubernetes architecture, workloads, networking, storage, RBAC, Helm, and observability.
+        Containers, Docker Compose, image security, Kubernetes architecture, workloads, networking, storage, RBAC, Helm, observability, and GPU scheduling.
+      </li>
+      <li>
+        <a href="CS-Fundamentals/cs-fundamentals.html"><strong>CS Fundamentals</strong></a>
+        <br>
+        Operating systems, databases, and computer networks from zero: processes and scheduling, virtual memory, transactions and MVCC, and TCP.
       </li>
       <li>
         <a href="Graph ML/graph-ml.html"><strong>Graph Machine Learning</strong></a>
@@ -80,7 +85,7 @@
       <li>Shared root files: <code>index.html</code>, <code>styles.css</code>, <code>assets/</code>, <code>scripts/</code>.</li>
       <li>One folder per subject (for example <code>AI Engineer/</code>).</li>
       <li>Match existing layout: breadcrumbs, <code>learn-page</code> on learn articles, footer hub links.</li>
-      <li>After adding or renaming pages, run <code>powershell -File scripts/build-search-index.ps1</code> and commit the updated index files.</li>
+      <li>After adding or renaming pages, run <code>python3 scripts/build-search-index.py</code>, commit the updated index files, and run <code>python3 scripts/check-links.py</code>.</li>
       <li>Use relative paths for styles and links (see README for depth table).</li>
       <li>Use <code>refer-link</code> for external diagram and paper citations.</li>
     </ul>

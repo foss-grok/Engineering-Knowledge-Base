@@ -10,7 +10,7 @@
 <body class="learn-page">
 <header>
   <nav aria-label="Breadcrumb">
-    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering.html#frameworks">Frameworks</a> &rsaquo; LangGraph</p>
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html#frameworks">Frameworks</a> &rsaquo; LangGraph</p>
   </nav>
   <h1>LangGraph</h1>
   <p>Low-level orchestration for stateful, multi-step LLM workflows: graphs, checkpoints, interrupts, and durable agent loops.</p>
@@ -21,7 +21,7 @@
     <h2>What LangGraph Solves</h2>
     <p>LangGraph models LLM applications as <strong>state machines</strong> (graphs) instead of opaque agent loops. Each step is a node function that reads shared state and returns partial updates. Edges define control flow: fixed transitions, conditional routing, or dynamic jumps via the <code>Command</code> API.</p>
     <p>This matters because production agents need persistence across restarts, human approval on risky actions, replay for debugging, and explicit caps on loops. LangChain LCEL chains are acyclic pipelines; LangGraph adds cycles, branching, and checkpointed state by design.</p>
-    <p class="refer-link"><small>Refer: <a href="https://langchain-ai.github.io/langgraph/concepts/low_level/" rel="noopener noreferrer">LangGraph low-level concepts</a> � <a href="https://github.com/langchain-ai/langgraph" rel="noopener noreferrer">GitHub</a></small></p>
+    <p class="refer-link"><small>Refer: <a href="https://langchain-ai.github.io/langgraph/concepts/low_level/" rel="noopener noreferrer">LangGraph low-level concepts</a> &middot; <a href="https://github.com/langchain-ai/langgraph" rel="noopener noreferrer">GitHub</a></small></p>
   </section>
 
   <section>
@@ -38,7 +38,7 @@ class AgentState(TypedDict):
     step_count: int</code></pre>
     <p>Reducers define how concurrent or sequential updates merge. Without reducers, last write wins. Custom reducers implement counters, set unions, or last-value semantics per key.</p>
     <h3>Nodes</h3>
-    <p>Nodes are Python callables <code>(state, config) -> partial_state | Command</code>. They should be small: call the model, execute one tool batch, run a validator. Heavy side effects belong in tool functions with idempotency keys.</p>
+    <p>Nodes are Python callables <code>(state, config) -&gt; partial_state | Command</code>. They should be small: call the model, execute one tool batch, run a validator. Heavy side effects belong in tool functions with idempotency keys.</p>
     <h3>Edges</h3>
     <ul>
       <li><strong>Normal edges</strong> - unconditional A to B</li>
@@ -57,7 +57,7 @@ def call_model(state: AgentState):
 
 def should_continue(state: AgentState):
     last = state["messages"][-1]
-    if state["step_count"] > 10:
+    if state["step_count"] &gt; 10:
         return END
     if last.tool_calls:
         return "tools"
@@ -210,7 +210,7 @@ def sensitive_action(state):
   </section>
 
   <nav class="page-footer-nav">
-    <p>Also in Frameworks: <a href="ai-engineering-frameworks-langchain.html">LangChain</a> � <a href="ai-engineering-frameworks-langfuse.html">Langfuse</a></p>
+    <p>Also in Frameworks: <a href="ai-engineering-frameworks-langchain.html">LangChain</a> &middot; <a href="ai-engineering-frameworks-langfuse.html">Langfuse</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
   </nav>
 </main>

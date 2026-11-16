@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Virtual Memory &amp; Paging | CS Fundamentals</title>
+  <meta name="description" content="Virtual memory from zero: address translation worked in hex, page tables, multi-level paging, TLBs, page faults, page replacement (FIFO, LRU, OPT) traced step by step, thrashing, huge pages, OOM kills, and how LLM servers reuse paging for the KV cache.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Virtual Memory &amp; Paging</p>
+  </nav>
+  <h1>Virtual Memory &amp; Paging</h1>
+  <p>How every process gets its own private, huge, tidy memory while sharing one small, messy pool of RAM. With hex translations, page-table math, and page replacement traced by hand.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Virtual Memory Exists</a></li>
+    <li><a href="#pages">Pages, Frames, and Offsets</a></li>
+    <li><a href="#translate">Translating an Address by Hand</a></li>
+    <li><a href="#page-table-size">Page Table Size and Multi-Level Tables</a></li>
+    <li><a href="#tlb">The TLB: Making Translation Fast</a></li>
+    <li><a href="#page-faults">Page Faults and Demand Paging</a></li>
+    <li><a href="#replacement">Page Replacement: FIFO, LRU, OPT</a></li>
+    <li><a href="#thrashing">Thrashing and the Working Set</a></li>
+    <li><a href="#linux-practice">Linux in Practice: Huge Pages, Overcommit, OOM</a></li>
+    <li><a href="#llm-paging">Modern Twist: Paging for the LLM KV Cache</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Virtual Memory Exists</h2>
+    <p>Imagine the early days: every program used real RAM addresses directly. Three problems appear immediately:</p>
+    <ol>
+      <li><strong>No protection.</strong> A bug in one program can overwrite another program's data, or the OS itself.</li>
+      <li><strong>No relocation.</strong> A program compiled to live at address 0x10000 cannot run if another program already sits there.</li>
+      <li><strong>Fragmentation.</strong> Free RAM ends up in small scattered holes. A program needing 100 MB in one piece may fail even if 500 MB is free in total.</li>
+    </ol>
+    <p><strong>Virtual memory</strong> solves all three with one idea: programs never see real addresses. Each process uses <em>virtual addresses</em>. The hardware (the <strong>MMU</strong>, Memory Management Unit, inside the CPU) translates each virtual address to a <em>physical address</em> in RAM on every memory access, using tables the OS maintains.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> Virtual addresses are like apartment numbers in a building directory. "Apartment 4B" is what you tell your friends. The directory (page table) says 4B is actually the third door on the second floor of the east wing. The landlord (OS) can move you to another physical room and just update the directory. Your friends never notice.
+    </div>
+    <p>Bonus wins: processes can share read-only pages (one copy of <code>libc</code> in RAM for hundreds of processes), memory can be loaded lazily from disk, and a process can use more virtual memory than physical RAM exists.</p>
+  </section>
+
+  <section id="pages">
+    <h2>2. Pages, Frames, and Offsets</h2>
+    <p>Translating every single byte separately would need a gigantic table. So memory is split into fixed-size chunks:</p>
+    <ul>
+      <li>A <strong>page</strong> is a fixed-size block of <em>virtual</em> memory. The common size is <strong>4 KiB</strong> (4096 bytes).</li>
+      <li>A <strong>frame</strong> (page frame) is a block of <em>physical</em> RAM of the same size.</li>
+      <li>The <strong>page table</strong> maps page numbers to frame numbers. One entry per page is a <strong>PTE</strong> (page table entry).</li>
+    </ul>
+    <p>Because pages and frames are the same size, the position <em>inside</em> the page never changes during translation. So a virtual address splits in two parts:</p>
+    <pre><code>  virtual address  =  [ virtual page number (VPN) | offset ]
+  physical address =  [ physical frame number (PFN) | offset ]   (same offset)
+
+  offset bits = log2(page size)      4 KiB = 2^12  -&gt;  12 offset bits</code></pre>
+    <p>A PTE stores more than the frame number. It has flag bits: <strong>present</strong> (is the page in RAM?), <strong>writable</strong>, <strong>user/kernel</strong>, <strong>accessed</strong> (used recently), <strong>dirty</strong> (modified since loaded), and on x86-64 an <strong>NX</strong> (no-execute) bit.</p>
+  </section>
+
+  <section id="translate">
+    <h2>3. Translating an Address by Hand</h2>
+    <p><strong>Setup:</strong> 32-bit virtual addresses, 4 KiB pages. So 12 bits of offset and 32 - 12 = 20 bits of VPN.</p>
+    <p><strong>Problem:</strong> translate virtual address <code>0x00403A7C</code>. The page table says VPN <code>0x00403</code> maps to frame <code>0x001F2</code>, present.</p>
+    <h3>Step by step</h3>
+    <ol>
+      <li><strong>Split the address.</strong> 12 offset bits = 3 hex digits (each hex digit is 4 bits). So the last 3 hex digits are the offset: <code>0xA7C</code>. The rest is the VPN: <code>0x00403</code>.</li>
+      <li><strong>Look up the VPN.</strong> PTE for <code>0x00403</code> gives PFN <code>0x001F2</code>. Present bit is 1, so no fault.</li>
+      <li><strong>Glue frame and offset.</strong> Physical address = PFN followed by the offset = <code>0x001F2</code> and <code>A7C</code> = <code>0x001F2A7C</code>.</li>
+    </ol>
+    <p>In formula form: <code>PA = PFN * page_size + offset = 0x1F2 * 0x1000 + 0xA7C = 0x1F2A7C</code>.</p>
+    <div class="callout">
+      <strong>Shortcut:</strong> with 4 KiB pages the offset is exactly 3 hex digits, and with 64 KiB pages it is exactly 4, so you can split the address by counting hex digits from the right. For sizes like 8 KiB (13 offset bits), write the address in binary first.
+    </div>
+    <h3>Try another (solution right below)</h3>
+    <p>Same system. Translate <code>0x0040_3FFF</code> and <code>0x0040_4000</code>, if VPN 0x404 maps to frame 0x7AB.</p>
+    <ul>
+      <li><code>0x00403FFF</code>: VPN 0x403, offset 0xFFF, the last byte of the page. PA = <code>0x1F2FFF</code>.</li>
+      <li><code>0x00404000</code>: one byte later, but it is a new page. VPN 0x404, offset 0x000. PA = <code>0x7AB000</code>. Neighbouring virtual bytes can live in completely different physical places.</li>
+    </ul>
+  </section>
+
+  <section id="page-table-size">
+    <h2>4. Page Table Size and Multi-Level Tables</h2>
+    <h3>The problem with one flat table</h3>
+    <p>32-bit addresses, 4 KiB pages, 4-byte PTEs:</p>
+    <pre><code>number of pages  = 2^32 / 2^12 = 2^20 = 1,048,576
+table size       = 2^20 * 4 bytes = 4 MiB   per process</code></pre>
+    <p>4 MiB for every process, even a tiny one, is wasteful. For 64-bit it is impossible: x86-64 uses 48-bit virtual addresses, so <code>2^48 / 2^12 = 2^36</code> pages times 8-byte PTEs = <strong>512 GiB</strong> of page table per process.</p>
+    <h3>The fix: a tree of tables</h3>
+    <p>Most of the address space is unused. A <strong>multi-level page table</strong> only allocates the parts that are used. x86-64 with 4 levels splits a 48-bit address like this:</p>
+    <pre><code> 47        39 38        30 29        21 20        12 11          0
++------------+------------+------------+------------+-------------+
+|  PML4 (9)  |  PDPT (9)  |   PD (9)   |   PT (9)   | offset (12) |
++------------+------------+------------+------------+-------------+
+   level 4      level 3      level 2      level 1
+
+Each level: 9 bits -&gt; 512 entries x 8 bytes = 4096 bytes = exactly one page.</code></pre>
+    <p>The CPU starts at the top table (its address lives in the <code>CR3</code> register), uses 9 bits to pick an entry, which points to the next table, and so on 4 times, then adds the offset. If a whole region is unused, the upper-level entry is simply empty and no lower tables exist. Newer CPUs support 5 levels (57-bit addresses) for machines with huge memory.</p>
+    <p>The cost: one memory access by the program can need <strong>4 extra memory reads</strong> just to walk the tables. That would make everything 5 times slower. Which brings us to the TLB.</p>
+  </section>
+
+  <section id="tlb">
+    <h2>5. The TLB: Making Translation Fast</h2>
+    <p>The <strong>Translation Lookaside Buffer (TLB)</strong> is a small, very fast cache inside the CPU that remembers recent VPN to PFN translations. Typical sizes are tens of entries (level 1) to a couple of thousand (level 2).</p>
+    <ul>
+      <li><strong>TLB hit:</strong> translation is found instantly. No page walk.</li>
+      <li><strong>TLB miss:</strong> the hardware walks the page table (on x86), then stores the result in the TLB.</li>
+    </ul>
+    <p>Programs touch memory with strong <strong>locality</strong>: the same and nearby addresses again and again. So hit rates above 99% are normal.</p>
+    <h3>Worked example: effective access time</h3>
+    <p>Memory access takes 100 ns. TLB lookup time is negligible. The TLB hit ratio is 98%. A miss needs a 4-level walk (4 memory reads) plus the real access.</p>
+    <pre><code>hit cost  = 100 ns                       (just the data access)
+miss cost = 4 * 100 + 100 = 500 ns      (walk + data access)
+
+EAT = 0.98 * 100 + 0.02 * 500
+    = 98 + 10
+    = 108 ns     -&gt; only 8% slower than no translation at all</code></pre>
+    <p>Drop the hit ratio to 90% and EAT = 90 + 50 = 140 ns, 40% slower. TLB hit rate really matters. (Real CPUs also cache page-table entries in the normal data caches, which shortens walks.)</p>
+    <p><strong>Context switches and the TLB:</strong> translations belong to one address space. Old CPUs flushed the whole TLB on every process switch. Modern CPUs tag entries with an address-space ID (PCID on x86, ASID on ARM) so entries can survive switches.</p>
+  </section>
+
+  <section id="page-faults">
+    <h2>6. Page Faults and Demand Paging</h2>
+    <p>A <strong>page fault</strong> is a trap into the kernel when the MMU cannot complete a translation: the PTE is not present, or the access breaks the permissions. A fault is not always an error. It is how lazy loading works.</p>
+    <h3>Demand paging, step by step</h3>
+    <ol>
+      <li>You start a program. The kernel sets up page tables but loads almost nothing. All PTEs are "not present".</li>
+      <li>The CPU tries the first instruction. Not present: <strong>page fault</strong>.</li>
+      <li>The kernel checks: is this address part of a valid region (code of the binary, heap, stack)? If not, the process gets <code>SIGSEGV</code> (segmentation fault).</li>
+      <li>If valid: find a free frame (evicting another page if RAM is full), read the page from disk if needed, fill in the PTE, mark it present.</li>
+      <li>Return to the process and <strong>re-run the same instruction</strong>. It now succeeds.</li>
+    </ol>
+    <table>
+      <thead><tr><th>Fault type</th><th>Meaning</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Minor (soft)</td><td>Page is already in RAM (for example in the page cache, or a fresh zero page) and just needs mapping</td><td>Around a microsecond</td></tr>
+        <tr><td>Major (hard)</td><td>Page must be read from disk or swap</td><td>Around 100 microseconds on NVMe, around 10 ms on a spinning disk</td></tr>
+        <tr><td>Invalid</td><td>Address not in any valid region, or a write to read-only memory</td><td>Process gets SIGSEGV</td></tr>
+      </tbody>
+    </table>
+    <p>Copy-on-write (used by <code>fork()</code>, see <a href="os-processes-threads-scheduling.html#fork-exec">Processes</a>) is also built on faults: shared pages are read-only, and the first write faults, so the kernel copies just that page.</p>
+    <h3>Worked example: how much does a fault rate hurt?</h3>
+    <p>Memory access is 100 ns. A major fault costs 8 ms = 8,000,000 ns. Let <code>p</code> be the fault probability per access.</p>
+    <pre><code>EAT = (1 - p) * 100 + p * 8,000,000
+
+p = 1 in 1000:     EAT = 99.9 + 8000     = ~8100 ns  (81x slower!)
+For &lt;10% slowdown: 110 &gt; 100 + 7,999,900p  -&gt;  p &lt; 0.0000013  (about 1 in 800,000)</code></pre>
+    <p>Lesson: the fault rate for hot data must be tiny. This is why running out of RAM feels like the machine freezing.</p>
+    <pre><code>$ /usr/bin/time -v ./myprogram 2&gt;&amp;1 | grep -i fault
+  Major (requiring I/O) page faults: 0
+  Minor (reclaiming a frame) page faults: 1532</code></pre>
+  </section>
+
+  <section id="replacement">
+    <h2>7. Page Replacement: FIFO, LRU, OPT</h2>
+    <p>When RAM is full and a fault needs a frame, the OS must <strong>evict</strong> some page. If that page is dirty, it must be written to disk first. Which page to evict? We compare three policies on a classic reference string (the sequence of pages a program touches) with <strong>3 frames</strong>:</p>
+    <pre><code>7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1     (20 references)</code></pre>
+    <h3>FIFO: evict the oldest loaded page</h3>
+    <p>Simple, but "loaded long ago" does not mean "not needed". Result: <strong>15 faults</strong>.</p>
+    <h3>LRU: evict the least recently used page</h3>
+    <p>Uses the recent past to predict the near future. Full trace below. The frames column lists pages from least recently used (left, next victim) to most recently used (right).</p>
+    <table>
+      <thead><tr><th>#</th><th>Ref</th><th>Frames (LRU first)</th><th>Result</th><th>Evicted</th></tr></thead>
+      <tbody>
+<tr><td>1</td><td>7</td><td>7</td><td>FAULT</td><td></td></tr>
+<tr><td>2</td><td>0</td><td>7 0</td><td>FAULT</td><td></td></tr>
+<tr><td>3</td><td>1</td><td>7 0 1</td><td>FAULT</td><td></td></tr>
+<tr><td>4</td><td>2</td><td>0 1 2</td><td>FAULT</td><td>evict 7</td></tr>
+<tr><td>5</td><td>0</td><td>1 2 0</td><td>hit</td><td></td></tr>
+<tr><td>6</td><td>3</td><td>2 0 3</td><td>FAULT</td><td>evict 1</td></tr>
+<tr><td>7</td><td>0</td><td>2 3 0</td><td>hit</td><td></td></tr>
+<tr><td>8</td><td>4</td><td>3 0 4</td><td>FAULT</td><td>evict 2</td></tr>
+<tr><td>9</td><td>2</td><td>0 4 2</td><td>FAULT</td><td>evict 3</td></tr>
+<tr><td>10</td><td>3</td><td>4 2 3</td><td>FAULT</td><td>evict 0</td></tr>
+<tr><td>11</td><td>0</td><td>2 3 0</td><td>FAULT</td><td>evict 4</td></tr>
+<tr><td>12</td><td>3</td><td>2 0 3</td><td>hit</td><td></td></tr>
+<tr><td>13</td><td>2</td><td>0 3 2</td><td>hit</td><td></td></tr>
+<tr><td>14</td><td>1</td><td>3 2 1</td><td>FAULT</td><td>evict 0</td></tr>
+<tr><td>15</td><td>2</td><td>3 1 2</td><td>hit</td><td></td></tr>
+<tr><td>16</td><td>0</td><td>1 2 0</td><td>FAULT</td><td>evict 3</td></tr>
+<tr><td>17</td><td>1</td><td>2 0 1</td><td>hit</td><td></td></tr>
+<tr><td>18</td><td>7</td><td>0 1 7</td><td>FAULT</td><td>evict 2</td></tr>
+<tr><td>19</td><td>0</td><td>1 7 0</td><td>hit</td><td></td></tr>
+<tr><td>20</td><td>1</td><td>7 0 1</td><td>hit</td><td></td></tr>      </tbody>
+    </table>
+    <p>Count the FAULT rows: <strong>12 faults</strong>.</p>
+    <h3>OPT (Belady's optimal): evict the page used furthest in the future</h3>
+    <p>Look ahead and evict the page whose next use is the latest (or never). This gives the fewest faults possible: <strong>9 faults</strong> here. It is impossible in a real OS (it needs to know the future), but it is the yardstick for judging other policies.</p>
+    <p>Example decision at reference #4 (page 2 arrives, frames hold 7, 0, 1): the future is <code>0 3 0 4 2 3 0 3 2 1 2 0 1 7 ...</code>. Page 0 is needed next at once, page 1 at position 14, page 7 not until position 18. So OPT evicts 7.</p>
+    <table>
+      <thead><tr><th>Policy</th><th>Faults (3 frames)</th><th>Practical?</th></tr></thead>
+      <tbody>
+        <tr><td>FIFO</td><td>15</td><td>Yes, cheap, often poor</td></tr>
+        <tr><td>LRU</td><td>12</td><td>Exact LRU is expensive; approximated</td></tr>
+        <tr><td>OPT</td><td>9</td><td>No, needs the future; used as a benchmark</td></tr>
+      </tbody>
+    </table>
+    <p>(All three counts were verified with a simulator.)</p>
+    <h3>Belady's anomaly: more RAM, more faults?</h3>
+    <p>With FIFO, adding frames can <em>increase</em> faults. Reference string <code>1 2 3 4 1 2 5 1 2 3 4 5</code> gives <strong>9 faults with 3 frames but 10 faults with 4 frames</strong>. LRU and OPT never do this (they are "stack algorithms": the pages kept with n frames are always a subset of those kept with n + 1).</p>
+    <h3>What real kernels do: approximate LRU</h3>
+    <p>Tracking exact recency for every memory access is too expensive. Instead, the hardware sets the <strong>accessed bit</strong> in the PTE when a page is used. The <strong>clock (second-chance) algorithm</strong> sweeps pages in a circle: if the accessed bit is 1, clear it and move on (second chance); if it is 0, evict. Linux keeps active and inactive lists, and since kernel 6.1 offers <strong>MGLRU</strong> (multi-generational LRU), which sorts pages into age generations and is used by default on Android, ChromeOS, and several Linux distributions.</p>
+  </section>
+
+  <section id="thrashing">
+    <h2>8. Thrashing and the Working Set</h2>
+    <p>The <strong>working set</strong> of a process is the set of pages it actively uses in a recent time window. If the sum of all working sets is bigger than RAM, every process keeps evicting pages that another process (or itself) needs a moment later. The system spends nearly all its time on page faults and disk I/O. CPU utilization drops, which can trick a naive OS into starting even more work. This collapse is <strong>thrashing</strong>.</p>
+    <p>Signs on Linux: high <code>si</code>/<code>so</code> (swap in/out) in <code>vmstat 1</code>, many major faults, high I/O wait, and Pressure Stall Information showing memory pressure:</p>
+    <pre><code>$ cat /proc/pressure/memory
+some avg10=42.17 avg60=30.02 avg300=12.50 total=81726354
+full avg10=18.40 avg60=11.73 avg300=4.02 total=31277120</code></pre>
+    <p>"some" = percent of time at least one task stalled on memory; "full" = all non-idle tasks stalled. Fixes: add RAM, run fewer things at once, reduce memory use, or kill something (which is what the OOM killer and tools like <code>systemd-oomd</code> do).</p>
+  </section>
+
+  <section id="linux-practice">
+    <h2>9. Linux in Practice: Huge Pages, Overcommit, OOM</h2>
+    <h3>Huge pages and TLB reach</h3>
+    <p><strong>TLB reach</strong> = number of TLB entries times page size. With 1536 entries:</p>
+    <pre><code>4 KiB pages:  1536 * 4 KiB = 6 MiB of memory covered
+2 MiB pages:  1536 * 2 MiB = 3 GiB of memory covered</code></pre>
+    <p>A database with a 64 GiB buffer pool will miss the TLB constantly with 4 KiB pages. x86-64 supports 2 MiB and 1 GiB <strong>huge pages</strong>. Linux offers explicit <code>hugetlbfs</code> pages (reserved in advance; used by databases and DPDK) and <strong>Transparent Huge Pages (THP)</strong>, which merges pages automatically. THP helps many workloads but can cause latency spikes from background compaction, which is why some databases recommend <code>madvise</code> mode instead of <code>always</code>.</p>
+    <h3>Overcommit</h3>
+    <p><code>malloc(1 GB)</code> usually succeeds instantly even on a small machine. Linux hands out virtual memory optimistically and only assigns frames when pages are touched. This is <strong>overcommit</strong>. It works because programs often reserve more than they use. The risk: if everyone touches their memory, RAM runs out.</p>
+    <h3>The OOM killer</h3>
+    <p>When memory cannot be reclaimed, the kernel's <strong>OOM (out-of-memory) killer</strong> picks a process (largest memory, adjusted by <code>/proc/&lt;pid&gt;/oom_score_adj</code>) and kills it with <code>SIGKILL</code>. In containers, each cgroup has its own limit (<code>memory.max</code>). Exceeding it triggers an OOM kill inside that cgroup only.</p>
+    <div class="callout">
+      <strong>Kubernetes connection:</strong> a container killed this way shows <code>Reason: OOMKilled</code> and exit code <strong>137</strong> (128 + signal 9). Note that the page cache counts toward the cgroup too, but the kernel reclaims clean cache before killing. See <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html">Kubernetes Workloads</a> for memory requests and limits.
+    </div>
+    <h3>RSS vs VSZ</h3>
+    <p><code>ps</code> shows <strong>VSZ</strong> (virtual size: everything mapped, including never-touched reservations) and <strong>RSS</strong> (resident set size: pages actually in RAM now, counting shared libraries fully in every process). Neither is perfect. <code>PSS</code> in <code>/proc/&lt;pid&gt;/smaps_rollup</code> splits shared pages fairly among sharers.</p>
+  </section>
+
+  <section id="llm-paging">
+    <h2>10. Modern Twist: Paging for the LLM KV Cache</h2>
+    <p>The same idea that freed operating systems from fragmentation in the 1960s now powers LLM serving. An LLM keeps a <strong>KV cache</strong> per request that grows one token at a time, and nobody knows in advance how long an answer will be. Early servers reserved one big contiguous block per request for the maximum length. Most of it sat unused, just like external and internal fragmentation in RAM.</p>
+    <p><strong>PagedAttention</strong> (the vLLM paper, 2023) applies paging directly:</p>
+    <table>
+      <thead><tr><th>OS concept</th><th>vLLM equivalent</th></tr></thead>
+      <tbody>
+        <tr><td>Page (4 KiB)</td><td>KV block (for example 16 tokens)</td></tr>
+        <tr><td>Physical frame</td><td>Block slot in GPU memory</td></tr>
+        <tr><td>Page table per process</td><td>Block table per request</td></tr>
+        <tr><td>Demand paging</td><td>Allocate a new block only when the previous one is full</td></tr>
+        <tr><td>Copy-on-write shared pages</td><td>Shared prefix blocks for parallel sampling and prefix caching</td></tr>
+        <tr><td>Swapping to disk</td><td>Preempting a request and swapping or recomputing its KV blocks</td></tr>
+      </tbody>
+    </table>
+    <p>Read the full story, with memory math, in <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-inference-optimization.html#paged-attention">LLM Inference Optimization</a>.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>11. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Confusing page and frame.</strong> Page = virtual, frame = physical. Offsets are identical in both.</li>
+      <li><strong>Counting offset bits wrong.</strong> Offset bits come from the page size only: 4 KiB means 12 bits, no matter how big memory is.</li>
+      <li><strong>Forgetting the data access in EAT.</strong> A TLB miss costs the page walk <em>plus</em> the actual access.</li>
+      <li><strong>Thinking a page fault means a bug.</strong> Most faults are normal (lazy loading, COW). Only invalid accesses crash.</li>
+      <li><strong>Trusting free memory numbers.</strong> Linux uses idle RAM for the page cache. Look at <code>available</code> in <code>free -h</code>, not <code>free</code>.</li>
+      <li><strong>Assuming more frames always helps FIFO.</strong> Belady's anomaly says no.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>12. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Item</th><th>Formula or fact</th></tr></thead>
+      <tbody>
+        <tr><td>Offset bits</td><td><code>log2(page size)</code>; 4 KiB = 12</td></tr>
+        <tr><td>Number of pages</td><td><code>2^(VA bits) / page size</code></td></tr>
+        <tr><td>Flat table size</td><td><code>pages * PTE size</code></td></tr>
+        <tr><td>Physical address</td><td><code>PFN * page size + offset</code></td></tr>
+        <tr><td>EAT with TLB</td><td><code>h * mem + (1 - h) * (levels * mem + mem)</code></td></tr>
+        <tr><td>EAT with faults</td><td><code>(1 - p) * mem + p * fault_time</code></td></tr>
+        <tr><td>TLB reach</td><td><code>entries * page size</code></td></tr>
+        <tr><td>Replacement quality</td><td>OPT &le; LRU, FIFO can show Belady's anomaly</td></tr>
+        <tr><td>OOMKilled exit code</td><td>137 = 128 + SIGKILL (9)</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/" rel="noopener noreferrer">OSTEP chapters on paging and TLBs</a> &middot; <a href="https://docs.kernel.org/admin-guide/mm/multigen_lru.html" rel="noopener noreferrer">Linux MGLRU docs</a> &middot; <a href="https://docs.kernel.org/admin-guide/mm/transhuge.html" rel="noopener noreferrer">Transparent Huge Pages</a> &middot; <a href="https://arxiv.org/abs/2309.06180" rel="noopener noreferrer">PagedAttention paper (vLLM)</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Previous in Operating Systems: <a href="os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a></p>
+    <p>Related: <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-inference-optimization.html">LLM Inference Optimization</a> &middot; <a href="../Databases/dbms-transactions-isolation-mvcc.html">Transactions &amp; MVCC</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

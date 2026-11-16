@@ -47,11 +47,15 @@ Load scripts before `search.js`:
 
 After adding or renaming HTML pages:
 
-```powershell
-powershell -File scripts/build-search-index.ps1
+```bash
+python3 scripts/build-search-index.py
 ```
 
-Commit `assets/search-index.js` and `assets/search-index.json`.
+Commit `assets/search-index.js` and `assets/search-index.json`. Then check links:
+
+```bash
+python3 scripts/check-links.py
+```
 
 ## Pull requests
 

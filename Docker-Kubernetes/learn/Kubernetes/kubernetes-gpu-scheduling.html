@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>GPU Scheduling on Kubernetes | Docker &amp; Kubernetes</title>
+  <meta name="description" content="Running GPU workloads on Kubernetes from zero: device plugins, the NVIDIA GPU Operator, requesting GPUs, taints and node labels, sharing GPUs with time-slicing, MPS and MIG, Dynamic Resource Allocation (DRA), gang scheduling with Kueue, autoscaling, monitoring with DCGM, and debugging Pending GPU pods.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; GPU Scheduling</p>
+  </nav>
+  <h1>GPU Scheduling on Kubernetes</h1>
+  <p>How a cluster finds, hands out, shares, and monitors GPUs for training and LLM inference. From "what is a device plugin" to MIG slices, DRA claims, and gang-scheduled training jobs.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why-different">Why GPUs Are Different from CPU and Memory</a></li>
+    <li><a href="#device-plugins">Device Plugins: How Kubernetes Learns About GPUs</a></li>
+    <li><a href="#gpu-operator">The NVIDIA GPU Operator</a></li>
+    <li><a href="#requesting">Requesting a GPU in a Pod</a></li>
+    <li><a href="#placement">Putting GPU Pods on the Right Nodes</a></li>
+    <li><a href="#sharing">Sharing GPUs: Time-Slicing, MPS, and MIG</a></li>
+    <li><a href="#dra">Dynamic Resource Allocation (DRA)</a></li>
+    <li><a href="#gang">Distributed Training and Gang Scheduling</a></li>
+    <li><a href="#inference">Serving an LLM: a Complete Deployment</a></li>
+    <li><a href="#autoscaling">Autoscaling and Cost</a></li>
+    <li><a href="#monitoring">Monitoring GPUs</a></li>
+    <li><a href="#debugging">Scenario: My GPU Pod Is Stuck in Pending</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why-different">
+    <h2>1. Why GPUs Are Different from CPU and Memory</h2>
+    <p>Kubernetes was built around CPU and memory. Those are easy: the kubelet reads them from the operating system, and the Linux kernel can divide them finely (CPU shares, memory limits). GPUs break those assumptions:</p>
+    <ul>
+      <li><strong>Kubernetes does not know they exist.</strong> The kubelet cannot discover GPUs by itself. A vendor plugin must tell it.</li>
+      <li><strong>They are whole devices.</strong> You cannot ask for "0.3 of a GPU" the way you ask for <code>300m</code> CPU. GPU counts are integers.</li>
+      <li><strong>No overcommit.</strong> A GPU given to one container is not handed to another (unless you explicitly set up sharing, section 6).</li>
+      <li><strong>Extra software is needed on the node:</strong> a kernel driver, a container runtime hook that mounts the device files and driver libraries into containers, and the CUDA libraries in the image.</li>
+      <li><strong>They are expensive.</strong> An idle H100 costs real money every hour. Good scheduling is about cost as much as correctness.</li>
+    </ul>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> CPU and memory are like water from a tap: you can take any amount. GPUs are like rental cars: you take a whole car, someone has to register the cars with the rental office first (device plugin), and you might want a specific model (node labels).
+    </div>
+  </section>
+
+  <section id="device-plugins">
+    <h2>2. Device Plugins: How Kubernetes Learns About GPUs</h2>
+    <p>The <strong>device plugin framework</strong> is how hardware vendors teach the kubelet about special devices without changing Kubernetes code.</p>
+    <h3>Step by step</h3>
+    <ol>
+      <li>The vendor's device plugin runs on each GPU node, usually as a DaemonSet.</li>
+      <li>It finds the GPUs (for NVIDIA, through the driver's management library) and registers with the kubelet over a gRPC Unix socket in <code>/var/lib/kubelet/device-plugins/</code>.</li>
+      <li>It advertises an <strong>extended resource</strong> name and count, for example <code>nvidia.com/gpu: 8</code>, and reports device health.</li>
+      <li>The kubelet adds this to the node's <code>status.capacity</code> and <code>status.allocatable</code>. Now the scheduler can see it.</li>
+      <li>When a Pod requesting <code>nvidia.com/gpu: 1</code> is scheduled to the node, the kubelet asks the plugin to <strong>allocate</strong> a specific device. The plugin returns what the container needs: device files, environment variables (which GPU IDs are visible), and mounts.</li>
+      <li>The container runtime (with the NVIDIA Container Toolkit) starts the container with only that GPU visible.</li>
+    </ol>
+    <pre><code>$ kubectl get nodes -o custom-columns=NAME:.metadata.name,GPUS:.status.allocatable.nvidia\.com/gpu
+NAME            GPUS
+cpu-node-1      &lt;none&gt;
+gpu-node-1      8
+gpu-node-2      8</code></pre>
+  </section>
+
+  <section id="gpu-operator">
+    <h2>3. The NVIDIA GPU Operator</h2>
+    <p>Installing and upgrading drivers, toolkit, and plugin by hand on every node is error-prone. The <strong>NVIDIA GPU Operator</strong> (installed with Helm) manages all of it as containers:</p>
+    <table>
+      <thead><tr><th>Component</th><th>Job</th></tr></thead>
+      <tbody>
+        <tr><td>Driver container</td><td>Installs the kernel driver on the node (can be skipped if the node image already has it, as on many managed clouds)</td></tr>
+        <tr><td>Container Toolkit</td><td>Configures containerd/CRI-O so containers can access GPUs</td></tr>
+        <tr><td>Device plugin</td><td>Advertises <code>nvidia.com/gpu</code> (section 2)</td></tr>
+        <tr><td>GPU Feature Discovery (GFD)</td><td>Adds node labels such as GPU product, memory, count, and MIG capability</td></tr>
+        <tr><td>DCGM exporter</td><td>Exposes GPU metrics to Prometheus</td></tr>
+        <tr><td>MIG manager</td><td>Applies MIG partition layouts from a node label</td></tr>
+      </tbody>
+    </table>
+    <pre><code>helm repo add nvidia https://helm.ngc.nvidia.com/nvidia &amp;&amp; helm repo update
+helm install gpu-operator nvidia/gpu-operator -n gpu-operator --create-namespace
+
+# a few minutes later
+kubectl get pods -n gpu-operator
+kubectl get node gpu-node-1 --show-labels | tr ',' '\n' | grep nvidia.com/gpu</code></pre>
+    <p>Typical GFD labels: <code>nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3</code>, <code>nvidia.com/gpu.memory=81559</code> (MiB), <code>nvidia.com/gpu.count=8</code>.</p>
+  </section>
+
+  <section id="requesting">
+    <h2>4. Requesting a GPU in a Pod</h2>
+    <pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: cuda-smoke-test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cuda
+      image: nvidia/cuda:12.4.1-base-ubuntu22.04
+      command: ["nvidia-smi"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1</code></pre>
+    <p>Rules for extended resources like GPUs:</p>
+    <ul>
+      <li>Specify them in <code>limits</code>. If you also set <code>requests</code>, it must equal the limit. If you set only the limit, the request defaults to the same value.</li>
+      <li>Only whole numbers. <code>0.5</code> is rejected.</li>
+      <li>GPUs are given per <em>container</em>, and are not shared between containers in a Pod.</li>
+    </ul>
+    <pre><code>$ kubectl apply -f cuda-smoke-test.yaml
+$ kubectl logs cuda-smoke-test       # nvidia-smi table showing exactly ONE GPU</code></pre>
+    <p>If the log shows one GPU, the whole chain (driver, toolkit, plugin, scheduler) works.</p>
+  </section>
+
+  <section id="placement">
+    <h2>5. Putting GPU Pods on the Right Nodes</h2>
+    <h3>Keep non-GPU pods off GPU nodes: taints</h3>
+    <p>If ordinary pods land on a GPU node, they can use up its CPU or memory and block GPU pods from fitting. So GPU nodes are usually <strong>tainted</strong>, and only GPU workloads <strong>tolerate</strong> the taint. Several managed clouds add a taint like <code>nvidia.com/gpu=present:NoSchedule</code> automatically, and the <code>ExtendedResourceToleration</code> admission plugin can add the matching toleration to any pod that requests GPUs.</p>
+    <pre><code>kubectl taint nodes gpu-node-1 nvidia.com/gpu=present:NoSchedule</code></pre>
+    <h3>Pick the GPU model: node affinity on GFD labels</h3>
+    <pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: trainer
+spec:
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values: ["NVIDIA-H100-80GB-HBM3", "NVIDIA-A100-SXM4-80GB"]
+  containers:
+    - name: train
+      image: ghcr.io/example/trainer:1.0
+      resources:
+        limits:
+          nvidia.com/gpu: 4
+          cpu: "32"
+          memory: 256Gi</code></pre>
+    <div class="callout">
+      <strong>Remember:</strong> a toleration only <em>allows</em> a pod on a tainted node; it does not <em>attract</em> it. You need both a toleration (permission) and affinity or a GPU request (attraction).
+    </div>
+  </section>
+
+  <section id="sharing">
+    <h2>6. Sharing GPUs: Time-Slicing, MPS, and MIG</h2>
+    <p>Many workloads (notebooks, small models, dev environments) use a fraction of a big GPU. Giving each a whole H100 wastes money. Three NVIDIA sharing options, from weakest to strongest isolation:</p>
+    <table>
+      <thead><tr><th></th><th>Time-slicing</th><th>MPS</th><th>MIG</th></tr></thead>
+      <tbody>
+        <tr><td>How</td><td>Processes take turns on the whole GPU</td><td>A server merges work from several processes so they run concurrently</td><td>Hardware splits the GPU into isolated instances</td></tr>
+        <tr><td>Memory isolation</td><td>None: one pod can use all memory and crash others (OOM)</td><td>Limits can be set per client; no full fault isolation</td><td>Yes, each slice has its own memory</td></tr>
+        <tr><td>Performance isolation</td><td>None</td><td>Partial</td><td>Yes, dedicated compute and memory bandwidth</td></tr>
+        <tr><td>Hardware</td><td>Any NVIDIA GPU</td><td>Most NVIDIA GPUs</td><td>A100, A30, H100, H200, B200 and other data-center GPUs</td></tr>
+        <tr><td>Good for</td><td>Dev, notebooks, bursty light jobs</td><td>Many small inference processes</td><td>Multi-tenant production, guaranteed QoS</td></tr>
+      </tbody>
+    </table>
+    <h3>Time-slicing config</h3>
+    <p>Each physical GPU is advertised as several "replicas". Pods still request <code>nvidia.com/gpu: 1</code>, but now get a shared slot.</p>
+    <pre><code>apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator
+data:
+  any: |-
+    version: v1
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4</code></pre>
+    <p>A node with 8 GPUs now advertises <code>nvidia.com/gpu: 32</code>. Point the operator at it (<code>devicePlugin.config.name=time-slicing-config</code>). Remember: nothing stops one pod from using all 80 GB.</p>
+    <h3>MIG: real hardware partitions</h3>
+    <p><strong>Multi-Instance GPU</strong> splits one GPU into up to <strong>7</strong> instances, each with its own compute units, cache, and memory. Profiles are named <code>&lt;compute slices&gt;g.&lt;memory&gt;gb</code>. For an H100 80 GB, examples are <code>1g.10gb</code>, <code>2g.20gb</code>, <code>3g.40gb</code>, and <code>7g.80gb</code> (the whole GPU).</p>
+    <p>With the operator's "mixed" strategy, each profile becomes its own resource:</p>
+    <pre><code>resources:
+  limits:
+    nvidia.com/mig-1g.10gb: 1</code></pre>
+    <p><strong>Worked example:</strong> a team runs 14 small embedding services, each needing under 8 GB. On 2 H100s split into 7 x <code>1g.10gb</code> each, all 14 fit on 2 GPUs, with hard isolation, instead of 14 whole GPUs.</p>
+  </section>
+
+  <section id="dra">
+    <h2>7. Dynamic Resource Allocation (DRA)</h2>
+    <p>The device plugin model has limits: a device is just a count. You cannot say "a GPU with at least 40 GB of memory", "two GPUs connected by NVLink", or "share this GPU between these two pods". <strong>Dynamic Resource Allocation</strong> fixes this. Its core API reached general availability with the <code>resource.k8s.io/v1</code> API in <strong>Kubernetes v1.34</strong>, and the Kubernetes docs list it as stable and always on from v1.35.</p>
+    <h3>The new objects</h3>
+    <table>
+      <thead><tr><th>Object</th><th>Who creates it</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>DeviceClass</code></td><td>Admin / driver install</td><td>A kind of device, for example "NVIDIA GPU"</td></tr>
+        <tr><td><code>ResourceSlice</code></td><td>The DRA driver on each node</td><td>The devices on the node, with attributes (model, memory, driver version) and capacity</td></tr>
+        <tr><td><code>ResourceClaim</code></td><td>User</td><td>"I need devices matching these rules"</td></tr>
+        <tr><td><code>ResourceClaimTemplate</code></td><td>User</td><td>Stamps out a new claim per pod (like a PVC template)</td></tr>
+      </tbody>
+    </table>
+    <p>The scheduler reads the ResourceSlices, finds devices matching the claim (rules are written in <strong>CEL</strong>, a small expression language), allocates them, and the driver prepares them on the node. It is the same idea as PersistentVolumeClaims, but for devices.</p>
+    <pre><code>apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: one-gpu
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            deviceClassName: gpu.nvidia.com
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dra-demo
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: one-gpu
+  containers:
+    - name: app
+      image: nvidia/cuda:12.4.1-base-ubuntu22.04
+      command: ["nvidia-smi", "-L"]
+      resources:
+        claims:
+          - name: gpu</code></pre>
+    <p>The device class name and the attributes you can filter on come from the installed DRA driver (here NVIDIA's). Use <code>kubectl get deviceclasses</code> and <code>kubectl get resourceslices -o yaml</code> to see what your cluster offers. Device plugins still work and remain common; DRA is where new GPU features (fine-grained sharing, topology-aware multi-GPU, network devices) are heading.</p>
+  </section>
+
+  <section id="gang">
+    <h2>8. Distributed Training and Gang Scheduling</h2>
+    <p>A training job across 4 nodes x 8 GPUs needs <strong>all 32 GPUs at once</strong>. The default scheduler places pods one by one. Imagine two such jobs and only 32 free GPUs:</p>
+    <pre><code>Job A gets 16 GPUs (2 of its 4 pods) ... waits for the rest
+Job B gets 16 GPUs (2 of its 4 pods) ... waits for the rest
+=&gt; 32 GPUs allocated, 0 jobs running. Deadlock, and expensive.</code></pre>
+    <p><strong>Gang scheduling</strong> means all-or-nothing: either every pod of a job starts, or none do. Common tools:</p>
+    <ul>
+      <li><strong>Kueue</strong> (a Kubernetes SIG project): a job-queueing layer. It admits a whole job only when quota for all its resources is available, manages team quotas with borrowing (ClusterQueues and cohorts), and supports fair sharing and preemption. Works with Jobs, JobSets, Kubeflow training jobs, RayJobs, and more.</li>
+      <li><strong>Volcano</strong>: a batch scheduler with PodGroups (<code>minMember</code>) for gang scheduling, popular for AI and HPC.</li>
+    </ul>
+    <p>Also think about <strong>topology</strong>: GPUs in the same node talk over NVLink, nodes talk over InfiniBand or RoCE. Placing a job's pods close together (same rack, same network block) can change training speed a lot. Kueue's topology-aware scheduling and cloud placement policies address this. For the training side, see <a href="../../../AI Engineer/learn/Training-Pipeline/ai-engineering-distributed-training.html">Distributed Training</a>.</p>
+  </section>
+
+  <section id="inference">
+    <h2>9. Serving an LLM: a Complete Deployment</h2>
+    <p>A vLLM server for an 8B model on one GPU, with the details that usually trip people up:</p>
+    <pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-8b
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: llm-8b }
+  template:
+    metadata:
+      labels: { app: llm-8b }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest   # pin a specific version in production
+          args:
+            - --model=meta-llama/Llama-3.1-8B-Instruct
+            - --max-model-len=8192
+            - --gpu-memory-utilization=0.90
+            - --enable-prefix-caching
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token } }
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              memory: 48Gi
+            requests:
+              cpu: "4"
+              memory: 48Gi
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          startupProbe:                    # model download + load can take minutes
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 60
+          volumeMounts:
+            - { name: cache, mountPath: /root/.cache/huggingface }
+            - { name: dshm, mountPath: /dev/shm }
+      volumes:
+        - name: cache
+          persistentVolumeClaim: { claimName: hf-cache }
+        - name: dshm                       # shared memory for NCCL / multi-process
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }</code></pre>
+    <ul>
+      <li><strong>startupProbe:</strong> without it, the liveness/readiness checks may kill or hide the pod while it downloads 16 GB of weights.</li>
+      <li><strong>Model cache on a PVC:</strong> avoids re-downloading weights on every restart.</li>
+      <li><strong>/dev/shm:</strong> the container default is only 64 MB; multi-GPU (tensor parallel) serving needs more.</li>
+    </ul>
+    <p>Why the memory settings matter, and how many users one GPU can hold: see <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-inference-optimization.html#capacity">Inference Optimization: capacity planning</a>.</p>
+  </section>
+
+  <section id="autoscaling">
+    <h2>10. Autoscaling and Cost</h2>
+    <ul>
+      <li><strong>Node autoscaling:</strong> Cluster Autoscaler or Karpenter adds GPU nodes when GPU pods are Pending and removes idle ones. Keep GPU node pools able to <strong>scale to zero</strong> for dev and batch.</li>
+      <li><strong>Pod autoscaling for inference:</strong> scale on <em>queue depth</em>, requests in flight, or KV cache usage (via custom or external metrics, or KEDA), not on CPU. GPU utilization is a weak signal for LLM servers.</li>
+      <li><strong>Cold starts:</strong> a new GPU node plus image pull plus weight loading can take 5 to 15 minutes. Keep warm capacity, pre-pull images, and use fast model storage.</li>
+      <li><strong>Spot/preemptible GPUs:</strong> much cheaper for fault-tolerant training with checkpointing, risky for latency-critical serving.</li>
+    </ul>
+  </section>
+
+  <section id="monitoring">
+    <h2>11. Monitoring GPUs</h2>
+    <p>The DCGM exporter publishes per-GPU metrics with pod and namespace labels:</p>
+    <table>
+      <thead><tr><th>Metric</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>DCGM_FI_DEV_GPU_UTIL</code></td><td>Percent of time any kernel was running. Coarse: 100% does not mean the GPU is fully used.</td></tr>
+        <tr><td><code>DCGM_FI_PROF_GR_ENGINE_ACTIVE</code>, <code>DCGM_FI_PROF_SM_ACTIVE</code></td><td>Better measures of how busy the compute engines really are</td></tr>
+        <tr><td><code>DCGM_FI_DEV_FB_USED</code></td><td>GPU memory used (MiB)</td></tr>
+        <tr><td><code>DCGM_FI_DEV_POWER_USAGE</code>, <code>DCGM_FI_DEV_GPU_TEMP</code></td><td>Power and temperature; throttling shows up here</td></tr>
+        <tr><td><code>DCGM_FI_DEV_XID_ERRORS</code></td><td>Driver-reported GPU errors; certain XIDs mean the node needs draining</td></tr>
+      </tbody>
+    </table>
+    <p>A useful cost dashboard: GPUs allocated per namespace (from <code>kube_pod_container_resource_limits</code>) next to how busy those GPUs actually are. Big gaps mean wasted money and candidates for MIG or time-slicing.</p>
+  </section>
+
+  <section id="debugging">
+    <h2>12. Scenario: My GPU Pod Is Stuck in Pending</h2>
+    <p><strong>Situation.</strong> You deploy a training pod requesting 2 GPUs. It stays <code>Pending</code> for 20 minutes.</p>
+    <h3>Step 1: read the scheduler's reason</h3>
+    <pre><code>$ kubectl describe pod trainer | sed -n '/Events/,$p'
+  Warning  FailedScheduling  0/6 nodes are available: 3 Insufficient nvidia.com/gpu,
+           3 node(s) had untolerated taint {nvidia.com/gpu: present}. ...</code></pre>
+    <h3>Step 2: decode the message, piece by piece</h3>
+    <table>
+      <thead><tr><th>Message part</th><th>Meaning</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>Insufficient nvidia.com/gpu</code></td><td>Those nodes do not have 2 <em>free</em> GPUs</td><td>Wait, free GPUs, request fewer, or add nodes</td></tr>
+        <tr><td><code>untolerated taint</code></td><td>Pod lacks the toleration for GPU nodes</td><td>Add the toleration</td></tr>
+        <tr><td><code>didn't match Pod's node affinity/selector</code></td><td>Label mismatch, for example a typo in the GPU product name</td><td>Compare with real node labels</td></tr>
+        <tr><td>No GPU node mentioned at all, and none have the resource</td><td>Device plugin not running, or driver broken</td><td>Check the operator pods and node allocatable</td></tr>
+      </tbody>
+    </table>
+    <h3>Step 3: check what is really free</h3>
+    <pre><code>kubectl get nodes -o custom-columns=NAME:.metadata.name,ALLOC:.status.allocatable.nvidia\.com/gpu
+kubectl describe node gpu-node-1 | sed -n '/Allocated resources/,/Events/p'
+kubectl get pods -A -o wide --field-selector spec.nodeName=gpu-node-1</code></pre>
+    <p>Often you find GPUs held by a forgotten notebook or a finished Job whose pod was never cleaned up. (Pods in <code>Completed</code> state do not hold GPUs; pods stuck <code>Running</code> with nothing to do do.)</p>
+    <h3>Step 4: check the plugin if allocatable is missing or 0</h3>
+    <pre><code>kubectl get pods -n gpu-operator
+kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset</code></pre>
+    <p>Common causes: driver install failed after a kernel upgrade, a GPU fell off the bus (XID errors), or the node is missing the label the operator uses to select GPU nodes.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Setting <code>NVIDIA_VISIBLE_DEVICES=all</code> in an image or pod spec</strong> without requesting the resource. Depending on runtime configuration this can expose GPUs the scheduler thinks are free, leading to two jobs on one GPU. Always go through resource requests.</li>
+      <li><strong>Treating time-slicing as isolation.</strong> One pod's memory leak crashes its neighbours.</li>
+      <li><strong>Forgetting CPU and RAM for GPU pods.</strong> Data loaders starve the GPU when the pod gets 1 CPU. Request enough CPU and memory, and set <code>/dev/shm</code>.</li>
+      <li><strong>Image and driver mismatch.</strong> The CUDA version in the image must be supported by the node's driver (newer drivers run older CUDA, not the other way around).</li>
+      <li><strong>No startupProbe for model servers.</strong> Pods get killed during multi-minute model loads.</li>
+      <li><strong>Scheduling distributed jobs without gang semantics.</strong> Partial allocations can deadlock the cluster's GPUs.</li>
+    </ul>
+    <p class="refer-link"><small>Refer: <a href="https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/" rel="noopener noreferrer">Kubernetes: Schedule GPUs</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/" rel="noopener noreferrer">Kubernetes: Dynamic Resource Allocation</a> &middot; <a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html" rel="noopener noreferrer">NVIDIA GPU Operator</a> &middot; <a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/" rel="noopener noreferrer">NVIDIA MIG User Guide</a> &middot; <a href="https://kueue.sigs.k8s.io/" rel="noopener noreferrer">Kueue</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="kubernetes-workloads.html">Workloads</a> &middot; <a href="kubernetes-helm-observability.html">Helm &amp; Observability</a> &middot; <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-inference-optimization.html">LLM Inference Optimization</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

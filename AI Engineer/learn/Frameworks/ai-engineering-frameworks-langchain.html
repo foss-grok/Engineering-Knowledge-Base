@@ -10,7 +10,7 @@
 <body class="learn-page">
 <header>
   <nav aria-label="Breadcrumb">
-    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering.html#frameworks">Frameworks</a> &rsaquo; LangChain</p>
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html#frameworks">Frameworks</a> &rsaquo; LangChain</p>
   </nav>
   <h1>LangChain</h1>
   <p>Composable primitives for building LLM applications: models, prompts, retrieval, tools, and orchestration via LCEL.</p>
@@ -21,7 +21,7 @@
     <h2>What LangChain Is (and Is Not)</h2>
     <p>LangChain is an open-source framework for building applications powered by large language models. It standardizes how you connect models to data sources, tools, memory, and business logic. The core value is composability: small, testable units (runnables) snap together into pipelines without rewriting glue code for every provider swap.</p>
     <p>LangChain is <strong>not</strong> a model host, vector database, or agent runtime by itself. It integrates with OpenAI, Anthropic, local Ollama, Hugging Face, Pinecone, Postgres pgvector, and hundreds of other backends through adapter packages. For durable, stateful agent workflows with checkpoints and human approval, teams typically pair LangChain with <strong>LangGraph</strong> (same ecosystem, lower-level graph runtime).</p>
-    <p class="refer-link"><small>Refer: <a href="https://python.langchain.com/docs/concepts/" rel="noopener noreferrer">LangChain concepts</a> � <a href="https://github.com/langchain-ai/langchain" rel="noopener noreferrer">GitHub</a></small></p>
+    <p class="refer-link"><small>Refer: <a href="https://python.langchain.com/docs/concepts/" rel="noopener noreferrer">LangChain concepts</a> &middot; <a href="https://github.com/langchain-ai/langchain" rel="noopener noreferrer">GitHub</a></small></p>
   </section>
 
   <section>
@@ -90,13 +90,13 @@ chain = RunnableParallel(
     <pre><code>from langchain_core.tools import tool
 
 @tool
-def get_weather(city: str) -> str:
+def get_weather(city: str) -&gt; str:
     """Return current weather for a city."""
     return f"Sunny in {city}"
 
 model_with_tools = model.bind_tools([get_weather])
 response = model_with_tools.invoke([HumanMessage("Weather in Berlin?")])
-# response.tool_calls -> [{name, args, id}]</code></pre>
+# response.tool_calls -&gt; [{name, args, id}]</code></pre>
     <p><code>bind_tools</code> converts Python functions (with type hints and docstrings) or Pydantic models into provider-native tool schemas. The model returns structured call requests; your runtime executes tools and appends ToolMessages before the next invoke.</p>
     <h3>Structured output</h3>
     <p><code>with_structured_output(MyPydanticModel)</code> constrains responses to a schema via tool calling or JSON mode, depending on provider support. Prefer this over free-form JSON parsing for extraction pipelines.</p>
@@ -194,7 +194,7 @@ result = chain.invoke(
   </section>
 
   <nav class="page-footer-nav">
-    <p>Also in Frameworks: <a href="ai-engineering-frameworks-langgraph.html">LangGraph</a> � <a href="ai-engineering-frameworks-langfuse.html">Langfuse</a></p>
+    <p>Also in Frameworks: <a href="ai-engineering-frameworks-langgraph.html">LangGraph</a> &middot; <a href="ai-engineering-frameworks-langfuse.html">Langfuse</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
   </nav>
 </main>
