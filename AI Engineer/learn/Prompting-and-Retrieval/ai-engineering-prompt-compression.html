@@ -28,7 +28,7 @@
       <li><strong>Conversation history</strong> (stale turns that still fit in window but waste budget)</li>
     </ul>
     <p>Compression is distinct from <em>context window extension</em> (e.g. sliding windows, memory stores). It makes existing context denser. It is complementary to KV-cache optimization, quantization, and smaller models.</p>
-    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/html/2410.12388v2" rel="noopener noreferrer">Prompt Compression Survey</a> � <a href="https://arxiv.org/abs/2310.05736" rel="noopener noreferrer">LLMLingua paper</a></small></p>
+    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/html/2410.12388v2" rel="noopener noreferrer">Prompt Compression Survey</a> &middot; <a href="https://arxiv.org/abs/2310.05736" rel="noopener noreferrer">LLMLingua paper</a></small></p>
   </section>
 
   <section>
@@ -140,7 +140,7 @@ result = compressor.compress_prompt(
 )
 
 compressed = result["compressed_prompt"]
-print(result["origin_tokens"], "->", result["compressed_tokens"])</code></pre>
+print(result["origin_tokens"], "-&gt;", result["compressed_tokens"])</code></pre>
 
     <h3>LongLLMLingua example (RAG)</h3>
     <pre><code>compressor = PromptCompressor(
@@ -186,7 +186,7 @@ compressed = compressor.compress_prompt(
   <section>
     <h2>Headroom</h2>
     <p>Headroom is an open-source <strong>context compression layer for AI agents</strong>. It targets tool outputs, logs, RAG chunks, files, and conversation history before they reach the LLM. Typical savings: <strong>60-95%</strong> on JSON/search results, <strong>15-70%</strong> on code-heavy agent traces, with a focus on preserving errors, stack traces, and structurally important fields.</p>
-    <p class="refer-link"><small>Refer: <a href="https://github.com/headroomlabs-ai/headroom" rel="noopener noreferrer">Headroom GitHub</a> � <a href="https://headroomlabs-ai.github.io/headroom/" rel="noopener noreferrer">Headroom docs</a></small></p>
+    <p class="refer-link"><small>Refer: <a href="https://github.com/headroomlabs-ai/headroom" rel="noopener noreferrer">Headroom GitHub</a> &middot; <a href="https://headroomlabs-ai.github.io/headroom/" rel="noopener noreferrer">Headroom docs</a></small></p>
 
     <h3>What makes Headroom different</h3>
     <ul>
@@ -322,7 +322,7 @@ response = llm.invoke(compressed_messages)
 
   <section>
     <h2>Production Patterns</h2>
-    <h3>RAG Q&A API</h3>
+    <h3>RAG Q&amp;A API</h3>
     <ol>
       <li>Retrieve top-k chunks (hybrid search + rerank).</li>
       <li>Run <strong>LongLLMLingua</strong> or LLMLingua-2 on assembled context with the user question.</li>
@@ -373,7 +373,7 @@ response = llm.invoke(compressed_messages)
   </section>
 
   <nav class="page-footer-nav">
-    <p>Related: <a href="ai-engineering-prompt-engineering.html">Prompt Engineering</a> � <a href="ai-engineering-rag.html">RAG</a> � <a href="ai-engineering-inference-optimization.html">Inference Optimization</a> � <a href="ai-engineering-frameworks-langchain.html">LangChain</a></p>
+    <p>Related: <a href="ai-engineering-prompt-engineering.html">Prompt Engineering</a> &middot; <a href="ai-engineering-rag.html">RAG</a> &middot; <a href="../Inference-Deployment-Operations/ai-engineering-inference-optimization.html">Inference Optimization</a> &middot; <a href="../Frameworks/ai-engineering-frameworks-langchain.html">LangChain</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
   </nav>
 </main>

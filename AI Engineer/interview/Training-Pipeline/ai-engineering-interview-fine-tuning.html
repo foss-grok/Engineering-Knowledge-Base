@@ -20,7 +20,7 @@
 <main>
 <section>
 
-<h2>Fine-Tuning & PEFT</h2>
+<h2>Fine-Tuning &amp; PEFT</h2>
 <p>Adapting a base model to a task or behavior.</p>
 
 <details><summary>Full fine-tuning vs PEFT - when do you choose each?</summary>
@@ -28,7 +28,7 @@
 </details>
 
 <details><summary>Explain LoRA in depth.</summary>
-<div><p>LoRA (Low-Rank Adaptation) freezes the original weight matrix <code>W</code> and instead learns a low-rank decomposition <code>?W = A�B</code> where A and B are much smaller matrices (rank r, typically 8-64), added to the frozen weight at inference: <code>W' = W + A�B</code>. Because the update is low-rank, the number of trainable parameters is a tiny fraction of the full model, memory and compute needs drop drastically, and multiple LoRA adapters can be trained and swapped in/out on the same frozen base model.</p></div>
+<div><p>LoRA (Low-Rank Adaptation) freezes the original weight matrix <code>W</code> and instead learns a low-rank decomposition <code>&Delta;W = A&times;B</code> where A and B are much smaller matrices (rank r, typically 8-64), added to the frozen weight at inference: <code>W' = W + A&times;B</code>. Because the update is low-rank, the number of trainable parameters is a tiny fraction of the full model, memory and compute needs drop drastically, and multiple LoRA adapters can be trained and swapped in/out on the same frozen base model.</p></div>
 </details>
 
 <details><summary>What is QLoRA and how does it save even more memory?</summary>

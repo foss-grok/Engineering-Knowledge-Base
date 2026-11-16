@@ -44,7 +44,7 @@
 </details>
 
 <details><summary>What is the difference between model FLOPs, training compute, and inference compute - why does it matter for decisions?</summary>
-<div><p>Training compute is a one-time cost proportional to <code>~6ND</code> (params � tokens), while inference compute is a recurring per-request cost proportional to model size and output length, paid every time the model is used. This is why labs increasingly train smaller models on far more tokens than "Chinchilla-optimal" (e.g. LLaMA-3) - a slightly more expensive training run is worth it if it produces a smaller, cheaper-to-serve model for the same quality.</p></div>
+<div><p>Training compute is a one-time cost proportional to <code>~6ND</code> (params &times; tokens), while inference compute is a recurring per-request cost proportional to model size and output length, paid every time the model is used. This is why labs increasingly train smaller models on far more tokens than "Chinchilla-optimal" (e.g. LLaMA-3) - a slightly more expensive training run is worth it if it produces a smaller, cheaper-to-serve model for the same quality.</p></div>
 </details>
 
 <details><summary>What is mixed-precision training and why use bf16 over fp16?</summary>

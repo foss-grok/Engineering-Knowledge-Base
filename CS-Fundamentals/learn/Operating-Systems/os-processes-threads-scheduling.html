@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Processes, Threads &amp; CPU Scheduling | CS Fundamentals</title>
+  <meta name="description" content="Operating systems from zero: what a process is, process states, context switches, fork and exec, threads, CPU scheduling algorithms with fully worked examples, Linux EEVDF and sched_ext, and container CPU throttling.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Processes, Threads &amp; Scheduling</p>
+  </nav>
+  <h1>Processes, Threads &amp; CPU Scheduling</h1>
+  <p>How one CPU runs hundreds of programs "at the same time", explained from zero, with worked scheduling problems you can solve by hand.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-picture">The Big Picture</a></li>
+    <li><a href="#process">What Is a Process?</a></li>
+    <li><a href="#states">Process States</a></li>
+    <li><a href="#context-switch">Context Switches</a></li>
+    <li><a href="#fork-exec">Creating Processes: fork, exec, wait</a></li>
+    <li><a href="#threads">Threads</a></li>
+    <li><a href="#scheduling-terms">Scheduling Vocabulary</a></li>
+    <li><a href="#algorithms">Scheduling Algorithms, Worked by Hand</a></li>
+    <li><a href="#linux">How Linux Actually Schedules (CFS, EEVDF, sched_ext)</a></li>
+    <li><a href="#containers">Scenario: Why Is My Container Slow at 30% CPU?</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-picture">
+    <h2>1. The Big Picture</h2>
+    <p>Your laptop may have 8 CPU cores. Yet it runs a browser, a music player, a chat app, and hundreds of background services at once. How?</p>
+    <p>The answer is <strong>time sharing</strong>. The operating system (OS) gives each program a tiny slice of CPU time, a few milliseconds. Then it pauses that program and gives the CPU to another one. It switches so fast that, to a human, everything looks simultaneous.</p>
+    <p>To do this, the OS needs answers to three questions:</p>
+    <ol>
+      <li><strong>What exactly is a "running program"?</strong> That is a <em>process</em> (and inside it, <em>threads</em>).</li>
+      <li><strong>How do we pause one program and resume another without losing anything?</strong> That is a <em>context switch</em>.</li>
+      <li><strong>Who runs next, and for how long?</strong> That is <em>CPU scheduling</em>.</li>
+    </ol>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> Think of one chef (the CPU) and many recipes being cooked (processes). The chef works on one dish for a minute, writes a sticky note saying exactly where they stopped ("added salt, stirring step 4"), then moves to another dish. The sticky note is the saved context. The rule for choosing the next dish is the scheduler.
+    </div>
+  </section>
+
+  <section id="process">
+    <h2>2. What Is a Process?</h2>
+    <p>A <strong>program</strong> is a file on disk, for example <code>/usr/bin/python3</code>. It is passive. It does nothing by itself.</p>
+    <p>A <strong>process</strong> is a program <em>in execution</em>. It is the program plus everything needed to run it right now. If you open three terminal windows and run <code>python3</code> in each, you have one program and three processes.</p>
+
+    <h3>What a process owns</h3>
+    <ul>
+      <li><strong>A process ID (PID):</strong> a number that names it, for example 4182.</li>
+      <li><strong>Its own virtual address space:</strong> its private view of memory. Process A cannot read process B's memory by accident.</li>
+      <li><strong>CPU state:</strong> the values in the CPU registers, including the <em>program counter</em> (the address of the next instruction to run) and the <em>stack pointer</em>.</li>
+      <li><strong>Open resources:</strong> open files, network sockets, pipes. Each is referenced by a small number called a <em>file descriptor</em> (0 = stdin, 1 = stdout, 2 = stderr).</li>
+      <li><strong>Credentials and limits:</strong> which user it runs as, how much memory it may use, and so on.</li>
+    </ul>
+    <p>The kernel stores all of this in a data structure called the <strong>Process Control Block (PCB)</strong>. In Linux the PCB is <code>struct task_struct</code>.</p>
+
+    <h3>The memory layout of a process</h3>
+    <pre><code>High addresses
+ +--------------------------+
+ |  Stack                   |  local variables, function call frames
+ |    grows downward  v     |  (one stack per thread)
+ |                          |
+ |    (free space)          |
+ |                          |
+ |    grows upward    ^     |
+ |  Heap                    |  malloc / new / Python objects
+ +--------------------------+
+ |  BSS                     |  global variables that start as zero
+ |  Data                    |  global variables with initial values
+ +--------------------------+
+ |  Text (code)             |  the machine instructions, read-only
+ +--------------------------+
+Low addresses</code></pre>
+    <p>Every address in this picture is <em>virtual</em>. The OS and hardware translate it to real RAM. See <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> for how.</p>
+    <p>You can look at a live process on Linux:</p>
+    <pre><code>$ cat /proc/self/status | head -n 9   # info about the 'cat' process itself
+$ ls -l /proc/$$/fd                   # open file descriptors of your shell
+$ cat /proc/$$/maps                   # its memory regions (text, heap, stack, libraries)</code></pre>
+  </section>
+
+  <section id="states">
+    <h2>3. Process States</h2>
+    <p>A process is not always running. At any moment it is in one of a few states:</p>
+    <pre><code>              admitted                    exit()
+   [ NEW ] -----------&gt; [ READY ] &lt;----+     [ TERMINATED ]
+                          |    ^        |           ^
+          scheduler picks |    | time   |           |
+                    it    v    | slice  |           |
+                        [ RUNNING ] ----+-----------+
+                          |       used up / preempted
+       waits for I/O,     |
+       a lock, or sleep   v
+                       [ WAITING ]  (also called BLOCKED)
+                          |
+                          +---- I/O done -----&gt; back to READY</code></pre>
+    <table>
+      <thead><tr><th>State</th><th>Meaning in plain words</th></tr></thead>
+      <tbody>
+        <tr><td>New</td><td>Being created. The kernel is setting up its PCB and memory.</td></tr>
+        <tr><td>Ready</td><td>Could run right now, but is waiting for a free CPU. It sits in the <em>run queue</em>.</td></tr>
+        <tr><td>Running</td><td>Instructions are executing on a CPU core. At most one process per core is in this state.</td></tr>
+        <tr><td>Waiting / Blocked</td><td>Cannot run even if a CPU is free. It waits for something: a disk read, a network packet, a timer, a lock.</td></tr>
+        <tr><td>Terminated</td><td>Finished. Some bookkeeping remains until the parent collects the exit code.</td></tr>
+      </tbody>
+    </table>
+    <p>The key insight: <strong>a blocked process uses no CPU</strong>. While your web server waits for the database, the CPU runs something else. This is why one core can serve many I/O-heavy programs.</p>
+    <p>On Linux, <code>ps</code> and <code>top</code> show these as letters: <code>R</code> (running or runnable, so Linux merges Ready and Running), <code>S</code> (sleeping, interruptible), <code>D</code> (uninterruptible sleep, usually disk I/O), <code>Z</code> (zombie), <code>T</code> (stopped).</p>
+  </section>
+
+  <section id="context-switch">
+    <h2>4. Context Switches</h2>
+    <p>A <strong>context switch</strong> is the act of saving the state of the running process and loading the state of the next one.</p>
+    <h3>Step by step</h3>
+    <ol>
+      <li>Something gives control to the kernel. Either a <strong>timer interrupt</strong> fires (the time slice is over), or the process makes a <strong>system call</strong> that blocks (for example <code>read()</code> on a socket with no data).</li>
+      <li>The kernel saves the CPU registers of process A (program counter, stack pointer, general registers) into A's PCB.</li>
+      <li>The scheduler picks process B.</li>
+      <li>The kernel switches the memory mapping to B's address space (on x86 this means loading a new page table base into the <code>CR3</code> register).</li>
+      <li>The kernel restores B's registers from B's PCB. The CPU continues exactly where B stopped.</li>
+    </ol>
+    <h3>Why switches cost something</h3>
+    <p>The direct cost is small, typically a few microseconds. The hidden cost is bigger: B's data is probably not in the CPU caches and TLB (the cache of address translations). So B runs slowly for a while until the caches "warm up" again. This is why a scheduler should not switch too often.</p>
+    <div class="callout">
+      <strong>Two kinds of switch you can measure:</strong> <em>voluntary</em> (the process blocked on I/O or a lock) and <em>involuntary</em> (the scheduler preempted it). Run <code>grep ctxt /proc/&lt;pid&gt;/status</code>. Many involuntary switches mean CPU contention. Many voluntary switches mean the program waits a lot.
+    </div>
+  </section>
+
+  <section id="fork-exec">
+    <h2>5. Creating Processes: fork, exec, wait</h2>
+    <p>On Unix-like systems (Linux, macOS), new processes are created in two steps:</p>
+    <ul>
+      <li><strong><code>fork()</code></strong> makes a copy of the calling process. After it, there are two almost identical processes. The only visible difference is the return value: the child gets <code>0</code>, and the parent gets the child's PID.</li>
+      <li><strong><code>exec()</code></strong> (a family: <code>execlp</code>, <code>execvp</code>, ...) replaces the current program with a new program. The PID stays the same. The code, data, heap, and stack are replaced.</li>
+      <li><strong><code>wait()</code> / <code>waitpid()</code></strong> lets the parent pause until a child finishes and read its exit code.</li>
+    </ul>
+    <p>This is exactly what your shell does when you type <code>ls</code>: it forks, the child execs <code>/bin/ls</code>, and the shell waits.</p>
+
+    <h3>A complete, tested example</h3>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/wait.h&gt;
+
+int main(void) {
+    printf("parent: my pid is %d\n", getpid());
+    fflush(stdout);                 /* empty the buffer before fork */
+
+    pid_t pid = fork();             /* one call, two returns */
+    if (pid &lt; 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0) {
+        /* Child: fork() returned 0 here */
+        printf("child: pid=%d, parent=%d\n", getpid(), getppid());
+        fflush(stdout);
+        execlp("echo", "echo", "child: now running the echo program", (char *)NULL);
+        perror("execlp");           /* only reached if exec failed */
+        _exit(127);
+    }
+    /* Parent: fork() returned the child's pid */
+    int status;
+    waitpid(pid, &amp;status, 0);       /* reap the child, no zombie */
+    if (WIFEXITED(status))
+        printf("parent: child %d exited with code %d\n", pid, WEXITSTATUS(status));
+    return 0;
+}</code></pre>
+    <pre><code>$ gcc -Wall -o fork fork.c &amp;&amp; ./fork
+parent: my pid is 989355
+child: pid=989356, parent=989355
+child: now running the echo program
+parent: child 989356 exited with code 0</code></pre>
+
+    <h3>Copy-on-write: why fork is cheap</h3>
+    <p>Copying gigabytes of memory on every <code>fork()</code> would be slow. Instead, the kernel lets parent and child <em>share</em> the same physical pages and marks them read-only. Only when one of them writes to a page does the kernel copy that single page. This trick is called <strong>copy-on-write (COW)</strong>. Redis uses it to take snapshots: it forks, and the child writes the frozen memory to disk while the parent keeps serving.</p>
+
+    <h3>Worked problem: how many processes?</h3>
+    <pre><code>int main(void) {
+    fork();
+    fork();
+    fork();
+    printf("hi\n");
+}</code></pre>
+    <p>Walk through it. Before the first fork there is 1 process. Each <code>fork()</code> is executed by <em>every</em> process that exists at that point, and each one doubles.</p>
+    <ul>
+      <li>After fork #1: 2 processes.</li>
+      <li>After fork #2: each of the 2 forks, so 4.</li>
+      <li>After fork #3: 8.</li>
+    </ul>
+    <p>So "hi" prints <strong>8 times</strong>. In general, <code>n</code> sequential forks give <code>2<sup>n</sup></code> processes, which means <code>2<sup>n</sup> - 1</code> new ones were created. (We ran this on Linux and counted 8 lines.)</p>
+
+    <h3>Zombies and orphans</h3>
+    <ul>
+      <li><strong>Zombie:</strong> a child has exited but the parent has not called <code>wait()</code> yet. The process uses no memory or CPU, but its PID and exit code stay in the process table. Thousands of zombies can exhaust PIDs. Fix: the parent must reap children (or handle <code>SIGCHLD</code>).</li>
+      <li><strong>Orphan:</strong> the parent exits first. The child is adopted by PID 1 (<code>init</code>/<code>systemd</code>), or by a "subreaper", which reaps it later.</li>
+    </ul>
+    <div class="callout">
+      <strong>Containers connection:</strong> Inside a container your app is often PID 1. PID 1 has special duties: it must reap orphaned zombies, and it does not get default signal handlers, so <code>SIGTERM</code> may be ignored. That is why tools like <code>tini</code> (or <code>docker run --init</code>) exist. See <a href="../../../Docker-Kubernetes/learn/Docker/docker-advanced.html">Advanced Docker</a>.
+    </div>
+  </section>
+
+  <section id="threads">
+    <h2>6. Threads</h2>
+    <p>A <strong>thread</strong> is one sequence of instructions running inside a process. A process starts with one thread. It can create more.</p>
+    <table>
+      <thead><tr><th></th><th>Shared by all threads of a process</th><th>Private to each thread</th></tr></thead>
+      <tbody>
+        <tr><td>Memory</td><td>Code, global data, heap</td><td>Its own stack</td></tr>
+        <tr><td>CPU</td><td></td><td>Registers, program counter</td></tr>
+        <tr><td>Resources</td><td>Open files, sockets, PID</td><td>Thread ID, signal mask</td></tr>
+      </tbody>
+    </table>
+    <h3>Why use threads instead of processes?</h3>
+    <ul>
+      <li><strong>Cheap sharing:</strong> threads see the same heap, so passing data is just passing a pointer. Processes need pipes, sockets, or shared memory.</li>
+      <li><strong>Cheaper to create and switch:</strong> switching between threads of the same process does not change the address space, so the TLB stays useful.</li>
+    </ul>
+    <h3>The price: shared memory is dangerous</h3>
+    <p>If two threads update the same variable without coordination, updates get lost. <code>counter++</code> looks like one step but is three: load, add, store. Two threads can both load 5, both add 1, and both store 6. One increment vanished. This is a <strong>race condition</strong>. Fixes are locks (mutexes), atomic operations, or not sharing mutable data.</p>
+    <h3>How Linux implements threads</h3>
+    <p>Linux does not have a separate "thread" object. Both processes and threads are <em>tasks</em> created by the <code>clone()</code> system call. A thread is simply a task that shares its address space, files, and signal handlers with its creator. Each thread is scheduled independently, so a process with 4 threads can use 4 cores at once. Run <code>ps -eLf</code> to see one line per thread.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> A process is a house. Threads are people living in the house. They share the kitchen and the fridge (heap), each has their own notebook (stack), and if two people cook in the same pot at once without talking, dinner is ruined (race condition).
+    </div>
+    <h3>Concurrency vs parallelism</h3>
+    <p><strong>Concurrency</strong> means several tasks are in progress during the same period, possibly by taking turns on one core. <strong>Parallelism</strong> means tasks literally execute at the same instant on different cores. A single-core machine can be concurrent but never parallel.</p>
+  </section>
+
+  <section id="scheduling-terms">
+    <h2>7. Scheduling Vocabulary</h2>
+    <p>Before solving scheduling problems, learn these terms. Every exam and every real tuning discussion uses them.</p>
+    <table>
+      <thead><tr><th>Term</th><th>Plain meaning</th><th>Formula</th></tr></thead>
+      <tbody>
+        <tr><td>Arrival time (AT)</td><td>When the process enters the ready queue</td><td>given</td></tr>
+        <tr><td>Burst time (BT)</td><td>How much CPU time it needs in total</td><td>given</td></tr>
+        <tr><td>Completion time (CT)</td><td>The moment it finishes</td><td>read from the timeline</td></tr>
+        <tr><td>Turnaround time (TAT)</td><td>Total time from arrival to finish</td><td><code>TAT = CT - AT</code></td></tr>
+        <tr><td>Waiting time (WT)</td><td>Time spent ready but not running</td><td><code>WT = TAT - BT</code></td></tr>
+        <tr><td>Response time (RT)</td><td>Time from arrival until it first gets the CPU</td><td><code>RT = first start - AT</code></td></tr>
+        <tr><td>Throughput</td><td>Processes finished per unit time</td><td><code>count / total time</code></td></tr>
+      </tbody>
+    </table>
+    <p>Two more words matter:</p>
+    <ul>
+      <li><strong>Non-preemptive:</strong> once a process gets the CPU it keeps it until it finishes or blocks.</li>
+      <li><strong>Preemptive:</strong> the OS can take the CPU away in the middle (for example when the time slice ends or a more urgent process arrives).</li>
+    </ul>
+    <p>A <strong>Gantt chart</strong> is just a timeline showing which process ran when. We will draw one for every algorithm.</p>
+  </section>
+
+  <section id="algorithms">
+    <h2>8. Scheduling Algorithms, Worked by Hand</h2>
+    <p>We use the same four processes for every algorithm so you can compare. Times are in milliseconds. One CPU.</p>
+    <table>
+      <thead><tr><th>Process</th><th>Arrival (AT)</th><th>Burst (BT)</th></tr></thead>
+      <tbody>
+        <tr><td>P1</td><td>0</td><td>7</td></tr>
+        <tr><td>P2</td><td>2</td><td>4</td></tr>
+        <tr><td>P3</td><td>4</td><td>1</td></tr>
+        <tr><td>P4</td><td>5</td><td>4</td></tr>
+      </tbody>
+    </table>
+    <p>Total work is 7 + 4 + 1 + 4 = 16 ms, so every schedule ends at time 16 (the CPU is never idle here).</p>
+
+    <h3>8.1 First-Come, First-Served (FCFS)</h3>
+    <p><strong>Rule:</strong> run processes in arrival order. Non-preemptive. It is a simple queue.</p>
+    <pre><code>| P1            | P2      | P3 | P4      |
+0               7         11   12        16</code></pre>
+    <table>
+      <thead><tr><th>Process</th><th>CT</th><th>TAT = CT - AT</th><th>WT = TAT - BT</th><th>RT</th></tr></thead>
+      <tbody>
+        <tr><td>P1</td><td>7</td><td>7 - 0 = 7</td><td>7 - 7 = 0</td><td>0</td></tr>
+        <tr><td>P2</td><td>11</td><td>11 - 2 = 9</td><td>9 - 4 = 5</td><td>5</td></tr>
+        <tr><td>P3</td><td>12</td><td>12 - 4 = 8</td><td>8 - 1 = 7</td><td>7</td></tr>
+        <tr><td>P4</td><td>16</td><td>16 - 5 = 11</td><td>11 - 4 = 7</td><td>7</td></tr>
+        <tr><td><strong>Average</strong></td><td></td><td><strong>8.75</strong></td><td><strong>4.75</strong></td><td><strong>4.75</strong></td></tr>
+      </tbody>
+    </table>
+    <p><strong>Problem shown:</strong> P3 needs only 1 ms but waits 7 ms behind long jobs. This is the <strong>convoy effect</strong>: short jobs stuck behind a long one, like cars behind a slow truck.</p>
+
+    <h3>8.2 Shortest Job First (SJF), non-preemptive</h3>
+    <p><strong>Rule:</strong> when the CPU becomes free, pick the ready process with the smallest burst. Break ties by arrival time.</p>
+    <p>Walkthrough:</p>
+    <ol>
+      <li>t = 0: only P1 is ready. Run P1 to completion (non-preemptive), until t = 7.</li>
+      <li>t = 7: ready are P2 (4), P3 (1), P4 (4). Smallest is P3. Run 7 to 8.</li>
+      <li>t = 8: P2 (4) and P4 (4) tie. P2 arrived first. Run P2 8 to 12, then P4 12 to 16.</li>
+    </ol>
+    <pre><code>| P1            | P3 | P2      | P4      |
+0               7    8         12        16</code></pre>
+    <table>
+      <thead><tr><th>Process</th><th>CT</th><th>TAT</th><th>WT</th><th>RT</th></tr></thead>
+      <tbody>
+        <tr><td>P1</td><td>7</td><td>7</td><td>0</td><td>0</td></tr>
+        <tr><td>P2</td><td>12</td><td>10</td><td>6</td><td>6</td></tr>
+        <tr><td>P3</td><td>8</td><td>4</td><td>3</td><td>3</td></tr>
+        <tr><td>P4</td><td>16</td><td>11</td><td>7</td><td>7</td></tr>
+        <tr><td><strong>Average</strong></td><td></td><td><strong>8.0</strong></td><td><strong>4.0</strong></td><td><strong>4.0</strong></td></tr>
+      </tbody>
+    </table>
+    <p>SJF gives the <strong>minimum possible average waiting time</strong> among non-preemptive schedules for a known set of jobs. The catch: the OS does not know burst times in advance. Real systems <em>estimate</em> the next burst from past bursts, often with an exponential average: <code>next_guess = a * last_actual + (1 - a) * previous_guess</code>.</p>
+
+    <h3>8.3 Shortest Remaining Time First (SRTF), preemptive SJF</h3>
+    <p><strong>Rule:</strong> at every moment, run the process with the least <em>remaining</em> time. When a new process arrives, compare it with the running one and preempt if the new one is shorter.</p>
+    <ol>
+      <li>t = 0: P1 starts (remaining 7).</li>
+      <li>t = 2: P2 arrives with 4. P1 has 5 left. 4 &lt; 5, so P2 preempts P1.</li>
+      <li>t = 4: P3 arrives with 1. P2 has 2 left. 1 &lt; 2, so P3 runs.</li>
+      <li>t = 5: P3 finishes. P4 arrives with 4. Remaining: P1 = 5, P2 = 2, P4 = 4. Run P2.</li>
+      <li>t = 7: P2 finishes. Remaining: P1 = 5, P4 = 4. Run P4 until 11.</li>
+      <li>t = 11: only P1 is left. Run until 16.</li>
+    </ol>
+    <pre><code>| P1   | P2   | P3 | P2   | P4        | P1           |
+0      2      4    5      7           11             16</code></pre>
+    <table>
+      <thead><tr><th>Process</th><th>CT</th><th>TAT</th><th>WT</th><th>RT</th></tr></thead>
+      <tbody>
+        <tr><td>P1</td><td>16</td><td>16</td><td>9</td><td>0</td></tr>
+        <tr><td>P2</td><td>7</td><td>5</td><td>1</td><td>0</td></tr>
+        <tr><td>P3</td><td>5</td><td>1</td><td>0</td><td>0</td></tr>
+        <tr><td>P4</td><td>11</td><td>6</td><td>2</td><td>2</td></tr>
+        <tr><td><strong>Average</strong></td><td></td><td><strong>7.0</strong></td><td><strong>3.0</strong></td><td><strong>0.5</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Best averages so far. The danger is <strong>starvation</strong>: if short jobs keep arriving, a long job like P1 may wait forever. Here P1 waited 9 ms, more than anyone.</p>
+
+    <h3>8.4 Round Robin (RR), time quantum = 2</h3>
+    <p><strong>Rule:</strong> keep a FIFO ready queue. Each process runs for at most one <em>quantum</em> (here 2 ms), then goes to the back of the queue. This is the basis of interactive time sharing.</p>
+    <p><strong>Convention</strong> (state it in your answer, because books differ): if a new process arrives at the same instant a quantum ends, the new arrival joins the queue <em>before</em> the preempted process.</p>
+    <table>
+      <thead><tr><th>Time</th><th>Runs</th><th>What happens</th><th>Queue after</th></tr></thead>
+      <tbody>
+        <tr><td>0-2</td><td>P1</td><td>P1 left 5. P2 arrives at 2, joins first; then P1</td><td>P2, P1</td></tr>
+        <tr><td>2-4</td><td>P2</td><td>P2 left 2. P3 arrives at 4, joins; then P2</td><td>P1, P3, P2</td></tr>
+        <tr><td>4-6</td><td>P1</td><td>P4 arrives at 5. P1 left 3, back of queue</td><td>P3, P2, P4, P1</td></tr>
+        <tr><td>6-7</td><td>P3</td><td>P3 done (only needed 1)</td><td>P2, P4, P1</td></tr>
+        <tr><td>7-9</td><td>P2</td><td>P2 done</td><td>P4, P1</td></tr>
+        <tr><td>9-11</td><td>P4</td><td>P4 left 2</td><td>P1, P4</td></tr>
+        <tr><td>11-13</td><td>P1</td><td>P1 left 1</td><td>P4, P1</td></tr>
+        <tr><td>13-15</td><td>P4</td><td>P4 done</td><td>P1</td></tr>
+        <tr><td>15-16</td><td>P1</td><td>P1 done</td><td>empty</td></tr>
+      </tbody>
+    </table>
+    <pre><code>| P1 | P2 | P1 | P3| P2 | P4 | P1 | P4 | P1|
+0    2    4    6   7    9    11   13   15  16</code></pre>
+    <table>
+      <thead><tr><th>Process</th><th>CT</th><th>TAT</th><th>WT</th><th>RT</th></tr></thead>
+      <tbody>
+        <tr><td>P1</td><td>16</td><td>16</td><td>9</td><td>0</td></tr>
+        <tr><td>P2</td><td>9</td><td>7</td><td>3</td><td>0</td></tr>
+        <tr><td>P3</td><td>7</td><td>3</td><td>2</td><td>2</td></tr>
+        <tr><td>P4</td><td>15</td><td>10</td><td>6</td><td>4</td></tr>
+        <tr><td><strong>Average</strong></td><td></td><td><strong>9.0</strong></td><td><strong>5.0</strong></td><td><strong>1.5</strong></td></tr>
+      </tbody>
+    </table>
+    <p>RR has the worst average turnaround here, but good response time and <strong>no starvation</strong>: every process gets the CPU within <code>(n - 1) * quantum</code> of joining the queue, where n is the number of processes in the queue. It also caused 8 context switches versus 5 for SRTF.</p>
+    <h4>Choosing the quantum</h4>
+    <ul>
+      <li><strong>Too large</strong> (bigger than every burst): RR becomes FCFS.</li>
+      <li><strong>Too small</strong> (close to the context switch cost): the CPU spends most of its time switching instead of working. With a 1 ms quantum and 0.1 ms switch cost, about 1/11, roughly 9%, of CPU time is overhead.</li>
+    </ul>
+
+    <h3>8.5 Comparison</h3>
+    <table>
+      <thead><tr><th>Algorithm</th><th>Avg TAT</th><th>Avg WT</th><th>Avg RT</th><th>Starvation?</th><th>Needs burst length?</th></tr></thead>
+      <tbody>
+        <tr><td>FCFS</td><td>8.75</td><td>4.75</td><td>4.75</td><td>No</td><td>No</td></tr>
+        <tr><td>SJF</td><td>8.0</td><td>4.0</td><td>4.0</td><td>Yes</td><td>Yes (estimated)</td></tr>
+        <tr><td>SRTF</td><td>7.0</td><td>3.0</td><td>0.5</td><td>Yes</td><td>Yes (estimated)</td></tr>
+        <tr><td>RR (q = 2)</td><td>9.0</td><td>5.0</td><td>1.5</td><td>No</td><td>No</td></tr>
+      </tbody>
+    </table>
+    <p>(Every number above was checked with a small simulator.)</p>
+
+    <h3>8.6 Priority scheduling and multilevel queues</h3>
+    <p><strong>Priority scheduling</strong> runs the highest-priority ready process. SJF is a special case where priority = shorter burst. Low-priority work can starve; the classic fix is <strong>aging</strong>: slowly raise the priority of processes that have waited a long time.</p>
+    <p><strong>Multilevel Feedback Queue (MLFQ)</strong> uses several queues with different priorities and quanta. New processes start at the top. A process that uses its whole quantum (CPU-hungry) is moved down. A process that blocks early (interactive, I/O-bound) stays high. So the scheduler <em>learns</em> which jobs are interactive without being told. Periodically, everything is boosted to the top to prevent starvation.</p>
+  </section>
+
+  <section id="linux">
+    <h2>9. How Linux Actually Schedules (CFS, EEVDF, sched_ext)</h2>
+    <p>Textbook algorithms are building blocks. Real kernels combine them.</p>
+    <h3>Scheduling classes</h3>
+    <p>Linux has several scheduling classes checked in priority order. Real-time classes (<code>SCHED_FIFO</code>, <code>SCHED_RR</code>, and the deadline class <code>SCHED_DEADLINE</code>) always beat normal tasks. Almost every ordinary program runs in the normal class, <code>SCHED_OTHER</code> (also called <code>SCHED_NORMAL</code>).</p>
+    <h3>CFS: the idea of fair share</h3>
+    <p>From Linux 2.6.23 (2007) the normal class used the <strong>Completely Fair Scheduler (CFS)</strong>. Its core idea:</p>
+    <ul>
+      <li>Each task has a <strong>virtual runtime</strong> (<code>vruntime</code>): how much CPU it has had, scaled by its weight.</li>
+      <li>The scheduler always picks the task with the <strong>smallest vruntime</strong>, the one that has been treated least fairly so far. Tasks are kept in a red-black tree sorted by vruntime, so finding the minimum is fast.</li>
+      <li><strong>Nice values</strong> from -20 (high priority) to +19 (low) change the weight. Each nice step changes the CPU share by roughly 10%. A higher weight makes vruntime grow more slowly, so the task gets picked more often.</li>
+    </ul>
+    <h3>EEVDF: the current default</h3>
+    <p>In <strong>Linux 6.6</strong> (late 2023) CFS's picking logic was replaced by <strong>EEVDF</strong> (Earliest Eligible Virtual Deadline First). It keeps the fairness accounting but adds two ideas:</p>
+    <ul>
+      <li><strong>Eligibility:</strong> a task that has received more than its fair share ("negative lag") must wait until it is owed time again.</li>
+      <li><strong>Virtual deadline:</strong> among eligible tasks, pick the one whose deadline (roughly: when it should finish its next slice) is earliest. Tasks that ask for shorter slices get earlier deadlines, which helps latency-sensitive work without special heuristics.</li>
+    </ul>
+    <h3>sched_ext: schedulers written in eBPF</h3>
+    <p><strong>Linux 6.12</strong> (late 2024) merged <strong>sched_ext</strong>. It lets you load a whole scheduling policy as an eBPF program at runtime, and the kernel falls back to the default scheduler if the BPF scheduler misbehaves. Companies use it to experiment with policies tuned for games, cloud hosts, or specific services without rebuilding the kernel. This is a big trend: the scheduler is no longer one fixed algorithm.</p>
+    <h3>Try it</h3>
+    <pre><code>$ chrt -p $$                  # scheduling policy of your shell
+$ nice -n 10 ./batch-job      # start with lower priority
+$ renice -n 5 -p 4182         # change priority of a running process
+$ cat /proc/4182/sched        # vruntime, switch counts, etc.
+$ taskset -c 0,1 ./app        # pin a process to cores 0 and 1</code></pre>
+  </section>
+
+  <section id="containers">
+    <h2>10. Scenario: Why Is My Container Slow at 30% CPU?</h2>
+    <p><strong>Situation.</strong> A Java API runs in Kubernetes with <code>resources.limits.cpu: 500m</code> (half a core). Dashboards show average CPU around 30% of the limit. Yet p99 latency is terrible: some requests take an extra 80 to 90 ms for no visible reason.</p>
+    <h3>Step 1: understand how a CPU limit works</h3>
+    <p>A CPU limit is enforced by the <strong>CFS bandwidth controller</strong> in cgroups. It is not "half a core at all times". It is a budget: <em>quota</em> per <em>period</em>. The default period is 100 ms. A limit of <code>500m</code> becomes:</p>
+    <pre><code>$ cat /sys/fs/cgroup/cpu.max        # cgroup v2, inside the container
+50000 100000                         # 50 ms of CPU time per 100 ms period</code></pre>
+    <h3>Step 2: do the math for a burst</h3>
+    <p>A request arrives and the app uses 4 threads in parallel (GC threads, a thread pool). Four threads burn CPU 4 times faster than wall-clock time.</p>
+    <ul>
+      <li>The 50 ms budget is used up after 50 / 4 = <strong>12.5 ms</strong> of wall time.</li>
+      <li>All threads are then <strong>throttled</strong> (not allowed to run) until the period ends: 100 - 12.5 = <strong>87.5 ms</strong> of forced waiting.</li>
+    </ul>
+    <p>Averaged over a minute, usage looks low (30%). But within individual 100 ms windows, the app hits the wall. That matches the extra ~85 ms latency.</p>
+    <h3>Step 3: confirm with data</h3>
+    <pre><code>$ cat /sys/fs/cgroup/cpu.stat
+usage_usec 81234567
+nr_periods 51234
+nr_throttled 9120            # periods in which we hit the limit
+throttled_usec 612345678     # total time spent throttled</code></pre>
+    <p>If <code>nr_throttled / nr_periods</code> is more than a few percent, throttling is hurting you. In Prometheus, the cAdvisor metric is <code>container_cpu_cfs_throttled_periods_total</code>.</p>
+    <h3>Step 4: fix options</h3>
+    <ul>
+      <li>Raise the limit, or remove CPU limits and rely on <strong>requests</strong> for fair sharing (a common practice for latency-sensitive services; requests map to CPU <em>weight</em>, which only matters under contention).</li>
+      <li>Reduce parallelism to match the budget (for example size thread pools and GC threads for 1 core, not for the host's 64 cores).</li>
+      <li>Make sure the runtime sees the right CPU count. Modern JVMs, Go (from 1.25, GOMAXPROCS respects the cgroup CPU limit), and others read cgroup limits; older ones size thread pools for the whole machine.</li>
+    </ul>
+    <div class="callout">
+      <strong>Lesson:</strong> averages hide bursts. Scheduling problems are about what happens inside each small time window, which is exactly what the Gantt charts above trained you to think about.
+    </div>
+  </section>
+
+  <section id="pitfalls">
+    <h2>11. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Forgetting to flush before fork.</strong> <code>printf</code> output sits in a user-space buffer. <code>fork()</code> copies the buffer, so text printed before the fork can appear twice. Try it: <code>printf("hello "); fork();</code> then print a newline in both processes. You will see "hello" twice. Call <code>fflush(stdout)</code> before forking.</li>
+      <li><strong>Not reaping children.</strong> Leads to zombies. Always <code>wait</code>/<code>waitpid</code>, or handle <code>SIGCHLD</code>.</li>
+      <li><strong>Confusing load average with CPU usage.</strong> Linux load average counts runnable tasks <em>and</em> tasks in uninterruptible sleep (<code>D</code> state). Slow disks or NFS can push load to 50 while CPUs are idle.</li>
+      <li><strong>More threads is not always faster.</strong> Beyond the number of cores, CPU-bound threads only add context switches and cache misses.</li>
+      <li><strong>Mixing up WT and RT.</strong> Waiting time is total time spent waiting; response time is only until the first run. They are equal only for non-preemptive algorithms.</li>
+      <li><strong>Ignoring tie-breaking rules in RR.</strong> Different conventions give different Gantt charts. State your convention.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>12. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Concept</th><th>Remember</th></tr></thead>
+      <tbody>
+        <tr><td>Process</td><td>Program in execution: address space + registers + resources, described by a PCB</td></tr>
+        <tr><td>Thread</td><td>Unit of scheduling; shares heap/code/files, owns stack and registers</td></tr>
+        <tr><td>fork / exec / wait</td><td>Copy (COW) / replace program / reap child</td></tr>
+        <tr><td>TAT, WT, RT</td><td><code>CT - AT</code>, <code>TAT - BT</code>, <code>first run - AT</code></td></tr>
+        <tr><td>Best avg waiting time</td><td>SJF (non-preemptive), SRTF (preemptive)</td></tr>
+        <tr><td>No starvation</td><td>FCFS, RR; priority needs aging</td></tr>
+        <tr><td>Linux normal scheduler</td><td>EEVDF since 6.6 (CFS before); sched_ext since 6.12</td></tr>
+        <tr><td>Container CPU limit</td><td>quota per 100 ms period; watch <code>nr_throttled</code></td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/" rel="noopener noreferrer">Operating Systems: Three Easy Pieces (free book)</a> &middot; <a href="https://docs.kernel.org/scheduler/sched-eevdf.html" rel="noopener noreferrer">Linux kernel docs: EEVDF</a> &middot; <a href="https://docs.kernel.org/scheduler/sched-ext.html" rel="noopener noreferrer">Linux kernel docs: sched_ext</a> &middot; <a href="https://docs.kernel.org/scheduler/sched-bwc.html" rel="noopener noreferrer">CFS bandwidth control</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Next in Operating Systems: <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a></p>
+    <p>Related: <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html">Kubernetes Workloads (requests and limits)</a> &middot; <a href="../Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

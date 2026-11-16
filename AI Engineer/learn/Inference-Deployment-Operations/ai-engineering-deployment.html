@@ -28,14 +28,14 @@
     </ul>
     <p>Keeping orchestration stateless lets you scale app servers independently from GPU pools sized to token demand.</p>
     
-    <p class="refer-link"><small>Refer: <a href="https://docs.vllm.ai/en/latest/" rel="noopener noreferrer">vLLM docs</a> � <a href="https://huggingface.co/docs/text-generation-inference" rel="noopener noreferrer">TGI docs</a></small></p>
+    <p class="refer-link"><small>Refer: <a href="https://docs.vllm.ai/en/latest/" rel="noopener noreferrer">vLLM docs</a> &middot; <a href="https://huggingface.co/docs/text-generation-inference" rel="noopener noreferrer">TGI docs</a></small></p>
   </section>
 
   <section>
     <h2>Serving Runtimes</h2>
     <h3>GPU server frameworks</h3>
     <p>vLLM and TensorRT-LLM target high-throughput datacenter GPUs with continuous batching and optimized kernels. Text Generation Inference (TGI) offers Hugging Face ecosystem integration. Choose based on model support, quantization formats, and SLA requirements.</p>
-    <pre><code># Kubernetes deployment snippet � GPU node pool for inference
+    <pre><code># Kubernetes deployment snippet: GPU node pool for inference
 resources:
   limits:
     nvidia.com/gpu: 1
@@ -98,6 +98,7 @@ readinessProbe:
 
   <nav class="page-footer-nav">
     <p><a class="interview-link" href="../../interview/Inference-Deployment-Operations/ai-engineering-interview-deployment.html">Interview questions on Deployment</a></p>
+    <p>Related: <a href="ai-engineering-inference-optimization.html">Inference Optimization</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-gpu-scheduling.html">GPU Scheduling on Kubernetes</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
   </nav>
 </main>

@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>TCP Deep Dive: From Handshake to Congestion Control | CS Fundamentals</title>
+  <meta name="description" content="TCP explained from zero: ports and sockets, the three-way handshake with real sequence numbers, reliable delivery, flow control, congestion control (slow start, CUBIC, BBR) with worked math, connection teardown and TIME_WAIT, TLS 1.3 and HTTP/3, and a page-load latency budget.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; TCP Deep Dive</p>
+  </nav>
+  <h1>TCP Deep Dive: From Handshake to Congestion Control</h1>
+  <p>How two computers turn an unreliable network that loses, duplicates, and reorders packets into a clean, ordered byte stream. With real numbers, worked latency math, and debugging recipes.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#layers">Where TCP Fits</a></li>
+    <li><a href="#sockets">Ports, Sockets, and the 4-Tuple</a></li>
+    <li><a href="#segment">The TCP Segment</a></li>
+    <li><a href="#handshake">The Three-Way Handshake</a></li>
+    <li><a href="#reliability">Reliable Delivery: Sequence Numbers, ACKs, Retransmission</a></li>
+    <li><a href="#flow">Flow Control: Don't Drown the Receiver</a></li>
+    <li><a href="#congestion">Congestion Control: Don't Drown the Network</a></li>
+    <li><a href="#teardown">Closing a Connection and TIME_WAIT</a></li>
+    <li><a href="#page-load">Scenario: Budgeting a Page Load (TLS 1.3, HTTP/2, HTTP/3)</a></li>
+    <li><a href="#debugging">Scenario: Debugging Connection Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="layers">
+    <h2>1. Where TCP Fits</h2>
+    <p>Networking is built in layers. Each layer solves one problem and relies on the layer below.</p>
+    <pre><code> Layer            Example         Job                                   Unit
+ ---------------  --------------  ------------------------------------  ---------
+ Application      HTTP, DNS, SSH  what the data means                   message
+ Transport        TCP, UDP, QUIC  process-to-process delivery           segment
+ Network          IP              host-to-host delivery across networks packet
+ Link             Ethernet, WiFi  delivery to the next device on a link frame</code></pre>
+    <p><strong>IP</strong> delivers packets between machines on a "best effort" basis. Packets can be <strong>lost</strong> (a router queue was full), <strong>reordered</strong> (they took different paths), <strong>duplicated</strong>, or <strong>corrupted</strong>. IP does not care.</p>
+    <p><strong>TCP</strong> (Transmission Control Protocol) runs on top and gives applications a promise: <em>the bytes you write arrive at the other side complete, in order, without duplicates, or you get an error.</em> It does this entirely in the two endpoints. Routers in the middle know nothing about TCP connections.</p>
+    <p><strong>UDP</strong> is the opposite: it just adds ports to IP and sends. No connection, no ordering, no retransmission. It is used where speed matters more than perfection (DNS lookups, games, voice), and as the base of <strong>QUIC</strong>, which rebuilds reliability in user space.</p>
+  </section>
+
+  <section id="sockets">
+    <h2>2. Ports, Sockets, and the 4-Tuple</h2>
+    <p>An IP address finds a machine. A <strong>port</strong> (a 16-bit number, 0 to 65535) finds a program on that machine. Servers listen on well-known ports (443 for HTTPS, 5432 for PostgreSQL). Clients use a random <strong>ephemeral port</strong> (on Linux by default 32768 to 60999).</p>
+    <p>A TCP connection is identified by the <strong>4-tuple</strong>:</p>
+    <pre><code>(source IP, source port, destination IP, destination port)
+(192.168.1.20, 51544, 93.184.215.14, 443)</code></pre>
+    <p>This is why one server port can serve millions of clients: each connection has a different 4-tuple. A <strong>socket</strong> is the operating system object (a file descriptor) your program uses to talk over one connection, or to listen for new ones.</p>
+    <pre><code>$ ss -tn                 # established TCP connections, numeric
+$ ss -tlnp               # listening TCP sockets and the owning process</code></pre>
+  </section>
+
+  <section id="segment">
+    <h2>3. The TCP Segment</h2>
+    <p>TCP cuts your byte stream into <strong>segments</strong>. Each has a header (20 bytes minimum) with these important fields:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>Source / destination port</td><td>Which programs</td></tr>
+        <tr><td>Sequence number</td><td>Position in the byte stream of the <em>first byte</em> in this segment</td></tr>
+        <tr><td>Acknowledgment number</td><td>"I have received everything before this byte number; send me this one next"</td></tr>
+        <tr><td>Flags</td><td><code>SYN</code> (start), <code>ACK</code> (ack field valid), <code>FIN</code> (I am done sending), <code>RST</code> (abort), <code>PSH</code></td></tr>
+        <tr><td>Window</td><td>How many more bytes the sender of this segment can receive (flow control)</td></tr>
+        <tr><td>Options</td><td>MSS, window scale, SACK permitted, timestamps</td></tr>
+      </tbody>
+    </table>
+    <p>The <strong>MSS</strong> (maximum segment size) is the largest payload per segment. On normal Ethernet the link MTU is 1500 bytes; minus 20 bytes IPv4 header and 20 bytes TCP header gives an MSS of <strong>1460 bytes</strong>.</p>
+  </section>
+
+  <section id="handshake">
+    <h2>4. The Three-Way Handshake</h2>
+    <p>Before sending data, both sides must agree to talk and pick starting sequence numbers. Each side chooses a random <strong>Initial Sequence Number (ISN)</strong>. Randomness prevents old stray packets from a previous connection being mistaken as new, and makes it hard for attackers to inject fake segments.</p>
+    <pre><code>  Client (ISN = 1000)                              Server (ISN = 5000)
+     |                                                   |
+     |---- SYN, seq=1000 -------------------------------&gt;|   "I want to talk; my bytes start after 1000"
+     |                                                   |
+     |&lt;--- SYN+ACK, seq=5000, ack=1001 ------------------|   "OK. Mine start after 5000. Next I expect your 1001"
+     |                                                   |
+     |---- ACK, seq=1001, ack=5001 ---------------------&gt;|   "Got it. Next I expect your 5001"
+     |                                                   |
+     |========== connection ESTABLISHED =================|</code></pre>
+    <h3>Why the +1?</h3>
+    <p>A SYN carries no data but <strong>consumes one sequence number</strong>, so it can be acknowledged like data. The same is true of FIN. That is why the ack is 1001, not 1000.</p>
+    <h3>Why three messages, not two?</h3>
+    <p>Each side must send its own ISN <em>and</em> hear confirmation that the other side received it. Client's ISN is confirmed in message 2. Server's ISN is confirmed in message 3. Message 2 combines the server's SYN with its ACK, so three messages are enough.</p>
+    <h3>Cost</h3>
+    <p>The client can send data right after sending the final ACK. So the handshake costs <strong>1 round-trip time (RTT)</strong> before the first request byte leaves. With a 100 ms RTT, that is 100 ms of pure waiting, which is why connection reuse (keep-alive, pooling) matters so much.</p>
+    <div class="callout">
+      <strong>SYN flood:</strong> an attacker sends many SYNs from fake addresses and never completes the handshake, filling the server's queue of half-open connections. <strong>SYN cookies</strong> defend against this: the server encodes the connection state in its ISN and stores nothing until the final ACK arrives.
+    </div>
+  </section>
+
+  <section id="reliability">
+    <h2>5. Reliable Delivery: Sequence Numbers, ACKs, Retransmission</h2>
+    <h3>Sequence numbers count bytes</h3>
+    <p>Continuing from the handshake, the client sends a 3000-byte request in segments of up to 1460 bytes:</p>
+    <pre><code>segment A: seq=1001, 1460 bytes   (bytes 1001..2460)
+segment B: seq=2461, 1460 bytes   (bytes 2461..3920)
+segment C: seq=3921,   80 bytes   (bytes 3921..4000)
+
+server ACKs: ack=2461, ack=3921, ack=4001</code></pre>
+    <p>The ACK number is <strong>cumulative</strong>: "I have everything up to (not including) this byte". The receiver uses sequence numbers to put segments back in order and drop duplicates.</p>
+
+    <h3>What happens when a segment is lost</h3>
+    <p>Suppose segment B is lost, but A and C arrive.</p>
+    <ol>
+      <li>A arrives: receiver ACKs 2461.</li>
+      <li>C arrives, but there is a hole at 2461. The receiver buffers C and ACKs <strong>2461 again</strong> (a duplicate ACK). With the <strong>SACK</strong> option it also says "I additionally have 3921..4000".</li>
+      <li>The sender eventually retransmits B. Once it arrives, the receiver ACKs <strong>4001</strong> in one go.</li>
+    </ol>
+    <p>There are two ways the sender notices the loss:</p>
+    <ul>
+      <li><strong>Retransmission timeout (RTO):</strong> a timer per outstanding data. If no ACK arrives in time, resend. The RTO is computed from measured RTT and its variance (RFC 6298), and it doubles after each timeout (exponential backoff). Linux uses a minimum RTO of 200 ms.</li>
+      <li><strong>Fast retransmit:</strong> after <strong>3 duplicate ACKs</strong> for the same number, resend immediately without waiting for the timer. This works when later segments keep arriving.</li>
+    </ul>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> you mail chapters of a book numbered by page. Your friend replies "I have everything up to page 41". If they keep replying "up to page 41" while you are sending pages 60, 80, 100, page 41 clearly got lost, so you resend it without waiting a week.
+    </div>
+    <p>A <strong>checksum</strong> in the header catches corrupted segments, which are dropped and later retransmitted.</p>
+  </section>
+
+  <section id="flow">
+    <h2>6. Flow Control: Don't Drown the Receiver</h2>
+    <p>The receiving application might read slowly. TCP must not send more than the receiver's buffer can hold. Every segment advertises the <strong>receive window (rwnd)</strong>: free space in the receiver's buffer. The sender keeps the amount of unacknowledged data at most rwnd.</p>
+    <p>If the app stops reading, the window shrinks to 0 and the sender stops (it sends small "window probes" to learn when space opens).</p>
+    <h3>Window scaling and the bandwidth-delay product</h3>
+    <p>The header window field is 16 bits, so at most 65,535 bytes. That is too small for fast, long links. The <strong>window scale</strong> option, agreed in the handshake, multiplies it by 2<sup>shift</sup> (shift up to 14, so windows up to about 1 GiB).</p>
+    <p>How big must the window be? To keep a link full, you need enough data "in flight" to cover one round trip. That amount is the <strong>bandwidth-delay product (BDP)</strong>.</p>
+    <h4>Worked example</h4>
+    <pre><code>Link: 100 Mbit/s, RTT 50 ms
+
+BDP = bandwidth * RTT
+    = 100,000,000 bit/s * 0.050 s
+    = 5,000,000 bits
+    = 625,000 bytes  (about 610 KiB)
+
+Max throughput with a 64 KiB window (no scaling):
+    window / RTT = 65,535 B / 0.050 s = 1,310,700 B/s  = about 10.5 Mbit/s</code></pre>
+    <p>Without window scaling you would use about 10% of the link no matter how fast it is. General rule: <strong>throughput &le; window / RTT</strong>.</p>
+  </section>
+
+  <section id="congestion">
+    <h2>7. Congestion Control: Don't Drown the Network</h2>
+    <p>Flow control protects the receiver. <strong>Congestion control</strong> protects the network between. If every sender blasted at full speed, router queues would overflow, packets would drop, everyone would retransmit, and throughput would collapse. (This actually happened on the early Internet in 1986, leading to Van Jacobson's congestion control algorithms.)</p>
+    <p>The sender keeps a second limit, the <strong>congestion window (cwnd)</strong>, its own guess of how much the network can handle. The real limit on data in flight is:</p>
+    <pre><code>in_flight &le; min(cwnd, rwnd)</code></pre>
+    <h3>Slow start</h3>
+    <p>A new connection does not know the network's capacity. It starts small (modern stacks use an initial cwnd of <strong>10 segments</strong>, about 14.6 KB) and <strong>increases cwnd by one segment for every ACK</strong>. Since each full window of segments is acknowledged in one RTT, cwnd <strong>doubles every RTT</strong>. "Slow" only refers to the small start; the growth is exponential.</p>
+    <h4>Worked example: how many round trips to send a 100 KB response?</h4>
+    <pre><code>MSS = 1460 bytes. 100,000 / 1460 = 68.5  -&gt;  69 segments needed.
+
+RTT 1: cwnd = 10  -&gt;  sent 10   (total 10)
+RTT 2: cwnd = 20  -&gt;  sent 20   (total 30)
+RTT 3: cwnd = 40  -&gt;  sent 39   (total 69, done)</code></pre>
+    <p>So a fresh connection needs <strong>3 round trips</strong> just to deliver 100 KB, regardless of bandwidth. On a 100 ms RTT that is 300 ms of data transfer for a small page. This is why reusing warm connections (HTTP keep-alive, HTTP/2 multiplexing) and making responses smaller both help latency so much.</p>
+    <h3>Congestion avoidance and AIMD</h3>
+    <p>When cwnd reaches the <strong>slow start threshold (ssthresh)</strong>, growth becomes linear: about <strong>+1 segment per RTT</strong>. When loss is detected, the sender assumes congestion and cuts back:</p>
+    <ul>
+      <li>Loss detected by duplicate ACKs (mild): classic Reno halves cwnd (<strong>multiplicative decrease</strong>) and continues in congestion avoidance.</li>
+      <li>Loss detected by timeout (severe): ssthresh = cwnd / 2, cwnd resets to a small value, and slow start begins again.</li>
+    </ul>
+    <p>This "Additive Increase, Multiplicative Decrease" (<strong>AIMD</strong>) pattern produces the classic sawtooth graph, and it makes competing flows converge to a fair share.</p>
+    <pre><code>cwnd
+  ^        /|        /|        /|
+  |       / |       / |       / |
+  |      /  |      /  |      /  |      linear growth, halve on loss
+  |     /   |     /   |     /   |
+  |    /    |____/    |____/    |____
+  |   /  (slow start)
+  |  /
+  +---------------------------------------&gt; time</code></pre>
+    <h3>Modern algorithms</h3>
+    <table>
+      <thead><tr><th>Algorithm</th><th>Signal</th><th>Idea</th></tr></thead>
+      <tbody>
+        <tr><td>Reno / NewReno</td><td>Loss</td><td>Textbook AIMD</td></tr>
+        <tr><td><strong>CUBIC</strong></td><td>Loss</td><td>Window grows as a cubic function of time since the last loss, so it recovers quickly on fast long links. Reduces by a factor of 0.7 on loss. <strong>Default in Linux, Windows, and macOS.</strong></td></tr>
+        <tr><td><strong>BBR</strong> (Google)</td><td>Measured bandwidth and min RTT</td><td>Builds a model of the path's bottleneck bandwidth and RTT, and paces sending to match it, instead of filling buffers until loss. Helps on lossy links (mobile, long distance). Used widely at Google.</td></tr>
+      </tbody>
+    </table>
+    <pre><code>$ sysctl net.ipv4.tcp_congestion_control          # usually: cubic
+$ sysctl net.ipv4.tcp_available_congestion_control
+$ ss -ti dst example.com                            # per connection: cwnd, rtt, retrans</code></pre>
+  </section>
+
+  <section id="teardown">
+    <h2>8. Closing a Connection and TIME_WAIT</h2>
+    <p>TCP is full duplex: each direction is closed separately with a FIN.</p>
+    <pre><code>  Active closer (A)                         Passive closer (B)
+     |---- FIN --------------------------------&gt;|   A: "I am done sending"
+     |&lt;--- ACK ---------------------------------|
+     |              (B may still send data)     |
+     |&lt;--- FIN ---------------------------------|   B: "I am done too"
+     |---- ACK --------------------------------&gt;|
+  TIME_WAIT                                   CLOSED
+  (wait 2 x MSL, 60 s on Linux)
+     |
+  CLOSED</code></pre>
+    <p>The side that closes first enters <strong>TIME_WAIT</strong>. It keeps the 4-tuple reserved for twice the Maximum Segment Lifetime for two reasons:</p>
+    <ol>
+      <li>If its final ACK is lost, B will resend FIN, and A must still be able to answer.</li>
+      <li>Delayed segments from this connection must die out before a new connection reuses the same 4-tuple.</li>
+    </ol>
+    <p><strong>RST</strong> is the abrupt alternative: "this connection does not exist / abort now". You get one when connecting to a port nobody listens on, or when a program exits with unread data.</p>
+    <div class="callout">
+      <strong>Practical note:</strong> a busy client opening thousands of short connections to the same server can run out of ephemeral ports because of TIME_WAIT. Fixes: reuse connections (pooling, keep-alive), and on Linux <code>net.ipv4.tcp_tw_reuse</code> for outgoing connections. Never use the long-removed <code>tcp_tw_recycle</code> advice you may find online.
+    </div>
+  </section>
+
+  <section id="page-load">
+    <h2>9. Scenario: Budgeting a Page Load (TLS 1.3, HTTP/2, HTTP/3)</h2>
+    <p><strong>Question:</strong> a user in Mumbai opens <code>https://shop.example</code>, hosted in Frankfurt. RTT is 120 ms. Nothing is cached. Server processing takes 40 ms. How long until the first byte of HTML arrives?</p>
+    <h3>Step 1: DNS</h3>
+    <p>The browser asks its resolver for the IP. Assume the resolver is nearby and has the answer cached: about 10 ms. (If not cached, add round trips to root, TLD, and authoritative servers.)</p>
+    <h3>Step 2: TCP handshake = 1 RTT = 120 ms</h3>
+    <h3>Step 3: TLS 1.3 handshake = 1 RTT = 120 ms</h3>
+    <p>The client sends <code>ClientHello</code> with its key share. The server replies with <code>ServerHello</code>, its key share, certificate, and <code>Finished</code>. Now both sides can derive keys, and the client sends its <code>Finished</code> together with the HTTP request. (TLS 1.2 needed 2 RTTs here.)</p>
+    <h3>Step 4: HTTP request and response = 1 RTT + server time = 160 ms</h3>
+    <pre><code>HTTP/1.1 or HTTP/2 over TLS 1.3 over TCP:
+  DNS 10 + TCP 120 + TLS 120 + HTTP (120 + 40) = 410 ms to first byte
+
+HTTP/3 over QUIC (UDP), first visit:
+  QUIC merges transport and TLS 1.3 setup into ONE round trip
+  DNS 10 + QUIC/TLS 120 + HTTP (120 + 40)     = 290 ms
+
+HTTP/3 with 0-RTT resumption (returning visitor):
+  request rides in the very first flight
+  DNS 10 + (120 + 40)                          = 170 ms</code></pre>
+    <p>Then the 100 KB HTML needs about 3 RTTs of slow start (section 7), plus CSS, JS, and images. A CDN edge in Mumbai (RTT 10 ms) shrinks every term. <strong>Latency is mostly round trips times RTT</strong>, so engineers fight round trips: connection reuse, TLS 1.3, HTTP/3, CDNs, fewer redirects, and preconnect hints.</p>
+    <h3>Measure it yourself</h3>
+    <pre><code>$ curl -o /dev/null -s -w \
+  'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  https://example.com
+dns=0.001378 connect=0.001902 tls=0.024213 ttfb=0.039511 total=0.039601</code></pre>
+    <p>All curl times are cumulative from the start. TCP took <code>connect - dns</code>, TLS took <code>tls - connect</code>, and the server plus one RTT took <code>ttfb - tls</code>. (Output above is a real run from a data center close to a CDN edge, hence the tiny numbers.)</p>
+    <h3>Why HTTP/2 and HTTP/3 exist</h3>
+    <ul>
+      <li><strong>HTTP/1.1:</strong> one request at a time per connection, so browsers open about 6 connections per host.</li>
+      <li><strong>HTTP/2:</strong> many requests multiplexed as streams on one TCP connection. But one lost TCP segment stalls <em>all</em> streams until it is retransmitted, because TCP delivers bytes strictly in order. This is <strong>head-of-line blocking</strong> at the transport layer.</li>
+      <li><strong>HTTP/3:</strong> runs over <strong>QUIC</strong> on UDP. QUIC handles streams itself, so a loss only stalls the stream it belongs to. It also encrypts transport headers and lets connections survive IP changes (WiFi to mobile) via connection IDs.</li>
+    </ul>
+  </section>
+
+  <section id="debugging">
+    <h2>10. Scenario: Debugging Connection Problems</h2>
+    <table>
+      <thead><tr><th>Symptom</th><th>Most likely meaning</th><th>What happened on the wire</th></tr></thead>
+      <tbody>
+        <tr><td><code>Connection refused</code> (instant)</td><td>Host is up, nothing listens on that port (or the app listens on 127.0.0.1 only)</td><td>SYN answered by RST</td></tr>
+        <tr><td><code>Connection timed out</code> (after many seconds)</td><td>A firewall/security group drops packets, or the host is down/unroutable</td><td>SYN sent and retried, no reply at all</td></tr>
+        <tr><td><code>Connection reset by peer</code></td><td>The other side aborted: crashed, closed with unread data, or a middlebox/load balancer killed an idle connection</td><td>RST in the middle of a connection</td></tr>
+        <tr><td>Every request is slow by ~40 ms</td><td>Nagle's algorithm interacting with delayed ACK</td><td>Small write waits for an ACK that the peer delays</td></tr>
+        <tr><td>Throughput far below bandwidth on a long link</td><td>Window too small for the BDP, or loss</td><td>Look at cwnd, rwnd, retransmits in <code>ss -ti</code></td></tr>
+      </tbody>
+    </table>
+    <h3>Walkthrough: "my service can't reach the database"</h3>
+    <ol>
+      <li><strong>Name resolution:</strong> <code>getent hosts db.internal</code> (or <code>dig</code>). Wrong IP? Fix DNS first.</li>
+      <li><strong>Is anything listening?</strong> On the DB host: <code>ss -tlnp | grep 5432</code>. If it shows <code>127.0.0.1:5432</code>, it only accepts local connections. Change the bind address (<code>listen_addresses</code> in PostgreSQL).</li>
+      <li><strong>Can packets get there?</strong> From the client: <code>nc -vz db.internal 5432</code>. "Refused" means routing works but no listener; "timed out" points to a firewall, security group, or Kubernetes NetworkPolicy.</li>
+      <li><strong>Look at the packets</strong> if still unclear: <code>sudo tcpdump -nn -i any host db.internal and port 5432</code>. Repeated SYNs with no SYN-ACK means drops. SYN followed by RST means refused.</li>
+    </ol>
+    <p>In Kubernetes, also check that the Service selector matches the Pod labels and that endpoints exist (<code>kubectl get endpointslices</code>). See <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a>.</p>
+    <h3>Nagle and delayed ACK, explained</h3>
+    <p><strong>Nagle's algorithm</strong> holds back small writes while earlier data is unacknowledged, to avoid flooding the network with tiny packets. <strong>Delayed ACK</strong> makes the receiver wait briefly (Linux: from 40 ms) hoping to piggyback the ACK on a reply. Together, a "write header, write body" pattern can stall: the second small write waits for an ACK the peer is deliberately delaying. Fix: set <code>TCP_NODELAY</code> on latency-sensitive sockets (many HTTP clients, database drivers, and gRPC already do), or write the whole message in one call.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>11. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Thinking TCP preserves message boundaries.</strong> It is a byte stream. Two <code>send()</code>s of 100 bytes may arrive as one 200-byte <code>recv()</code>, or as 50 + 150. Protocols must add framing (length prefixes, delimiters).</li>
+      <li><strong>Ignoring that bandwidth is not latency.</strong> A 1 Gbit/s link does not make a 3-round-trip handshake faster.</li>
+      <li><strong>Opening a new connection per request.</strong> Pays handshake, TLS, and slow start every time. Use pooling.</li>
+      <li><strong>Treating "connection refused" and "timeout" as the same.</strong> They point to completely different layers.</li>
+      <li><strong>Forgetting the SYN and FIN each use a sequence number</strong> when computing ACK numbers.</li>
+      <li><strong>Long idle connections through load balancers and NAT.</strong> Middleboxes drop idle state (often after 350 s to a few minutes). Use TCP keepalives or application pings shorter than that timeout.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>12. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Item</th><th>Remember</th></tr></thead>
+      <tbody>
+        <tr><td>Handshake</td><td>SYN, SYN-ACK, ACK; costs 1 RTT; SYN uses one sequence number</td></tr>
+        <tr><td>ACK number</td><td>Next byte expected (cumulative)</td></tr>
+        <tr><td>Loss detection</td><td>3 duplicate ACKs (fast retransmit) or RTO timeout</td></tr>
+        <tr><td>Flow control</td><td>rwnd, set by receiver; window scaling for big BDP</td></tr>
+        <tr><td>Congestion control</td><td>cwnd: slow start doubles per RTT, then +1 MSS per RTT; cut on loss</td></tr>
+        <tr><td>Throughput limit</td><td><code>min(cwnd, rwnd) / RTT</code></td></tr>
+        <tr><td>BDP</td><td><code>bandwidth * RTT</code></td></tr>
+        <tr><td>TIME_WAIT</td><td>On the side that closes first; 60 s on Linux</td></tr>
+        <tr><td>First byte, HTTPS cold</td><td>DNS + 1 RTT (TCP) + 1 RTT (TLS 1.3) + 1 RTT (HTTP) + server time</td></tr>
+        <tr><td>HTTP/3</td><td>QUIC over UDP; 1 RTT setup, 0-RTT resume, no TCP head-of-line blocking</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.rfc-editor.org/rfc/rfc9293" rel="noopener noreferrer">RFC 9293: TCP</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc5681" rel="noopener noreferrer">RFC 5681: TCP Congestion Control</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9438" rel="noopener noreferrer">RFC 9438: CUBIC</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc8446" rel="noopener noreferrer">RFC 8446: TLS 1.3</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9000" rel="noopener noreferrer">RFC 9000: QUIC</a> &middot; <a href="https://hpbn.co/" rel="noopener noreferrer">High Performance Browser Networking (free book)</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking &amp; Services</a> &middot; <a href="../Operating-Systems/os-processes-threads-scheduling.html">Processes &amp; Scheduling</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

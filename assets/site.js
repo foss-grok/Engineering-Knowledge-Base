@@ -17,7 +17,10 @@
 
   function siteRootPrefix() {
     var base = stylesheetBase();
-    if (isSubjectOnlyDeployment() && (base.match(/\.\.\//g) || []).length >= 3) {
+    // Over HTTP(S) the stylesheet's relative path already points at the site root,
+    // so only adjust it for subject-only file:// browsing. (Adjusting it over HTTP
+    // made search request AI Engineer/assets/search-index.js, which does not exist.)
+    if (window.location.protocol === 'file:' && isSubjectOnlyDeployment() && (base.match(/\.\.\//g) || []).length >= 3) {
       return base.replace(/^\.\.\//, '');
     }
     return base;
