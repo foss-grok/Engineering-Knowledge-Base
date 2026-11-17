@@ -133,7 +133,11 @@
     var limit = maxEditDistance(token);
 
     for (w = 0; w < words.length; w++) {
-      if (words[w].indexOf(token) !== -1 || token.indexOf(words[w]) !== -1) {
+      // Word contains the query token ("dead" in "deadlock"), or the token contains a
+      // long-enough word. Short words like "a" or "to" must not match: otherwise any title
+      // containing "a" scored highly for every query that has the letter "a" in it.
+      if (words[w].indexOf(token) !== -1 ||
+          (words[w].length >= 4 && words[w].length * 2 >= token.length && token.indexOf(words[w]) !== -1)) {
         return 0.93;
       }
       dist = levenshtein(token, words[w], limit);
@@ -171,7 +175,9 @@
     if (phrase.length >= 3) {
       if (corpus.indexOf(phrase) !== -1) {
         phraseBoost = 0.35;
-      } else if (subsequenceScore(phrase, compact) > 0) {
+      } else if (tokens.length > 1 && subsequenceScore(phrase, compact) > 0) {
+        // For one-word queries the phrase is the token itself, which was already scored;
+        // boosting it again let loose letter matches (e.g. "etag" in "pretraining") win.
         phraseBoost = 0.2;
       }
     }

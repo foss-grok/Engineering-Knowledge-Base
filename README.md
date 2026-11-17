@@ -64,19 +64,20 @@ Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`CS-Fundamentals/cs-fundamentals.html`](CS-Fundamentals/cs-fundamentals.html) | 1 |
-| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 4 |
+| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 8 |
 
-Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`).
+Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`.
 
 ## Project structure
 
 ```
 Engineering-Knowledge-Base/
 ├── index.html
+├── 404.html               # Custom not-found page (root-relative links; served by the host for missing URLs)
 ├── styles.css
 ├── assets/
 │   ├── logo.svg
-│   ├── site.js              # Path normalization for local browsing
+│   ├── site.js              # Path normalization for local browsing, code copy buttons, wide-math fix
 │   ├── search.js            # Fuzzy site search
 │   ├── search-index.js      # Generated index (commit with content changes)
 │   └── search-index.json

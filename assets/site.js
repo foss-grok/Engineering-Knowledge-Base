@@ -90,3 +90,108 @@
     document.addEventListener('DOMContentLoaded', fixNavigationLinks);
   }
 })();
+
+// Copy buttons for code blocks on learn pages. Works over http(s) and file://.
+(function () {
+  'use strict';
+
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    // Fallback for file:// and older browsers
+    return new Promise(function (resolve, reject) {
+      var area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      try {
+        document.execCommand('copy') ? resolve() : reject(new Error('copy failed'));
+      } catch (err) {
+        reject(err);
+      } finally {
+        document.body.removeChild(area);
+      }
+    });
+  }
+
+  function addCopyButtons() {
+    document.querySelectorAll('.learn-page pre').forEach(function (pre) {
+      if (pre.parentNode && pre.parentNode.classList && pre.parentNode.classList.contains('code-block')) {
+        return;
+      }
+      var code = pre.querySelector('code') || pre;
+      var wrapper = document.createElement('div');
+      wrapper.className = 'code-block';
+      pre.parentNode.insertBefore(wrapper, pre);
+      wrapper.appendChild(pre);
+
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'code-copy';
+      button.textContent = 'Copy';
+      button.setAttribute('aria-label', 'Copy code to clipboard');
+      button.addEventListener('click', function () {
+        copyText(code.innerText.replace(/\n$/, '')).then(function () {
+          button.textContent = 'Copied';
+        }, function () {
+          button.textContent = 'Press Ctrl+C';
+        });
+        setTimeout(function () { button.textContent = 'Copy'; }, 1600);
+      });
+      wrapper.appendChild(button);
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', addCopyButtons);
+  } else {
+    addCopyButtons();
+  }
+})();
+
+// Inline MathJax formulas wider than their paragraph (common on phones) get the
+// "math-wide" class (see styles.css), so they scroll sideways inside their own box
+// instead of widening the whole page. Works with both the CHTML and SVG MathJax builds.
+(function () {
+  'use strict';
+
+  function markWideMath(root) {
+    (root || document).querySelectorAll('mjx-container:not([display="true"])').forEach(function (c) {
+      var parent = c.parentElement;
+      if (!parent) return;
+      c.classList.remove('math-wide');
+      if (c.getBoundingClientRect().width > parent.clientWidth + 1) {
+        c.classList.add('math-wide');
+      }
+    });
+  }
+
+  function whenTypeset() {
+    var mj = window.MathJax;
+    if (!mj || !mj.startup || !mj.startup.promise) return;
+    mj.startup.promise.then(function () {
+      markWideMath();
+      var timer;
+      window.addEventListener('resize', function () {
+        clearTimeout(timer);
+        timer = setTimeout(function () { markWideMath(); }, 150);
+      });
+      document.querySelectorAll('details').forEach(function (el) {
+        el.addEventListener('toggle', function () {
+          // details content is typeset lazily when opened
+          setTimeout(function () { markWideMath(el); }, 300);
+        });
+      });
+    });
+  }
+
+  if (document.readyState === 'complete') {
+    whenTypeset();
+  } else {
+    window.addEventListener('load', whenTypeset);
+  }
+})();

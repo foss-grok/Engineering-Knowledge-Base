@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>DNS &amp; HTTP: From a Name to a Web Page | CS Fundamentals</title>
+  <meta name="description" content="DNS and HTTP from zero: URL parts, the DNS hierarchy, recursive resolution traced step by step, record types with real answers, TTL and caching math, Kubernetes ndots, HTTP messages, methods, idempotency, status codes, headers, cookies, caching with ETag and 304, redirects, CDNs and proxies, and a DNS migration planned hour by hour.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; DNS &amp; HTTP</p>
+  </nav>
+  <h1>DNS &amp; HTTP: From a Name to a Web Page</h1>
+  <p>What really happens between typing a web address and seeing the page: how a name becomes an IP address, and what the browser and server say to each other. The DNS answers and HTTP headers on this page come from real lookups and requests made on 17 November 2026.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-picture">The Big Picture</a></li>
+    <li><a href="#url">Reading a URL</a></li>
+    <li><a href="#dns-why">Why DNS Exists</a></li>
+    <li><a href="#dns-tree">The DNS Tree</a></li>
+    <li><a href="#resolution">A Lookup, Step by Step</a></li>
+    <li><a href="#records">Record Types, With Real Answers</a></li>
+    <li><a href="#ttl">TTL and Caching</a></li>
+    <li><a href="#dns-ops">DNS in Practice: Transport, Privacy, Failures, Kubernetes</a></li>
+    <li><a href="#http-messages">HTTP Messages</a></li>
+    <li><a href="#methods">Methods, Safety, and Idempotency</a></li>
+    <li><a href="#status">Status Codes</a></li>
+    <li><a href="#headers">Headers, Cookies, and State</a></li>
+    <li><a href="#caching">HTTP Caching: Cache-Control, ETag, 304</a></li>
+    <li><a href="#middle">Proxies, Load Balancers, and CDNs</a></li>
+    <li><a href="#scenario">Scenario: Moving a Site Without Downtime</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-picture">
+    <h2>1. The Big Picture</h2>
+    <p>You type <code>https://engineering.msaqlain.com/</code> and press Enter. Roughly six things happen:</p>
+    <pre><code>  1. Parse the URL         "https", host "engineering.msaqlain.com", path "/"
+  2. DNS lookup            host name  --&gt;  IP address          (this page)
+  3. TCP connection        3-way handshake to IP, port 443      (TCP page)
+  4. TLS handshake         check certificate, agree on keys     (TCP page)
+  5. HTTP request/reply    "GET /"  --&gt;  "200 OK" + HTML         (this page)
+  6. Render                parse HTML, fetch CSS/JS/images (more HTTP requests), draw</code></pre>
+    <p>Steps 3 and 4, plus the speed of each step, are covered in <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> (see its <a href="cn-tcp-deep-dive.html#page-load">page-load budget</a>). This page covers the two "language" layers around them: <strong>DNS</strong>, which finds the server, and <strong>HTTP</strong>, which is what you say once you reach it.</p>
+    <p>Two words first:</p>
+    <ul>
+      <li>An <strong>IP address</strong> is the number that identifies a machine on the internet, like a phone number. IPv4 looks like <code>104.20.23.154</code>. IPv6 is longer, like <code>2606:4700::6810:84e5</code>.</li>
+      <li>A <strong>port</strong> picks which program on that machine you want, like an extension number. HTTPS uses port 443, plain HTTP uses 80, and DNS uses 53.</li>
+    </ul>
+  </section>
+
+  <section id="url">
+    <h2>2. Reading a URL</h2>
+    <pre><code>  https://user@shop.example.com:8443/orders/42?sort=new&amp;page=2#reviews
+  \___/   \__/ \______________/ \__/\________/\________________/\______/
+ scheme  user      host         port   path        query        fragment</code></pre>
+    <table>
+      <thead><tr><th>Part</th><th>Meaning</th><th>Sent to the server?</th></tr></thead>
+      <tbody>
+        <tr><td>Scheme</td><td>Which protocol: <code>https</code>, <code>http</code>, <code>ftp</code>...</td><td>It decides how to connect</td></tr>
+        <tr><td>Host</td><td>The name to look up in DNS</td><td>Yes, in the <code>Host</code> header and in TLS (SNI)</td></tr>
+        <tr><td>Port</td><td>Optional. Default 443 for https, 80 for http</td><td>Used to connect</td></tr>
+        <tr><td>Path</td><td>Which resource on the server</td><td>Yes</td></tr>
+        <tr><td>Query</td><td><code>key=value</code> pairs after <code>?</code>, joined by <code>&amp;</code></td><td>Yes</td></tr>
+        <tr><td>Fragment</td><td>A spot inside the page, after <code>#</code></td><td><strong>No.</strong> The browser keeps it to itself</td></tr>
+      </tbody>
+    </table>
+    <p>Special characters are written with <strong>percent-encoding</strong>: a space becomes <code>%20</code>. That is why a folder named <code>AI Engineer</code> shows up in a link as <code>AI%20Engineer</code>.</p>
+  </section>
+
+  <section id="dns-why">
+    <h2>3. Why DNS Exists</h2>
+    <p>Computers connect using IP addresses. People remember names. The <strong>Domain Name System (DNS)</strong> is the internet's phone book: it turns a name like <code>github.com</code> into an address like <code>140.82.112.3</code>.</p>
+    <p>Names also let the owner change servers without telling anyone. The address behind a name can change every day. Big sites even hand out <em>different</em> addresses to different users, to send each one to a nearby or less busy server.</p>
+    <p>In the 1970s, every computer on the early internet had one shared file, <code>HOSTS.TXT</code>, copied from a central server. It did not scale. DNS (1983) replaced it with a <strong>distributed</strong> database: no single server knows every name. Each part of the name is managed by someone different. Your machine still has a tiny leftover of the old idea: the <code>/etc/hosts</code> file, which is checked before DNS.</p>
+  </section>
+
+  <section id="dns-tree">
+    <h2>4. The DNS Tree</h2>
+    <p>Read a domain name from <strong>right to left</strong>. Each dot is a step down a tree.</p>
+    <pre><code>                               . (root)
+                 /               |                 \
+              com               org                 in       &lt;- top-level domains (TLDs)
+            /     \               |               /    \
+       github    msaqlain     wikipedia        co      gov    &lt;- second level
+                    |                           |
+               engineering                   example          &lt;- subdomain
+                                              (example.co.in)
+
+  "engineering.msaqlain.com." = engineering -&gt; msaqlain -&gt; com -&gt; . (root)</code></pre>
+    <p>The full name really ends with a dot for the root: <code>engineering.msaqlain.com.</code> Browsers hide it.</p>
+    <ul>
+      <li>A <strong>zone</strong> is a part of the tree managed by one owner. The <code>com</code> zone is run by a registry. The <code>msaqlain.com</code> zone is run by whoever owns that domain.</li>
+      <li>An <strong>authoritative name server</strong> is a server that holds the official answers for a zone. It does not guess or remember; it simply knows.</li>
+      <li>Each level <strong>delegates</strong> to the next: the <code>com</code> servers do not know the address of <code>github.com</code>, but they know which servers are authoritative for <code>github.com</code> and point you there.</li>
+      <li>There are 13 named <strong>root server</strong> addresses (<code>a.root-servers.net</code> to <code>m.root-servers.net</code>). Each one is really hundreds of machines around the world sharing one address, a trick called <strong>anycast</strong>. Your packets reach the nearest copy.</li>
+    </ul>
+  </section>
+
+  <section id="resolution">
+    <h2>5. A Lookup, Step by Step</h2>
+    <p>Three kinds of DNS programs take part:</p>
+    <ul>
+      <li><strong>Stub resolver:</strong> a tiny client inside your operating system. It just asks one server and waits.</li>
+      <li><strong>Recursive resolver:</strong> the server that does the real work and remembers answers. Your home router, your internet provider, or a public one like <code>1.1.1.1</code> (Cloudflare) or <code>8.8.8.8</code> (Google).</li>
+      <li><strong>Authoritative servers:</strong> root, TLD, and the domain's own servers.</li>
+    </ul>
+    <p>Here is a full lookup of <code>www.github.com</code> when nothing is cached yet:</p>
+    <pre><code>  your laptop               recursive resolver                 the DNS tree
+  (stub)                    (e.g. 1.1.1.1)
+     |  1. www.github.com A?      |
+     |--------------------------&gt; |  2. www.github.com A?
+     |                            |-------------------------------&gt; root server
+     |                            |  3. "I don't know. Ask com: a.gtld-servers.net"
+     |                            |&lt;-------------------------------
+     |                            |  4. www.github.com A?
+     |                            |-------------------------------&gt; com TLD server
+     |                            |  5. "Ask github's servers: ns-1283.awsdns-32.org ..."
+     |                            |&lt;-------------------------------
+     |                            |  6. www.github.com A?
+     |                            |-------------------------------&gt; github.com authoritative
+     |                            |  7. "www.github.com is an alias (CNAME) for github.com,
+     |                            |      and github.com A 140.82.112.3, short TTL"
+     |                            |&lt;-------------------------------
+     |  8. 140.82.112.3           |  (saves the answer in its cache)
+     |&lt;-------------------------- |</code></pre>
+    <p>Two different styles of asking happen here:</p>
+    <ul>
+      <li>Your laptop sends a <strong>recursive query</strong>: "please give me the final answer, do whatever it takes."</li>
+      <li>The resolver sends <strong>iterative queries</strong>: each server only says "I don't know, but ask that one", and the resolver walks down the tree itself.</li>
+    </ul>
+    <p>A cold lookup takes 3 or more round trips from the resolver. That is slow (often 50 to 200 ms). So caching (section 7) is what makes DNS feel instant. In real life the root and <code>com</code> answers are almost always already cached, so most lookups go straight to step 6, or are answered from the cache at step 1.</p>
+    <h3>Where your machine looks, in order</h3>
+    <ol>
+      <li>The browser's own DNS cache (Chrome: <code>chrome://net-internals/#dns</code>).</li>
+      <li>The operating system: <code>/etc/hosts</code>, then its own cache (for example <code>systemd-resolved</code> on Linux).</li>
+      <li>The recursive resolver listed in <code>/etc/resolv.conf</code> or your network settings.</li>
+    </ol>
+    <h3>Try it yourself</h3>
+    <pre><code># Ask your normal resolver
+dig github.com A
+nslookup github.com
+
+# Ask a specific resolver
+dig @1.1.1.1 github.com A
+
+# Watch the whole walk from the root, like the diagram above
+dig +trace www.github.com
+
+# Short answer only
+dig +short gmail.com MX</code></pre>
+    <p>No <code>dig</code> installed? Use DNS over HTTPS with plain <code>curl</code>. This is how the answers in the next section were collected:</p>
+    <pre><code>curl -s -H 'accept: application/dns-json' \
+  'https://cloudflare-dns.com/dns-query?name=www.github.com&amp;type=A'</code></pre>
+  </section>
+
+  <section id="records">
+    <h2>6. Record Types, With Real Answers</h2>
+    <p>A DNS zone is a list of <strong>resource records</strong>. Each record has a name, a type, a TTL (how long it may be cached, in seconds), and data.</p>
+    <table>
+      <thead><tr><th>Type</th><th>Plain meaning</th><th>Example answer (real lookups on 17 Nov 2026, unless marked "typical")</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A</strong></td><td>Name to IPv4 address</td><td><code>example.com. 89 A 104.20.23.154</code> and <code>172.66.147.243</code></td></tr>
+        <tr><td><strong>AAAA</strong></td><td>Name to IPv6 address</td><td>Typical: <code>AAAA 2606:4700::6810:84e5</code></td></tr>
+        <tr><td><strong>CNAME</strong></td><td>"This name is an alias. Look up that other name instead."</td><td><code>www.github.com. 3392 CNAME github.com.</code> then <code>github.com. 37 A 140.82.112.3</code></td></tr>
+        <tr><td><strong>NS</strong></td><td>Which servers are authoritative for this zone</td><td><code>example.com. 82500 NS hera.ns.cloudflare.com.</code></td></tr>
+        <tr><td><strong>MX</strong></td><td>Where to deliver email. Lower number = try first</td><td><code>gmail.com. MX 5 gmail-smtp-in.l.google.com.</code>, then 10, 20, 30, 40 (backups)</td></tr>
+        <tr><td><strong>TXT</strong></td><td>Free text. Used for proof of domain ownership and email security (SPF, DKIM, DMARC)</td><td>Typical: <code>"v=spf1 include:_spf.google.com ~all"</code></td></tr>
+        <tr><td><strong>SOA</strong></td><td>"Start of authority": facts about the zone, including how long to cache a "no such name" answer</td><td><code>example.com</code> SOA ends in <code>... 10000 2400 604800 1800</code>; the last number, 1800 s, is the negative-cache time</td></tr>
+        <tr><td><strong>CAA</strong></td><td>Which certificate authorities may issue HTTPS certificates for this name</td><td>Typical: <code>0 issue "letsencrypt.org"</code></td></tr>
+        <tr><td><strong>HTTPS / SVCB</strong></td><td>Newer: tells the browser up front that the site supports HTTP/3 and other options, saving a round trip</td><td><code>cloudflare.com. 300 HTTPS 1 . alpn=h3,h2 ipv4hint=104.16.132.229,...</code></td></tr>
+      </tbody>
+    </table>
+    <p>Things worth noticing in these real answers:</p>
+    <ul>
+      <li><code>example.com</code> returned <strong>two</strong> A records. The client may pick either. This spreads load and gives a backup if one fails.</li>
+      <li><code>www.github.com</code> is a CNAME with a long TTL (3,392 s, cached nearly an hour), but the final A record has a very short TTL (37 s). GitHub can move <code>github.com</code> to another IP within a minute, while the alias rarely changes.</li>
+      <li>NS records often have long TTLs (82,500 s, almost a day), because the list of name servers almost never changes.</li>
+    </ul>
+    <div class="callout">
+      <strong>CNAME rule:</strong> a name that has a CNAME cannot have any other record. That is why the bare domain (<code>example.com</code>, called the <strong>apex</strong>) usually cannot be a CNAME: it must also have NS and SOA records. DNS providers work around this with "ALIAS" or "CNAME flattening", which look up the target for you and serve plain A records.
+    </div>
+  </section>
+
+  <section id="ttl">
+    <h2>7. TTL and Caching</h2>
+    <p><strong>TTL</strong> (time to live) is how many seconds a resolver may keep an answer before it must ask again. When a resolver hands you a cached answer, it counts the TTL down. That is why the real answer above said 89 seconds: it had been cached for a while already.</p>
+    <h3>Worked example: how long until a change is seen?</h3>
+    <p>Your A record has TTL 3600 (1 hour). At 10:00 you change the IP from <code>203.0.113.10</code> (old server) to <code>198.51.100.20</code> (new server).</p>
+    <ul>
+      <li>A resolver that cached the old answer at 09:59 keeps serving <em>the old IP</em> until 10:59.</li>
+      <li>A resolver that never cached it sees the new IP right away.</li>
+      <li>So the <strong>worst case</strong> is that some users reach the old server until <strong>10:00 + TTL = 11:00</strong>.</li>
+    </ul>
+    <p>Rule: <strong>a DNS change takes up to the old TTL to reach everyone</strong>. The word "propagation" makes it sound like the change spreads out. It does not. Old copies simply expire. (A few badly behaved resolvers and apps ignore TTLs and keep answers longer, so keep the old server running a bit past the TTL.)</p>
+    <h3>Choosing a TTL</h3>
+    <table>
+      <thead><tr><th>TTL</th><th>Good for</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>30 to 300 s</td><td>Records you may need to change fast (failover, migrations)</td><td>More queries, slightly slower first visits</td></tr>
+        <tr><td>3600 s (1 hour)</td><td>Most normal records</td><td>A change takes up to an hour</td></tr>
+        <tr><td>86400 s (1 day)</td><td>Records that almost never change (NS, MX)</td><td>Mistakes take a day to undo</td></tr>
+      </tbody>
+    </table>
+    <h3>Negative caching</h3>
+    <p>"This name does not exist" is cached too, for the time given in the zone's SOA record (1,800 s in the real answer above). If you look up a name <em>before</em> you create it, resolvers may keep saying "does not exist" for 30 minutes after you create it. Create records first, then test.</p>
+  </section>
+
+  <section id="dns-ops">
+    <h2>8. DNS in Practice: Transport, Privacy, Failures, Kubernetes</h2>
+    <h3>How DNS travels</h3>
+    <ul>
+      <li>Classic DNS uses <strong>UDP port 53</strong>: one small packet out, one back, no handshake. If the answer is too big, the server sets a "truncated" flag and the client retries over <strong>TCP port 53</strong>.</li>
+      <li>Classic DNS is <strong>not encrypted</strong>. Anyone on the network path can see which names you look up, and could fake answers.</li>
+      <li><strong>DNS over HTTPS (DoH)</strong> and <strong>DNS over TLS (DoT, port 853)</strong> encrypt the query between you and the resolver. Modern browsers can use DoH by default.</li>
+      <li><strong>DNSSEC</strong> adds digital signatures to records, so a resolver can prove an answer really came from the zone owner and was not changed. (The <code>"AD": true</code> flag in the real <code>example.com</code> answer means the resolver checked those signatures.)</li>
+    </ul>
+    <h3>When DNS fails</h3>
+    <table>
+      <thead><tr><th>Result</th><th>Meaning</th><th>Usual cause</th></tr></thead>
+      <tbody>
+        <tr><td><code>NXDOMAIN</code></td><td>The name does not exist</td><td>Typo, record not created yet, wrong search domain</td></tr>
+        <tr><td><code>NOERROR</code> but no answer</td><td>The name exists but has no record of this type (often called NODATA)</td><td>Asking for AAAA when only A exists</td></tr>
+        <tr><td><code>SERVFAIL</code></td><td>The resolver could not get a good answer</td><td>Authoritative servers down, broken DNSSEC signatures</td></tr>
+        <tr><td>Timeout</td><td>No reply at all</td><td>Firewall blocks port 53, resolver overloaded</td></tr>
+      </tbody>
+    </table>
+    <p>A saying among engineers is "It's always DNS." Many big outages started with a bad DNS change, because almost everything depends on it and caches hide mistakes for a while.</p>
+    <h3>Kubernetes: the ndots trap</h3>
+    <p>Inside a <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html#dns">Kubernetes pod</a>, <code>/etc/resolv.conf</code> usually looks like this:</p>
+    <pre><code>nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</code></pre>
+    <p><code>ndots:5</code> means: "if a name has fewer than 5 dots, first try it with each search domain added on the end." <code>api.example.com</code> has 2 dots, so a lookup tries, in order:</p>
+    <pre><code>api.example.com.default.svc.cluster.local   -&gt; NXDOMAIN
+api.example.com.svc.cluster.local           -&gt; NXDOMAIN
+api.example.com.cluster.local               -&gt; NXDOMAIN
+api.example.com                             -&gt; the real answer</code></pre>
+    <p>That is 4 lookups instead of 1, and twice that if the app asks for both A and AAAA. Under heavy traffic, this can overload the cluster DNS (CoreDNS) and add latency to every outgoing call. Fixes: write external names with a trailing dot (<code>api.example.com.</code>), which means "this is already complete"; lower <code>ndots</code> in the pod's <code>dnsConfig</code>; or run NodeLocal DNSCache.</p>
+  </section>
+
+  <section id="http-messages">
+    <h2>9. HTTP Messages</h2>
+    <p>Once connected, the browser and server speak <strong>HTTP</strong> (HyperText Transfer Protocol). The model is simple: the client sends a <strong>request</strong>, the server sends back a <strong>response</strong>. Every request stands alone, so HTTP is called <strong>stateless</strong>: the server does not have to remember earlier requests.</p>
+    <p>Here is a real exchange, printed with <code>curl -v https://example.com/</code> (lines with <code>&gt;</code> are sent, <code>&lt;</code> are received):</p>
+    <pre><code>&gt; GET / HTTP/2                         &lt;- request line: method, path, version
+&gt; Host: example.com                    &lt;- headers: name: value
+&gt; User-Agent: curl/8.14.1
+&gt; Accept: */*
+&gt;                                      &lt;- blank line ends the headers
+&lt; HTTP/2 200                           &lt;- status line: version, status code
+&lt; date: Tue, 17 Nov 2026 08:48:38 GMT
+&lt; content-type: text/html; charset=utf-8
+&lt; server: cloudflare
+&lt; last-modified: Mon, 16 Nov 2026 00:30:20 GMT
+&lt; age: 7
+&lt; cf-cache-status: HIT
+&lt; alt-svc: h3=":443"; ma=86400
+&lt;
+&lt;!doctype html&gt; ...                    &lt;- body (the HTML)</code></pre>
+    <p>The parts of every HTTP message:</p>
+    <ol>
+      <li><strong>Start line.</strong> Request: method + path + version. Response: version + status code.</li>
+      <li><strong>Headers.</strong> Extra facts as <code>Name: value</code> lines. Names are not case sensitive.</li>
+      <li><strong>Blank line.</strong></li>
+      <li><strong>Body</strong> (optional). The HTML, JSON, image, or form data.</li>
+    </ol>
+    <p>In HTTP/1.1 this is literally plain text sent over the connection. HTTP/2 and HTTP/3 send the same information in a compact binary form (and header names are lowercase, as above), but the <em>meaning</em> is identical. Learn the text form and you understand all versions. See the <a href="cn-tcp-deep-dive.html#page-load">TCP page</a> for why HTTP/2 and HTTP/3 exist.</p>
+    <p>Notice <code>alt-svc: h3=":443"; ma=86400</code>: the server says "I also speak HTTP/3 on port 443, remember this for a day." The next visit can use HTTP/3.</p>
+  </section>
+
+  <section id="methods">
+    <h2>10. Methods, Safety, and Idempotency</h2>
+    <p>The <strong>method</strong> says what you want to do with the resource.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Purpose</th><th>Safe?</th><th>Idempotent?</th><th>Has body?</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td>Read a resource</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+        <tr><td>HEAD</td><td>Like GET, but headers only</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+        <tr><td>POST</td><td>Create something, or run an action</td><td>No</td><td><strong>No</strong></td><td>Yes</td></tr>
+        <tr><td>PUT</td><td>Replace the resource with this exact content</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>PATCH</td><td>Change part of a resource</td><td>No</td><td>Not by default</td><td>Yes</td></tr>
+        <tr><td>DELETE</td><td>Remove the resource</td><td>No</td><td>Yes</td><td>Usually no</td></tr>
+        <tr><td>OPTIONS</td><td>Ask what is allowed (used by browsers for CORS checks)</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>Safe</strong> means the request does not change anything on the server. Crawlers and prefetchers may send safe requests freely.</li>
+      <li><strong>Idempotent</strong> means sending it once or ten times leaves the server in the same state. "Set my balance to 100" is idempotent. "Add 100 to my balance" is not.</li>
+    </ul>
+    <h3>Why idempotency matters: retries</h3>
+    <p>Networks fail. A request can reach the server and succeed, and then the <em>reply</em> is lost. The client cannot tell the difference between "never arrived" and "done, but the answer got lost".</p>
+    <pre><code>client                         server
+  |  POST /payments  amount=100   |
+  |-----------------------------&gt; |  charges the card
+  |       200 OK  (lost!)          |
+  |   x &lt;------------------------- |
+  |  (timeout... retry)            |
+  |  POST /payments  amount=100   |
+  |-----------------------------&gt; |  charges the card AGAIN</code></pre>
+    <p>Retrying a GET or PUT is fine. Retrying a POST can charge a customer twice. The standard fix is an <strong>idempotency key</strong>: the client makes a unique ID for each logical action and sends it in a header such as <code>Idempotency-Key: 7f3c...</code>. The server remembers the keys it has seen, and if the same key comes again, it returns the saved result instead of charging again. Payment APIs such as Stripe work this way. On the server, "remember the key" must itself be safe from <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html#race">race conditions</a>, usually by a unique constraint in the database.</p>
+  </section>
+
+  <section id="status">
+    <h2>11. Status Codes</h2>
+    <p>The first digit tells you the class:</p>
+    <table>
+      <thead><tr><th>Class</th><th>Meaning</th><th>Codes you will see most</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1xx</strong></td><td>Info, keep going</td><td>101 Switching Protocols (WebSockets), 103 Early Hints</td></tr>
+        <tr><td><strong>2xx</strong></td><td>Success</td><td>200 OK, 201 Created, 204 No Content</td></tr>
+        <tr><td><strong>3xx</strong></td><td>Go somewhere else, or use your copy</td><td>301 Moved Permanently, 302 Found, 304 Not Modified, 307/308 (redirect, keep the method)</td></tr>
+        <tr><td><strong>4xx</strong></td><td>The <em>client</em> made a mistake</td><td>400 Bad Request, 401 Unauthorized (not logged in), 403 Forbidden (logged in, not allowed), 404 Not Found, 409 Conflict, 429 Too Many Requests</td></tr>
+        <tr><td><strong>5xx</strong></td><td>The <em>server</em> failed</td><td>500 Internal Server Error, 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout</td></tr>
+      </tbody>
+    </table>
+    <p>The difference between 4xx and 5xx matters a lot in practice. A 4xx usually should <strong>not</strong> be retried: the same request will fail again. A 503 or a 429 often <strong>should</strong> be retried, after the delay in the <code>Retry-After</code> header if there is one, with growing waits between tries (<strong>exponential backoff</strong>).</p>
+    <h3>502 vs 504: reading the error from the middle</h3>
+    <p>Most sites have a proxy or load balancer in front of the app (section 14). These codes come from that middle box:</p>
+    <ul>
+      <li><strong>502 Bad Gateway:</strong> the proxy reached the app, but got a broken reply or the connection was refused. Often the app crashed or is restarting.</li>
+      <li><strong>504 Gateway Timeout:</strong> the proxy waited for the app and gave up. The app is alive but too slow, often stuck on a database query. See <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a>.</li>
+    </ul>
+  </section>
+
+  <section id="headers">
+    <h2>12. Headers, Cookies, and State</h2>
+    <h3>Headers you should know</h3>
+    <table>
+      <thead><tr><th>Header</th><th>Direction</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>Host</code></td><td>Request</td><td>Which site you want. One IP can host many sites, so this is required</td></tr>
+        <tr><td><code>Content-Type</code></td><td>Both</td><td>What the body is: <code>text/html</code>, <code>application/json</code>...</td></tr>
+        <tr><td><code>Content-Length</code></td><td>Both</td><td>Body size in bytes</td></tr>
+        <tr><td><code>Accept</code>, <code>Accept-Encoding</code></td><td>Request</td><td>What formats and compression (<code>gzip</code>, <code>br</code>, <code>zstd</code>) the client can handle</td></tr>
+        <tr><td><code>Authorization</code></td><td>Request</td><td>Credentials, such as <code>Bearer &lt;token&gt;</code></td></tr>
+        <tr><td><code>Location</code></td><td>Response</td><td>Where to go, for redirects and newly created resources</td></tr>
+        <tr><td><code>Cache-Control</code>, <code>ETag</code></td><td>Response</td><td>Caching rules (section 13)</td></tr>
+        <tr><td><code>Set-Cookie</code> / <code>Cookie</code></td><td>Response / Request</td><td>Store and send back small pieces of state</td></tr>
+        <tr><td><code>Strict-Transport-Security</code></td><td>Response</td><td>"Only ever use HTTPS for this site" (HSTS)</td></tr>
+      </tbody>
+    </table>
+    <h3>Cookies: memory for a stateless protocol</h3>
+    <p>If HTTP forgets every request, how does a site know you are logged in? With a <strong>cookie</strong>: a small named value the server asks the browser to store and send back on every later request to that site.</p>
+    <pre><code>1. POST /login   (username + password)
+   &lt;- 200 OK
+      Set-Cookie: session=9f8e7d...; HttpOnly; Secure; SameSite=Lax; Max-Age=86400
+
+2. GET /orders
+   -&gt; Cookie: session=9f8e7d...        (browser adds it automatically)
+   &lt;- 200 OK  (server looks up session 9f8e7d... and knows who you are)</code></pre>
+    <p>The cookie options are security settings:</p>
+    <ul>
+      <li><code>HttpOnly</code>: JavaScript on the page cannot read it, which limits damage from injected scripts.</li>
+      <li><code>Secure</code>: only sent over HTTPS.</li>
+      <li><code>SameSite=Lax</code>: not sent on most requests started by <em>other</em> sites, which blocks a class of attacks called CSRF (cross-site request forgery).</li>
+      <li><code>Max-Age</code>: how long to keep it, in seconds.</li>
+    </ul>
+    <p>APIs used by mobile apps and other servers often skip cookies and send a token in the <code>Authorization</code> header instead.</p>
+  </section>
+
+  <section id="caching">
+    <h2>13. HTTP Caching: Cache-Control, ETag, 304</h2>
+    <p>The fastest request is one you never send. HTTP caching lets browsers and CDNs reuse earlier responses.</p>
+    <h3>Cache-Control</h3>
+    <table>
+      <thead><tr><th>Directive</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>max-age=3600</code></td><td>Fresh for 3,600 seconds. Use it without asking the server</td></tr>
+        <tr><td><code>no-cache</code></td><td>You may store it, but must check with the server before each use</td></tr>
+        <tr><td><code>no-store</code></td><td>Never store it (bank pages, private data)</td></tr>
+        <tr><td><code>public</code> / <code>private</code></td><td>Shared caches (CDNs) may / may not store it</td></tr>
+        <tr><td><code>must-revalidate</code></td><td>Once stale, never use without checking</td></tr>
+        <tr><td><code>immutable</code></td><td>This URL's content will never change</td></tr>
+      </tbody>
+    </table>
+    <h3>Revalidation with ETag: a real example</h3>
+    <p>An <strong>ETag</strong> is a fingerprint of a version of a file. If the file changes, the ETag changes. Here is this very site's stylesheet:</p>
+    <pre><code>$ curl -sI https://engineering.msaqlain.com/styles.css
+HTTP/2 200
+cache-control: public, max-age=0, must-revalidate
+content-type: text/css; charset=utf-8
+etag: "4c3894ae9469f1a7e8fc574abad9bd40"
+content-length: 15575
+
+$ curl -sI -H 'If-None-Match: "4c3894ae9469f1a7e8fc574abad9bd40"' \
+    https://engineering.msaqlain.com/styles.css
+HTTP/2 304</code></pre>
+    <p>Step by step:</p>
+    <ol>
+      <li>First visit: the browser downloads 15,575 bytes and saves the ETag.</li>
+      <li><code>max-age=0, must-revalidate</code> means "check every time before using it".</li>
+      <li>Next visit: the browser sends <code>If-None-Match</code> with the saved ETag.</li>
+      <li>The file has not changed, so the server replies <strong>304 Not Modified</strong> with no body. The browser uses its saved copy. Only a few hundred bytes of headers moved.</li>
+    </ol>
+    <p>This is a safe default for a site that changes often: users always see the newest version, but unchanged files are not downloaded again. The cost is one round trip per file. The other common strategy is <strong>cache busting</strong>: put a version or hash in the file name (<code>app.3f9a1c.js</code>) and serve it with <code>max-age=31536000, immutable</code>. The browser never asks again, and a new release simply uses a new file name.</p>
+    <p><code>Last-Modified</code> with <code>If-Modified-Since</code> does the same job as ETag, using a date instead of a fingerprint.</p>
+  </section>
+
+  <section id="middle">
+    <h2>14. Proxies, Load Balancers, and CDNs</h2>
+    <p>Your request rarely goes straight to the program that builds the page.</p>
+    <pre><code>  browser --&gt; CDN edge (near you) --&gt; load balancer --&gt; app server 1
+                 |  cache HIT?                     \-&gt; app server 2
+                 |  answer from cache                \-&gt; app server 3 --&gt; database</code></pre>
+    <ul>
+      <li>A <strong>reverse proxy</strong> sits in front of servers and forwards requests to them. Examples: Nginx, Envoy, HAProxy. It can handle TLS, compression, and rate limits so the app does not have to.</li>
+      <li>A <strong>load balancer</strong> is a reverse proxy that spreads requests over several servers, and stops sending to servers that fail health checks. In Kubernetes, this is the job of Services and <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html#ingress">Ingress</a>.</li>
+      <li>A <strong>CDN</strong> (content delivery network) is a big network of caching proxies in many cities. In the real <code>example.com</code> reply above, <code>server: cloudflare</code>, <code>cf-cache-status: HIT</code>, and <code>age: 7</code> mean a Cloudflare server near the client answered from its cache, and that copy was 7 seconds old.</li>
+    </ul>
+    <p>Because of these middle boxes, the app sees the proxy's IP, not the user's. Proxies add headers like <code>X-Forwarded-For</code> (the original client IP) and <code>X-Forwarded-Proto</code> (was it https?). Only trust these headers when they come from your own proxy, because clients can fake them.</p>
+  </section>
+
+  <section id="scenario">
+    <h2>15. Scenario: Moving a Site Without Downtime</h2>
+    <p><strong>Situation.</strong> <code>shop.example.com</code> points to an old server, <code>203.0.113.10</code>, with an A record TTL of 86,400 seconds (1 day). You must move to a new server, <code>198.51.100.20</code>, on Saturday at 10:00, with no visible downtime.</p>
+    <h3>The naive plan, and why it hurts</h3>
+    <p>Change the A record at 10:00 Saturday and turn off the old server. Resolvers that cached the old answer on Friday at 10:01 keep sending users to the dead server until <strong>Saturday 10:01</strong>. Some users see errors for almost a full day.</p>
+    <h3>The safe plan</h3>
+    <table>
+      <thead><tr><th>When</th><th>Action</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Thursday 09:00 (at least one old TTL before the move)</td><td>Lower the TTL to 300 s. Keep the same IP</td><td>By Friday 09:00 every cached copy with the 1-day TTL has expired. From then on, caches hold the answer for at most 5 minutes</td></tr>
+        <tr><td>Friday</td><td>Set up the new server. Test it directly with <code>curl --resolve shop.example.com:443:198.51.100.20 https://shop.example.com/</code></td><td><code>--resolve</code> skips DNS, so you test the new server with the real name and certificate before anyone else uses it</td></tr>
+        <tr><td>Saturday 10:00</td><td>Change the A record to <code>198.51.100.20</code></td><td>The worst-case switch-over time is now 5 minutes, not 1 day</td></tr>
+        <tr><td>Saturday 10:00 to 11:00</td><td>Keep the old server running. Watch traffic on both</td><td>Traffic on the old server should fall to near zero within minutes. Some clients ignore TTLs</td></tr>
+        <tr><td>Saturday 11:00 onward</td><td>Turn off the old server once its traffic stays at zero. Raise the TTL back to 3600 s</td><td>Fewer DNS queries again</td></tr>
+      </tbody>
+    </table>
+    <p>Check during the move: <code>dig +short shop.example.com @1.1.1.1</code> and <code>@8.8.8.8</code> show what big public resolvers currently return, and the second column of a full <code>dig</code> answer shows how many seconds of TTL are left.</p>
+    <div class="callout">
+      <strong>The general lesson:</strong> DNS changes are not instant; they are bounded by the TTL that was in caches <em>before</em> you made the change. Lower the TTL first, wait one old TTL, then make the change.
+    </div>
+  </section>
+
+  <section id="pitfalls">
+    <h2>16. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Testing a DNS change from one laptop</strong> and assuming the world sees it. Your machine, your browser, and your resolver all cache. Test against several public resolvers.</li>
+      <li><strong>Looking up a name before creating it</strong>, then waiting for the negative-cache time.</li>
+      <li><strong>Long-lived programs that look up a name once at start-up</strong> and never again. When the IP changes, they keep calling the old one. Some HTTP clients and connection pools do this. Make sure they respect TTLs or reconnect now and then.</li>
+      <li><strong>Retrying POST requests without an idempotency key.</strong> Double charges, double orders.</li>
+      <li><strong>Returning 200 with an error message in the body.</strong> Monitoring, caches, and retry logic all read the status code. Use the right 4xx or 5xx.</li>
+      <li><strong>Caching private pages in a CDN</strong> because <code>Cache-Control: private</code> or <code>no-store</code> was missing. One user's page can be shown to another.</li>
+      <li><strong>Long <code>max-age</code> on a file name that never changes</strong> (<code>app.js</code>). Users keep the old version after a release. Use hashed file names for long caching.</li>
+      <li><strong>Trusting <code>X-Forwarded-For</code> from the open internet</strong> for rate limits or security decisions.</li>
+      <li><strong>Forgetting the trailing dot or ndots</strong> in Kubernetes, multiplying DNS traffic.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>17. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Command or rule</th></tr></thead>
+      <tbody>
+        <tr><td>Look up a name</td><td><code>dig example.com A</code>, <code>dig +short ...</code></td></tr>
+        <tr><td>See the full walk</td><td><code>dig +trace www.example.com</code></td></tr>
+        <tr><td>Ask one resolver</td><td><code>dig @1.1.1.1 example.com</code></td></tr>
+        <tr><td>Lookup without dig</td><td><code>curl -H 'accept: application/dns-json' 'https://cloudflare-dns.com/dns-query?name=...&amp;type=A'</code></td></tr>
+        <tr><td>Test a server before DNS points to it</td><td><code>curl --resolve host:443:IP https://host/</code></td></tr>
+        <tr><td>See request and response headers</td><td><code>curl -v URL</code>, or <code>curl -sI URL</code> for headers only</td></tr>
+        <tr><td>Time each phase</td><td><code>curl -w</code> (see the <a href="cn-tcp-deep-dive.html#page-load">TCP page</a>)</td></tr>
+        <tr><td>How long a DNS change takes</td><td>Up to the <em>old</em> TTL</td></tr>
+        <tr><td>Safe to retry</td><td>GET, HEAD, PUT, DELETE; POST only with an idempotency key</td></tr>
+        <tr><td>4xx vs 5xx</td><td>Client mistake (do not retry) vs server failure (maybe retry with backoff)</td></tr>
+        <tr><td>Check freshness cheaply</td><td>ETag + <code>If-None-Match</code> &rarr; 304</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.rfc-editor.org/rfc/rfc1034" rel="noopener noreferrer">RFC 1034: DNS concepts</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9110" rel="noopener noreferrer">RFC 9110: HTTP Semantics</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9111" rel="noopener noreferrer">RFC 9111: HTTP Caching</a> &middot; <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP" rel="noopener noreferrer">MDN: HTTP</a> &middot; <a href="https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/make-api-requests/dns-json/" rel="noopener noreferrer">Cloudflare DoH JSON API</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

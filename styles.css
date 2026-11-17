@@ -785,6 +785,25 @@ details .MathJax {
   max-width: 100%;
 }
 
+/* MathJax 3 renders display equations as <mjx-container display="true">.
+   Long equations must scroll inside their own box on phones instead of
+   widening the whole page. */
+mjx-container[display="true"] {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+}
+
+mjx-container.math-wide {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: middle;
+}
+
 summary .MathJax {
   display: inline;
 }
@@ -873,4 +892,66 @@ header .badge-interview {
 /* Keep in-page anchor targets from sitting flush against the top edge */
 main section[id] {
   scroll-margin-top: 1rem;
+}
+
+/* Copy button on code blocks (added by assets/site.js) */
+.learn-page .code-block {
+  position: relative;
+}
+
+.learn-page .code-block > pre {
+  padding-right: 4.5rem;
+}
+
+.learn-page .code-copy {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  padding: 0.2rem 0.6rem;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.learn-page .code-copy:hover,
+.learn-page .code-copy:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+  opacity: 1;
+}
+
+/* Suggested reading order on learn hubs */
+.learning-path {
+  counter-reset: path-step;
+  list-style: none;
+  padding-left: 0;
+}
+
+.learning-path li {
+  counter-increment: path-step;
+  position: relative;
+  padding-left: 2.25rem;
+  margin-bottom: 0.6rem;
+}
+
+.learning-path li::before {
+  content: counter(path-step);
+  position: absolute;
+  left: 0;
+  top: 0.05rem;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  background: rgba(94, 234, 212, 0.12);
+  border: 1px solid #3d5a54;
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.4rem;
+  text-align: center;
 }

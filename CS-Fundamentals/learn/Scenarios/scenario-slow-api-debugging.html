@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scenario: Debugging a Slow API End to End | CS Fundamentals</title>
+  <meta name="description" content="A full real-world walkthrough: an API gets slow after a traffic spike. Learn latency percentiles, the RED and USE methods, splitting time across network and server with curl, reading uptime and vmstat, Little's law for connection pools worked by hand, finding the slow query with pg_stat_statements and EXPLAIN, retry storms, load shedding, and writing a blameless postmortem.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Scenario: Slow API</p>
+  </nav>
+  <h1>Scenario: Debugging a Slow API End to End</h1>
+  <p>A story that uses every CS Fundamentals page at once. An API that was fast yesterday is slow today. We follow the clues layer by layer: network, operating system, application, and database. Along the way you learn the small set of numbers and tools that find almost any slowdown.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#situation">The Situation</a></li>
+    <li><a href="#vocabulary">Words for Speed: Latency, Percentiles, Throughput</a></li>
+    <li><a href="#map">Draw the Map First</a></li>
+    <li><a href="#methods">Two Checklists: RED and USE</a></li>
+    <li><a href="#network">Step 1: Network or Server?</a></li>
+    <li><a href="#host">Step 2: Is the Machine Struggling?</a></li>
+    <li><a href="#app">Step 3: Where Does the Request Spend Its Time?</a></li>
+    <li><a href="#littles-law">Step 4: Little's Law and the Connection Pool</a></li>
+    <li><a href="#database">Step 5: Find and Fix the Slow Query</a></li>
+    <li><a href="#retries">Step 6: Why It Got Worse: Retry Storms</a></li>
+    <li><a href="#hardening">Step 7: Make It Fail Gracefully Next Time</a></li>
+    <li><a href="#verify">Step 8: Prove the Fix</a></li>
+    <li><a href="#postmortem">Step 9: Write a Blameless Postmortem</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="situation">
+    <h2>1. The Situation</h2>
+    <p>A shop runs an API behind a load balancer. The endpoint <code>GET /api/orders?customer=...</code> powers the "My orders" screen of the mobile app.</p>
+    <ul>
+      <li>Normal day: about 200 requests per second, and 99% of requests finish within 120 ms.</li>
+      <li>Today a sale campaign starts at 18:00. Traffic doubles to 400 requests per second.</li>
+      <li>By 18:10, some requests take over 3 seconds. Some users get <code>504 Gateway Timeout</code>. The app's error rate climbs to 8%.</li>
+    </ul>
+    <p>Our job: find the cause, fix it, and make sure it does not happen again. The temptation is to guess ("the database is slow!", "add more servers!"). Guessing often works on small problems and fails on real ones. We will <em>measure</em> each layer instead.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> debugging a slow system is like finding where a traffic jam starts. You do not stand in one spot and guess. You check the road in sections. The first section where cars are crawling, but the one after it is clear, is where the jam begins.
+    </div>
+  </section>
+
+  <section id="vocabulary">
+    <h2>2. Words for Speed: Latency, Percentiles, Throughput</h2>
+    <ul>
+      <li><strong>Latency:</strong> how long one request takes, from start to finish.</li>
+      <li><strong>Throughput:</strong> how many requests are finished per second.</li>
+      <li><strong>Utilization:</strong> what fraction of time a resource (CPU, disk, a connection) is busy.</li>
+      <li><strong>Saturation:</strong> work that is <em>waiting</em> because the resource is already busy. A queue.</li>
+    </ul>
+    <h3>Why averages lie: percentiles</h3>
+    <p>Here are 20 real-looking request times in milliseconds, sorted:</p>
+    <pre><code>45 48 50 52 52 55 58 60 61 63 65 70 72 75 80 90 110 150 900 2400</code></pre>
+    <p>The <strong>average</strong> (mean) is 4,556 / 20 = <strong>227.8 ms</strong>. But no request actually took about 228 ms. Most were around 60 ms, and two were terrible.</p>
+    <p>A <strong>percentile</strong> answers "how slow is the request that is slower than X% of all requests?" Using the simple <em>nearest-rank</em> rule: sort the values, and the p-th percentile is the value at position <code>ceil(p/100 &times; n)</code>.</p>
+    <table>
+      <thead><tr><th>Name</th><th>Position (n = 20)</th><th>Value</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td>p50 (median)</td><td>ceil(0.50 &times; 20) = 10th</td><td>63 ms</td><td>A typical request</td></tr>
+        <tr><td>p90</td><td>ceil(0.90 &times; 20) = 18th</td><td>150 ms</td><td>1 in 10 is slower than this</td></tr>
+        <tr><td>p95</td><td>ceil(0.95 &times; 20) = 19th</td><td>900 ms</td><td>1 in 20 is slower than this</td></tr>
+        <tr><td>p99</td><td>ceil(0.99 &times; 20) = 20th</td><td>2,400 ms</td><td>The "tail": 1 in 100 is slower</td></tr>
+      </tbody>
+    </table>
+    <p>Why care about the tail? A single screen often makes many API calls. If a page makes 10 calls and each one has a 1% chance of being slow, the chance that <em>at least one</em> is slow is 1 - 0.99<sup>10</sup> &asymp; <strong>9.6%</strong>. Rare slowness per call becomes common slowness per user. That is why teams set goals on p95 or p99, not on the average.</p>
+    <p>A <strong>service level objective (SLO)</strong> is such a goal written down, for example: "99% of <code>/api/orders</code> requests finish within 300 ms, measured over 30 days."</p>
+  </section>
+
+  <section id="map">
+    <h2>3. Draw the Map First</h2>
+    <p>Before touching any tool, draw every hop one request makes. Each arrow is a place where time can be spent or a queue can form.</p>
+    <pre><code>  phone app
+     |  DNS lookup, TCP + TLS handshake            (network)
+     v
+  load balancer  ----  timeout 3 s  ----+
+     |                                  |
+     v                                  v
+  API server 1 ... API server 4         (OS: CPU, memory, threads)
+     |  each server: 50 worker threads
+     |  each server: DB connection pool of 10
+     v
+  PostgreSQL primary                    (database: queries, locks, disk)</code></pre>
+    <p>Write the limits on the map too: the load balancer gives up after 3 seconds (that is where the 504s come from), each server has a pool of 10 database connections, so all four servers together can hold at most 40 connections.</p>
+  </section>
+
+  <section id="methods">
+    <h2>4. Two Checklists: RED and USE</h2>
+    <p>Two short checklists cover almost everything.</p>
+    <h3>RED, for each service (Tom Wilkie)</h3>
+    <ul>
+      <li><strong>R</strong>ate: requests per second.</li>
+      <li><strong>E</strong>rrors: failed requests per second.</li>
+      <li><strong>D</strong>uration: latency percentiles.</li>
+    </ul>
+    <h3>USE, for each resource (Brendan Gregg)</h3>
+    <ul>
+      <li><strong>U</strong>tilization: how busy is it?</li>
+      <li><strong>S</strong>aturation: is work queuing up?</li>
+      <li><strong>E</strong>rrors: is it reporting failures?</li>
+    </ul>
+    <p>RED tells you <em>which service</em> hurts. USE tells you <em>which resource</em> inside it is the bottleneck. Here is our first RED reading at 18:15:</p>
+    <table>
+      <thead><tr><th>Service</th><th>Rate</th><th>Errors</th><th>p50</th><th>p99</th></tr></thead>
+      <tbody>
+        <tr><td>Load balancer</td><td>400/s</td><td>8% (504)</td><td>1.9 s</td><td>3.0 s (the timeout)</td></tr>
+        <tr><td>API servers</td><td>400/s</td><td>8%</td><td>1.9 s</td><td>3.0 s</td></tr>
+        <tr><td>PostgreSQL</td><td>~380 queries/s</td><td>0</td><td>100 ms</td><td>140 ms</td></tr>
+      </tbody>
+    </table>
+    <p>Look closely at the last row. The API receives 400 requests per second, and each request needs one database query, but the database only completes about 380 per second. And each query takes about 100 ms, yet the API's requests take 1,900 ms. Where do the other 1,800 ms go? Hold on to that question.</p>
+  </section>
+
+  <section id="network">
+    <h2>5. Step 1: Network or Server?</h2>
+    <p>First split the time into network parts and server parts. <code>curl</code> can print the time at the end of each phase (see <a href="../Computer-Networks/cn-tcp-deep-dive.html#page-load">TCP Deep Dive</a> for the details of each phase):</p>
+    <pre><code>curl -s -o /dev/null -w \
+ 'dns:     %{time_namelookup}s\nconnect: %{time_connect}s\ntls:     %{time_appconnect}s\nttfb:    %{time_starttransfer}s\ntotal:   %{time_total}s\n' \
+ 'https://api.shop.example/api/orders?customer=4242'</code></pre>
+    <p>The times are <strong>cumulative</strong> (each one counts from the very start). Example output during the incident:</p>
+    <pre><code>dns:     0.004s
+connect: 0.031s
+tls:     0.064s
+ttfb:    2.212s
+total:   2.215s</code></pre>
+    <p>Subtract to get each phase:</p>
+    <table>
+      <thead><tr><th>Phase</th><th>Math</th><th>Time</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>DNS</td><td>0.004</td><td>4 ms</td><td>Fine (cached)</td></tr>
+        <tr><td>TCP connect</td><td>0.031 - 0.004</td><td>27 ms</td><td>Fine, one round trip</td></tr>
+        <tr><td>TLS</td><td>0.064 - 0.031</td><td>33 ms</td><td>Fine, about one round trip</td></tr>
+        <tr><td><strong>Waiting for first byte</strong></td><td>2.212 - 0.064</td><td><strong>2,148 ms</strong></td><td><strong>Problem is here</strong></td></tr>
+        <tr><td>Download</td><td>2.215 - 2.212</td><td>3 ms</td><td>Fine</td></tr>
+      </tbody>
+    </table>
+    <p>Time to first byte (<strong>TTFB</strong>) minus the handshakes is "one round trip plus server time". The round trip is about 30 ms, so the server is spending over 2 seconds. <strong>The network is not the problem.</strong> DNS (see <a href="../Computer-Networks/cn-dns-http.html">DNS &amp; HTTP</a>) and TLS are healthy. We move inside the servers.</p>
+  </section>
+
+  <section id="host">
+    <h2>6. Step 2: Is the Machine Struggling?</h2>
+    <p>Log in to one API server and run three quick commands. Each takes seconds and rules out a whole class of causes.</p>
+    <h3>uptime: load average</h3>
+    <pre><code>$ uptime
+ 18:16:02 up 41 days,  load average: 1.12, 0.98, 0.85</code></pre>
+    <p>The <strong>load average</strong> is roughly the number of threads running or ready to run, averaged over 1, 5, and 15 minutes. (On Linux it also counts threads stuck waiting on disk.) Compare it to the number of CPU cores. This server has 4 cores, so 1.12 means the CPU is mostly idle. If it said 12, threads would be queuing for CPU time.</p>
+    <h3>vmstat: CPU, memory, and waiting, every second</h3>
+    <pre><code>$ vmstat 1 5
+procs ---------memory---------- ---swap-- -----io---- ---system--- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in    cs us sy id wa st
+ 1  0      0 2103420 98232 3110220   0    0     0    12  910  1650  9  3 88  0  0
+ 0  0      0 2103312 98232 3110228   0    0     0     0  887  1544  8  2 90  0  0
+ ...</code></pre>
+    <table>
+      <thead><tr><th>Column</th><th>Meaning</th><th>Here</th><th>Would worry us if</th></tr></thead>
+      <tbody>
+        <tr><td><code>r</code></td><td>Threads waiting for a CPU</td><td>0 to 1</td><td>Often above the core count (CPU saturated)</td></tr>
+        <tr><td><code>b</code></td><td>Threads blocked on disk I/O</td><td>0</td><td>Above 0 for long</td></tr>
+        <tr><td><code>si</code>/<code>so</code></td><td>Memory swapped in/out per second</td><td>0</td><td>Not 0 (memory pressure; see <a href="../Operating-Systems/os-virtual-memory-paging.html#thrashing">thrashing</a>)</td></tr>
+        <tr><td><code>us</code>/<code>sy</code></td><td>% CPU in user code / in the kernel</td><td>9 / 3</td><td>Near 100 together</td></tr>
+        <tr><td><code>id</code></td><td>% CPU idle</td><td>88</td><td>Near 0</td></tr>
+        <tr><td><code>wa</code></td><td>% CPU idle while waiting for disk</td><td>0</td><td>High (disk is the bottleneck)</td></tr>
+        <tr><td><code>st</code></td><td>% "stolen" by other virtual machines on the same host</td><td>0</td><td>High (noisy neighbours)</td></tr>
+      </tbody>
+    </table>
+    <p>In containers, also check for <strong>CPU throttling</strong>: a container can be slowed down by its CPU limit even when the machine looks idle. See <a href="../Operating-Systems/os-processes-threads-scheduling.html#containers">CPU limits and throttling in containers</a>. Here <code>nr_throttled</code> in <code>/sys/fs/cgroup/cpu.stat</code> is not growing, so that is ruled out too.</p>
+    <h3>The surprising conclusion</h3>
+    <p>The CPU is idle, memory is fine, and the disk is quiet. Yet requests take 2 seconds. When a system is <strong>slow but idle</strong>, the requests are not <em>working</em>. They are <em>waiting</em> for something: a lock, a pool, or another service. (This is the same clue as in the <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html#scenario">frozen payments service</a>.)</p>
+  </section>
+
+  <section id="app">
+    <h2>7. Step 3: Where Does the Request Spend Its Time?</h2>
+    <p><strong>Distributed tracing</strong> records how long each step inside a request takes. Each timed step is called a <strong>span</strong>, and the spans together form a <strong>trace</strong>. OpenTelemetry is the common standard; tools like Jaeger, Grafana Tempo, or Honeycomb draw the result as a "waterfall".</p>
+    <p>One slow trace from 18:16:</p>
+    <pre><code>GET /api/orders?customer=4242                        [==================================] 2,200 ms
+  auth.check_token                                   [=]                                      4 ms
+  db.pool.acquire  (waiting for a free connection)     [==============================]   2,089 ms
+  db.query  SELECT ... FROM orders WHERE ...                                          [==]     104 ms
+  json.serialize                                                                         []     3 ms</code></pre>
+    <p>There is the missing time. The query itself takes 104 ms, close to what the database reported. But the request waited <strong>2,089 ms just to get a database connection</strong> from the pool.</p>
+    <p>A <strong>connection pool</strong> is a fixed set of open database connections that request threads borrow and return. Opening a new connection for every request is slow (handshake, login, memory on the database), so apps reuse a few. If all connections are in use, the next thread waits in line. This is exactly the bounded buffer from <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html#semaphores">semaphores</a>: a pool of 10 is a counting semaphore that starts at 10.</p>
+    <p>The pool's own metrics confirm it:</p>
+    <pre><code>db_pool_connections_active     10     (of max 10)
+db_pool_connections_idle        0
+db_pool_pending_threads        48     &lt;- threads waiting in line
+db_pool_acquire_seconds_p99    2.9</code></pre>
+    <p>Utilization 100% and a growing queue: in USE terms, the pool is <strong>saturated</strong>. But why? On a normal day the same pool is fine. Time for a little math.</p>
+  </section>
+
+  <section id="littles-law">
+    <h2>8. Step 4: Little's Law and the Connection Pool</h2>
+    <p><strong>Little's law</strong> is one of the most useful formulas in all of systems work. For any stable system:</p>
+    <pre><code>  L  =  &lambda;  &times;  W
+
+  L = average number of items inside the system (busy connections, people in a shop)
+  &lambda; = arrival rate (items per second)                         &lambda; is the Greek letter "lambda"
+  W = average time each item spends inside (seconds)</code></pre>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> a coffee shop gets 2 customers per minute, and each one stays 10 minutes. On average, 2 &times; 10 = 20 customers are inside. If they start staying 30 minutes, you need room for 60, even though no more people are arriving.
+    </div>
+    <h3>Worked example: one API server</h3>
+    <p>Each of the 4 servers gets a quarter of the traffic. Each request holds a connection for the length of its query.</p>
+    <table>
+      <thead><tr><th></th><th>Normal day</th><th>Sale day</th></tr></thead>
+      <tbody>
+        <tr><td>Arrival rate per server, &lambda;</td><td>200 / 4 = 50 per s</td><td>400 / 4 = 100 per s</td></tr>
+        <tr><td>Time a connection is held, W</td><td>0.020 s</td><td>0.100 s</td></tr>
+        <tr><td>Busy connections needed, L = &lambda; &times; W</td><td>50 &times; 0.020 = <strong>1</strong></td><td>100 &times; 0.100 = <strong>10</strong></td></tr>
+        <tr><td>Pool size</td><td>10</td><td>10</td></tr>
+      </tbody>
+    </table>
+    <p>On a normal day, 1 of 10 connections is busy on average. There is lots of spare room. On sale day, the server needs 10 busy connections on average, which is <em>every</em> connection, all the time. Two things changed at once:</p>
+    <ol>
+      <li><strong>The arrival rate doubled</strong> (50 to 100 per second per server).</li>
+      <li><strong>The query got five times slower</strong> (20 ms to 100 ms). The database was busier, and (step 5 shows) each query had to scan more and more data.</li>
+    </ol>
+    <p>Little's law multiplies them: 2 &times; 5 = 10 times more busy connections. Neither change alone would have filled the pool.</p>
+    <p>Real traffic is also <strong>bursty</strong>. 100 per second on average can mean 180 in one second and 20 in the next. As a resource gets close to 100% busy, waiting time does not grow gently; it shoots up. In the simplest queue model, a single server that is 80% busy already has about 4 requests in line or being served on average; at 95% busy, about 19.</p>
+    <h3>Capacity: the other way to use the law</h3>
+    <p>Rearranged, Little's law gives the most a pool can handle: <code>max rate = pool size / W</code>.</p>
+    <pre><code>  one server, normal day, W = 0.020 s:   10 / 0.020 = 500 requests per second
+  one server, sale day,   W = 0.100 s:   10 / 0.100 = 100 requests per second
+  four servers on sale day:              4 &times; 100   = 400 per second = exactly today's traffic
+  add a few ms per borrow (W = 0.105 s): 4 &times; 10 / 0.105 &asymp; 381 per second</code></pre>
+    <p>That last line matches the ~380 queries per second the database was completing. And this is the trap. Once requests arrive faster than they can be served, the line does not stay a fixed length. It <strong>grows every second</strong>. With 400 arriving and about 380 served, the line grows by about 20 every second. After 100 seconds, about 2,000 are waiting, and a new arrival must wait about 2,000 / 380 &asymp; 5 seconds. The load balancer gives up at 3 seconds, which produces the 504s we saw.</p>
+    <div class="callout">
+      <strong>Why not just make the pool bigger?</strong> It may help a little, but the pool is protecting the database. 4 servers &times; 50 connections = 200 connections, each one a process on the database server, all fighting for the same CPU and disk. The queries get even slower, so W goes up and L goes up with it. A bigger pool often moves the queue from the app into the database, where it is harder to see. Fix the <em>W</em> first.
+    </div>
+  </section>
+
+  <section id="database">
+    <h2>9. Step 5: Find and Fix the Slow Query</h2>
+    <p>The query is "only" 100 ms, but it is the thing that holds each connection. Making it fast shrinks W, which shrinks L. On the database:</p>
+    <h3>What is running right now?</h3>
+    <pre><code>SELECT state, wait_event_type, wait_event, count(*)
+FROM pg_stat_activity
+WHERE datname = 'shop'
+GROUP BY 1, 2, 3 ORDER BY 4 DESC;
+
+ state  | wait_event_type | wait_event   | count
+--------+-----------------+--------------+------
+ active | IO              | DataFileRead |    26
+ active |                 |              |    12
+ idle   | Client          | ClientRead   |     2</code></pre>
+    <p>No sessions are waiting on <code>Lock</code>, so this is not a locking problem (if it were, see <a href="../Databases/dbms-transactions-isolation-mvcc.html#locking">locks and deadlocks</a>). Many sessions are reading data files. That is the sound of big scans.</p>
+    <h3>Which query costs the most in total?</h3>
+    <pre><code>SELECT calls, round(mean_exec_time::numeric, 1) AS avg_ms,
+       round(total_exec_time::numeric / 1000) AS total_s, query
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 3;
+
+  calls  | avg_ms | total_s | query
+---------+--------+---------+-----------------------------------------------------
+ 1180410 |   98.7 |  116507 | SELECT id, status, amount, created_at FROM orders
+         |        |         |   WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2
+   20211 |    3.2 |      65 | SELECT ... FROM customers WHERE id = $1
+    ...</code></pre>
+    <p>One query uses almost all the database time. Its plan:</p>
+    <pre><code>EXPLAIN ANALYZE SELECT id, status, amount, created_at FROM orders
+WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 20;
+
+ Limit
+   -&gt;  Sort  (Sort Key: created_at DESC)
+         -&gt;  Gather  (Workers Planned: 2)
+               -&gt;  Parallel Seq Scan on orders
+                     Filter: (customer_id = 4242)
+                     Rows Removed by Filter: 1999993
+ Execution Time: 97.8 ms</code></pre>
+    <p>A full table scan for every request. The <code>orders</code> table grew fast during the year (6 million rows now), and the scan grew with it. Nobody noticed at 200 requests per second, because 1 connection was enough. The sale doubled the rate and the slow query turned that into a full pool. Two small problems multiplied into one big one.</p>
+    <h3>The fix</h3>
+    <p>Build an index that matches the query exactly. This is worked through in detail in <a href="../Databases/dbms-indexing-btrees-query-plans.html#composite">Indexing, B+ Trees &amp; Query Plans</a>:</p>
+    <pre><code>CREATE INDEX CONCURRENTLY orders_customer_recent_idx
+  ON orders (customer_id, created_at DESC) INCLUDE (status, amount);</code></pre>
+    <p><code>CONCURRENTLY</code> matters here: a normal <code>CREATE INDEX</code> would block writes to <code>orders</code> while it builds, in the middle of a sale. After the build, the plan becomes <code>Limit -&gt; Index Only Scan</code> and the query takes about 0.1 ms.</p>
+    <p>Run Little's law again: L = 100 &times; 0.0001 = <strong>0.01</strong> busy connections per server. The pool goes from full to almost empty.</p>
+  </section>
+
+  <section id="retries">
+    <h2>10. Step 6: Why It Got Worse: Retry Storms</h2>
+    <p>One more detail from the RED numbers: at 18:20 the API was receiving <strong>more than 400</strong> requests per second, even though the number of users had stopped growing. The mobile app retried failed requests up to 3 times, right away.</p>
+    <p>Do the math. If most requests time out and each is tried up to 4 times in total (1 + 3 retries):</p>
+    <pre><code>  real user demand:            400 requests/s
+  worst case with retries:     400 &times; 4 = 1,600 requests/s</code></pre>
+    <p>The system was already over capacity at 400. Retries pushed even more work onto the busiest part, which made more requests fail, which caused more retries. This loop is called a <strong>retry storm</strong>. It can keep a system down even after the original cause is gone.</p>
+    <p>Safe retries follow four rules:</p>
+    <ol>
+      <li><strong>Exponential backoff:</strong> wait longer before each try (for example 100 ms, 200 ms, 400 ms).</li>
+      <li><strong>Jitter:</strong> add a random part to each wait, so thousands of clients do not retry at the same instant.</li>
+      <li><strong>A retry budget:</strong> for example, retries may add at most 10% extra traffic. Past that, fail fast.</li>
+      <li><strong>Only retry what is safe:</strong> timeouts and 503s, and only for <a href="../Computer-Networks/cn-dns-http.html#methods">idempotent requests</a>.</li>
+    </ol>
+  </section>
+
+  <section id="hardening">
+    <h2>11. Step 7: Make It Fail Gracefully Next Time</h2>
+    <p>The index fixes today's cause. These changes make the <em>next</em> unknown problem smaller:</p>
+    <table>
+      <thead><tr><th>Change</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Pool acquire timeout</strong> of 500 ms</td><td>A thread that cannot get a connection fails fast with a clear error, instead of waiting until the load balancer gives up at 3 s</td></tr>
+        <tr><td><strong>Database statement timeout</strong> (<code>SET statement_timeout = '2s'</code> for the app's user)</td><td>One runaway query cannot hold a connection forever</td></tr>
+        <tr><td><strong>Load shedding</strong></td><td>When the queue is too long, reply <code>503</code> with <code>Retry-After: 2</code> at once. Serving 90% of users well beats serving 100% badly</td></tr>
+        <tr><td><strong>Timeouts that shrink inward</strong></td><td>Load balancer 3 s &gt; app 2.5 s &gt; database 2 s. Inner layers give up first, so outer layers get a real error instead of waiting for nothing</td></tr>
+        <tr><td><strong>A short cache</strong> for "My orders"</td><td>Even 5 seconds of caching per customer removes repeat queries when users pull to refresh again and again</td></tr>
+        <tr><td><strong>Alerts on saturation</strong>, not just errors</td><td>Alert when pool wait p99 &gt; 100 ms or query p99 doubles. This would have warned weeks earlier, as the table grew</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Backpressure again:</strong> load shedding and bounded pools are the same idea as the bounded buffer in <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html#classic">producer-consumer</a>. A system with an unbounded queue does not fail fast; it fails slowly for everyone at once.
+    </div>
+  </section>
+
+  <section id="verify">
+    <h2>12. Step 8: Prove the Fix</h2>
+    <p>"It looks better" is not proof. Compare the same numbers before and after, at the same traffic:</p>
+    <table>
+      <thead><tr><th>Metric</th><th>18:15 (before)</th><th>18:45 (after index)</th></tr></thead>
+      <tbody>
+        <tr><td>Request rate</td><td>400/s (plus retries)</td><td>400/s</td></tr>
+        <tr><td>Error rate</td><td>8%</td><td>0.02%</td></tr>
+        <tr><td>p50 / p99 latency</td><td>1.9 s / 3.0 s</td><td>18 ms / 65 ms</td></tr>
+        <tr><td>Pool active / pending</td><td>10 / 48</td><td>0 to 1 / 0</td></tr>
+        <tr><td>Database CPU</td><td>92%</td><td>14%</td></tr>
+      </tbody>
+    </table>
+    <p>Then test the limit on purpose. Run a <strong>load test</strong> in a staging copy with tools like k6, Locust, or wrk, slowly raising traffic to 2 to 3 times the expected peak. Watch p99 and pool wait. The point where p99 bends sharply upward is your real capacity. Write it down, and plan the next sale against it.</p>
+  </section>
+
+  <section id="postmortem">
+    <h2>13. Step 9: Write a Blameless Postmortem</h2>
+    <p>A <strong>postmortem</strong> is a short write-up after an incident. "Blameless" means it looks for <em>how the system allowed the problem</em>, not for a person to blame. People share more honestly when they feel safe, and the system gets better faster. A simple template:</p>
+    <pre><code>Title:      Slow "My orders" API during sale launch (17 Nov, 18:05-18:42)
+Impact:     8% of order-list requests failed for 37 minutes; p99 3 s.
+Timeline:   18:00 sale starts, traffic 2x
+            18:05 p99 latency alert
+            18:16 trace shows 2 s waiting for DB pool
+            18:24 pg_stat_statements points to orders query (seq scan)
+            18:31 index build started CONCURRENTLY
+            18:42 index ready, latency normal
+Root cause: The orders query had no matching index. It slowed as the
+            table grew. Double traffic then filled the connection pool.
+            Immediate client retries tripled load.
+What went well:  Tracing showed the pool wait within minutes.
+What to improve: No alert on pool wait time; retries had no backoff.
+Actions:    [x] Add index                           (done)
+            [ ] Alert on pool wait p99 &gt; 100 ms     (owner, date)
+            [ ] Retries with backoff + jitter       (owner, date)
+            [ ] Load test before each big campaign  (owner, date)</code></pre>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Work these out on paper. Answers follow each one.</p>
+    <h3>Problem 1: percentiles</h3>
+    <p>Ten request times (ms): 30, 31, 33, 35, 36, 40, 41, 44, 300, 1200. Find the mean, p50, and p90 (nearest-rank).</p>
+    <p><em>Answer:</em> sum = 1,790, so the mean is 179 ms. p50 = position ceil(5) = 5th = 36 ms. p90 = position ceil(9) = 9th = 300 ms. The mean is five times the median because of two outliers.</p>
+    <h3>Problem 2: pool size</h3>
+    <p>A service gets 300 requests per second. Each holds a database connection for 15 ms. What is the average number of busy connections? If you want them to be at most 50% busy on average, how big should the pool be?</p>
+    <p><em>Answer:</em> L = 300 &times; 0.015 = 4.5 busy connections. For 50% utilization, pool = 4.5 / 0.5 = 9, so about 9 or 10 connections.</p>
+    <h3>Problem 3: where is the time?</h3>
+    <p>curl prints dns 0.120, connect 0.150, tls 0.185, ttfb 0.230, total 0.240. Which phase is slowest, and what would you check?</p>
+    <p><em>Answer:</em> DNS takes 120 ms, while the server only takes about 45 ms (0.230 - 0.185) including one round trip. Check DNS: is the resolver slow or far away, is the answer not cached (low TTL), or is a Kubernetes <a href="../Computer-Networks/cn-dns-http.html#dns-ops">ndots</a> search list causing several lookups?</p>
+    <h3>Problem 4: retry math</h3>
+    <p>Clients retry each failed request twice, with no backoff. During an outage, 50% of requests fail. Real demand is 1,000 requests per second. How many requests per second reach the server?</p>
+    <p><em>Answer:</em> first tries: 1,000. Half fail, giving 500 second tries. Half of those fail, giving 250 third tries. Total = 1,000 + 500 + 250 = 1,750 per second, 75% more load during an outage.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Watching averages.</strong> The mean hid the 2.4-second tail in section 2. Always look at p95 and p99.</li>
+      <li><strong>Guessing instead of splitting.</strong> Cut the request into phases (network, queue, query) and measure each one.</li>
+      <li><strong>Assuming "slow" means "busy".</strong> Idle CPU with slow requests means waiting: on a pool, a lock, or another service.</li>
+      <li><strong>Scaling the wrong layer.</strong> Adding API servers here would add more connections to an already struggling database and make it worse.</li>
+      <li><strong>Making the pool huge</strong> to hide a slow query. Fix W before L.</li>
+      <li><strong>Timeouts that grow inward</strong> (database timeout longer than the load balancer's). Outer layers give up while inner layers keep burning resources on work nobody will receive.</li>
+      <li><strong>Retries without backoff, jitter, or a budget.</strong></li>
+      <li><strong>Changing several things at once during an incident.</strong> If it gets better, you will not know which change helped. If it gets worse, you will not know which to undo.</li>
+      <li><strong>Building an index without <code>CONCURRENTLY</code></strong> on a busy table, and blocking all writes in the middle of the incident.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Question</th><th>Tool or formula</th></tr></thead>
+      <tbody>
+        <tr><td>Which service hurts?</td><td>RED: rate, errors, duration (p50/p99)</td></tr>
+        <tr><td>Which resource is the bottleneck?</td><td>USE: utilization, saturation, errors</td></tr>
+        <tr><td>Network or server?</td><td><code>curl -w</code>: dns, connect, tls, ttfb, total (cumulative)</td></tr>
+        <tr><td>Is the machine struggling?</td><td><code>uptime</code> (load vs cores), <code>vmstat 1</code> (r, si/so, wa, st), cgroup <code>cpu.stat</code></td></tr>
+        <tr><td>Where inside the request?</td><td>Distributed tracing spans; pool metrics</td></tr>
+        <tr><td>How many in flight?</td><td>Little's law: L = &lambda; &times; W</td></tr>
+        <tr><td>Max throughput of a pool</td><td>pool size / W</td></tr>
+        <tr><td>What is the database doing?</td><td><code>pg_stat_activity</code> (wait events), <code>pg_stat_statements</code>, <code>EXPLAIN ANALYZE</code></td></tr>
+        <tr><td>Retry load, k retries, failure rate f</td><td>demand &times; (1 + f + f&sup2; + ... + f<sup>k</sup>)</td></tr>
+        <tr><td>Chance a page with n calls hits a slow one</td><td>1 - (1 - p)<sup>n</sup></td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.brendangregg.com/usemethod.html" rel="noopener noreferrer">Brendan Gregg: The USE Method</a> &middot; <a href="https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/" rel="noopener noreferrer">Grafana: The RED Method</a> &middot; <a href="https://sre.google/sre-book/addressing-cascading-failures/" rel="noopener noreferrer">Google SRE book: Addressing Cascading Failures</a> &middot; <a href="https://sre.google/sre-book/postmortem-culture/" rel="noopener noreferrer">Google SRE book: Postmortem Culture</a> &middot; <a href="https://opentelemetry.io/docs/concepts/signals/traces/" rel="noopener noreferrer">OpenTelemetry: Traces</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Databases/dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a> &middot; <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html">Concurrency &amp; Deadlocks</a> &middot; <a href="../Computer-Networks/cn-dns-http.html">DNS &amp; HTTP</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-helm-observability.html">Kubernetes Helm &amp; Observability</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

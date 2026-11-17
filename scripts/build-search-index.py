@@ -43,6 +43,15 @@ KEYWORDS = [
                             "PostgreSQL", "MySQL", "serializable", "WAL"]),
     (r"cn-tcp", ["computer networks", "CN", "TCP", "handshake", "congestion control", "QUIC",
                  "HTTP/3", "TLS", "TIME_WAIT"]),
+    (r"os-concurrency", ["operating system", "OS", "race condition", "mutex", "semaphore", "deadlock",
+                         "spinlock", "condition variable", "producer consumer", "Banker's algorithm",
+                         "dining philosophers", "priority inversion", "critical section"]),
+    (r"dbms-indexing", ["DBMS", "database", "index", "B-tree", "B+ tree", "EXPLAIN", "query plan",
+                        "composite index", "covering index", "LSM", "PostgreSQL", "slow query"]),
+    (r"cn-dns-http", ["computer networks", "CN", "DNS", "HTTP", "TTL", "CNAME", "status codes",
+                      "cookies", "ETag", "caching", "CDN", "idempotency", "ndots", "resolver"]),
+    (r"scenario-slow-api", ["scenario", "latency", "p99", "percentile", "Little's law", "connection pool",
+                            "RED method", "USE method", "vmstat", "postmortem", "retry storm", "debugging"]),
     (r"gpu-scheduling", ["GPU", "MIG", "DRA", "device plugin", "NVIDIA", "Kueue", "time-slicing"]),
 ]
 
@@ -110,6 +119,8 @@ def main() -> None:
     for p in sorted(ROOT.rglob("*.html")):
         if ".git" in p.parts:
             continue
+        if p.name == "404.html":
+            continue  # error page, not content
         if 'http-equiv="refresh"' in p.read_text(encoding="utf-8"):
             continue  # redirect stubs (e.g. AI Engineer/index.html) would only duplicate hub results
         pages.append(page_entry(p))
