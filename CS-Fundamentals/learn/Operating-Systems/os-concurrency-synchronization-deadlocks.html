@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Concurrency, Synchronization &amp; Deadlocks | CS Fundamentals</title>
+  <meta name="description" content="Concurrency from zero: race conditions shown step by step, critical sections, atomic instructions, mutexes, spinlocks, semaphores, condition variables, producer-consumer, readers-writers, dining philosophers, the four deadlock conditions, the Banker's algorithm worked by hand, and a real deadlock fixed in code.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Concurrency &amp; Deadlocks</p>
+  </nav>
+  <h1>Concurrency, Synchronization &amp; Deadlocks</h1>
+  <p>Why two threads adding 1 to the same number can lose updates, the tools that stop it (locks, semaphores, condition variables), and how those same tools can freeze a program forever. Every idea is traced by hand, and every code sample was run to check the output.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Concurrency Is Hard</a></li>
+    <li><a href="#race">A Race Condition, Step by Step</a></li>
+    <li><a href="#critical">Critical Sections and the Three Rules</a></li>
+    <li><a href="#hardware">Atomic Instructions: Help From the Hardware</a></li>
+    <li><a href="#mutex">Mutexes and Spinlocks</a></li>
+    <li><a href="#semaphores">Semaphores</a></li>
+    <li><a href="#condvars">Condition Variables and Monitors</a></li>
+    <li><a href="#classic">Three Classic Problems</a></li>
+    <li><a href="#deadlock">Deadlock: The Four Conditions</a></li>
+    <li><a href="#handling">Handling Deadlock: Prevent, Avoid, Detect</a></li>
+    <li><a href="#bankers">The Banker's Algorithm, Worked by Hand</a></li>
+    <li><a href="#liveness">Starvation, Livelock, and Priority Inversion</a></li>
+    <li><a href="#scenario">Scenario: The Frozen Payments Service</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Concurrency Is Hard</h2>
+    <p><strong>Concurrency</strong> means several tasks are in progress at the same time. They may truly run at the same moment on different CPU cores (this is called <strong>parallelism</strong>), or one core may switch between them very fast. Either way, you do not control the exact order in which their steps happen.</p>
+    <p>That is fine when tasks share nothing. Trouble starts when two <a href="os-processes-threads-scheduling.html#threads">threads</a> (two paths of execution inside one program) read and write the same memory. The result can depend on timing. A bug that depends on timing may show up once in a million runs, vanish when you add a print statement, and then appear in production on a busy day.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> Two people share one notebook that holds a bank balance. Each one reads the number, does the math in their head, and writes the new number. If they both read "100" before either writes, and each adds 50, both write "150". One deposit is lost. Nobody did anything wrong alone. The bug lives in the <em>overlap</em>.
+    </div>
+    <p>This page gives you the words and tools to reason about that overlap:</p>
+    <ul>
+      <li><strong>Race condition:</strong> the result depends on the timing of threads.</li>
+      <li><strong>Synchronization:</strong> rules and tools that control the order threads may run in.</li>
+      <li><strong>Deadlock:</strong> threads wait for each other forever because of those very rules.</li>
+    </ul>
+  </section>
+
+  <section id="race">
+    <h2>2. A Race Condition, Step by Step</h2>
+    <p>Here is a tiny C program. Two threads each add 1 to a shared counter one million times. The right answer is 2,000,000.</p>
+    <pre><code>#include &lt;pthread.h&gt;
+#include &lt;stdio.h&gt;
+
+long counter = 0;
+
+void *work(void *arg) {
+    for (int i = 0; i &lt; 1000000; i++) {
+        counter++;              /* load, add, store: NOT atomic */
+    }
+    return NULL;
+}
+
+int main(void) {
+    pthread_t a, b;
+    pthread_create(&amp;a, NULL, work, NULL);
+    pthread_create(&amp;b, NULL, work, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("counter = %ld (expected 2000000)\n", counter);
+    return 0;
+}</code></pre>
+    <p>Compile with <code>gcc -O0 -pthread race.c -o race</code> and run it three times. On an 8-core Linux machine we got:</p>
+    <pre><code>counter = 1156636 (expected 2000000)
+counter = 1109601 (expected 2000000)
+counter = 1026926 (expected 2000000)</code></pre>
+    <p>Almost half the updates vanished, and the number changes every run. Why?</p>
+    <h3>counter++ is really three steps</h3>
+    <p>The CPU cannot change memory in place for this line. It does three separate steps:</p>
+    <ol>
+      <li><strong>Load:</strong> copy <code>counter</code> from memory into a register (a tiny storage slot inside the CPU).</li>
+      <li><strong>Add:</strong> add 1 to the register.</li>
+      <li><strong>Store:</strong> write the register back to memory.</li>
+    </ol>
+    <p>A thread can be paused, or another core can act, between any two steps. Here is one bad <strong>interleaving</strong> (an order in which the steps of two threads mix together). The counter starts at 5.</p>
+    <table>
+      <thead><tr><th>Time</th><th>Thread A</th><th>Thread B</th><th>counter in memory</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>load 5 into register</td><td></td><td>5</td></tr>
+        <tr><td>2</td><td></td><td>load 5 into register</td><td>5</td></tr>
+        <tr><td>3</td><td>add: register = 6</td><td></td><td>5</td></tr>
+        <tr><td>4</td><td></td><td>add: register = 6</td><td>5</td></tr>
+        <tr><td>5</td><td>store 6</td><td></td><td>6</td></tr>
+        <tr><td>6</td><td></td><td>store 6</td><td><strong>6 (should be 7)</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Both threads did one increment, but the counter only went up by one. This is called a <strong>lost update</strong>. The <a href="../Databases/dbms-transactions-isolation-mvcc.html#anomalies">same bug exists in databases</a>, where two transactions read and then write the same row.</p>
+    <div class="callout">
+      <strong>How to spot a race:</strong> look for <em>shared data</em> + <em>at least one writer</em> + <em>no rule that orders the accesses</em>. All three must be true. Remove any one of them and the race is gone.
+    </div>
+    <h3>Try it yourself: count the outcomes</h3>
+    <p>Two threads each run <code>x = x + 1</code> once, starting from <code>x = 0</code>. Each is load, add, store. What final values are possible?</p>
+    <ul>
+      <li>If one thread finishes all three steps before the other starts: <strong>x = 2</strong>.</li>
+      <li>If both load before either stores (like the table above): <strong>x = 1</strong>.</li>
+      <li>x = 0 is impossible, because at least one store of a value of 1 or more always happens last.</li>
+    </ul>
+    <p>So the answer is {1, 2}. Doing this small "list every interleaving" exercise is the best way to build intuition.</p>
+  </section>
+
+  <section id="critical">
+    <h2>3. Critical Sections and the Three Rules</h2>
+    <p>A <strong>critical section</strong> is a piece of code that touches shared data and must not be run by two threads at once. In the example, <code>counter++</code> is the critical section.</p>
+    <p>Any correct solution to the "critical section problem" must give three guarantees:</p>
+    <table>
+      <thead><tr><th>Rule</th><th>Plain meaning</th><th>What breaks without it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Mutual exclusion</strong></td><td>At most one thread is inside the critical section at any time.</td><td>Lost updates and corrupt data</td></tr>
+        <tr><td><strong>Progress</strong></td><td>If nobody is inside and some threads want in, one of them gets in soon. Threads outside cannot block the choice.</td><td>Everyone waits even though the room is empty</td></tr>
+        <tr><td><strong>Bounded waiting</strong></td><td>A waiting thread gets its turn after a limited number of other threads go first.</td><td>Starvation: one unlucky thread waits forever</td></tr>
+      </tbody>
+    </table>
+    <p>Code is shaped like this:</p>
+    <pre><code>while (true) {
+    entry section       // ask permission (lock)
+        critical section    // touch shared data
+    exit section        // give permission back (unlock)
+    remainder section   // other work, no shared data
+}</code></pre>
+    <h3>Why a simple flag does not work</h3>
+    <p>A first idea is a shared variable <code>busy</code>:</p>
+    <pre><code>while (busy) { }   // wait until free
+busy = true;       // claim it
+counter++;
+busy = false;</code></pre>
+    <p>This fails for the same reason as before. Both threads can see <code>busy == false</code>, and both can set it to true and enter. Checking and setting are two steps, and a thread can be interrupted between them. We need a way to <em>check and set in one unbreakable step</em>.</p>
+    <p>There are clever software-only fixes, such as <strong>Peterson's algorithm</strong> for two threads. It uses two flags and a "turn" variable. It is great for learning, but modern CPUs reorder memory operations for speed, so Peterson's algorithm is not safe on real hardware without extra "memory barrier" instructions. In practice, we use help from the hardware.</p>
+  </section>
+
+  <section id="hardware">
+    <h2>4. Atomic Instructions: Help From the Hardware</h2>
+    <p>An <strong>atomic</strong> operation happens all at once from the point of view of every other thread. No one can see it half done. CPUs offer a few atomic instructions. Two are the building blocks of almost every lock.</p>
+    <h3>Test-and-set</h3>
+    <p>It sets a memory word to true and returns the <em>old</em> value, in one step.</p>
+    <pre><code>// What the hardware does, all as ONE step:
+bool test_and_set(bool *target) {
+    bool old = *target;
+    *target = true;
+    return old;
+}
+
+// A lock built on it:
+while (test_and_set(&amp;lock)) { }   // old was true? someone holds it, keep trying
+/* critical section */
+lock = false;</code></pre>
+    <p>If two threads call it at once, the hardware orders them. Exactly one sees <code>false</code> (and wins). The other sees <code>true</code> and keeps trying.</p>
+    <h3>Compare-and-swap (CAS)</h3>
+    <p>"If the value is still what I expect, replace it with my new value. Tell me if it worked." Again, one step.</p>
+    <pre><code>// Hardware, ONE step:
+bool cas(int *addr, int expected, int new_value) {
+    if (*addr != expected) return false;
+    *addr = new_value;
+    return true;
+}
+
+// Lock-free increment:
+int old;
+do {
+    old = counter;                     // read
+} while (!cas(&amp;counter, old, old + 1)); // retry if someone changed it meanwhile</code></pre>
+    <p>CAS powers <strong>lock-free</strong> data structures (structures where threads never wait on a lock; they just retry). In C you get it as <code>atomic_fetch_add</code> or <code>atomic_compare_exchange_strong</code> from <code>&lt;stdatomic.h&gt;</code>. Java has <code>AtomicInteger</code>, Go has <code>sync/atomic</code>, and Rust has <code>AtomicUsize</code>.</p>
+    <div class="callout">
+      <strong>Rule of thumb:</strong> for one number (a counter, a flag), use an atomic type. For anything bigger (two fields that must change together, a list, a map), use a lock. Hand-written lock-free code is very hard to get right.
+    </div>
+  </section>
+
+  <section id="mutex">
+    <h2>5. Mutexes and Spinlocks</h2>
+    <p>A <strong>mutex</strong> (short for "mutual exclusion") is a lock with two operations: <code>lock()</code> and <code>unlock()</code>. Only the thread that locked it may unlock it. Here is the race program fixed with a mutex:</p>
+    <pre><code>long counter = 0;
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+void *work(void *arg) {
+    for (int i = 0; i &lt; 1000000; i++) {
+        pthread_mutex_lock(&amp;lock);    /* enter critical section */
+        counter++;
+        pthread_mutex_unlock(&amp;lock);  /* leave critical section */
+    }
+    return NULL;
+}</code></pre>
+    <p>Output, every time: <code>counter = 2000000 (expected 2000000)</code>.</p>
+    <h3>What happens while you wait?</h3>
+    <p>There are two ways to wait for a lock:</p>
+    <table>
+      <thead><tr><th></th><th>Spinlock</th><th>Sleeping mutex</th></tr></thead>
+      <tbody>
+        <tr><td>How it waits</td><td>Loops ("spins") and checks again and again</td><td>Asks the OS to put the thread to sleep until the lock is free</td></tr>
+        <tr><td>CPU use while waiting</td><td>100% of a core, doing nothing useful</td><td>Near zero</td></tr>
+        <tr><td>Cost to wake up</td><td>None; it notices in nanoseconds</td><td>A <a href="os-processes-threads-scheduling.html#context-switch">context switch</a>, a few microseconds</td></tr>
+        <tr><td>Good when</td><td>The lock is held for a very short time and threads run on different cores (common inside OS kernels)</td><td>The lock may be held for a while, or there are more threads than cores</td></tr>
+      </tbody>
+    </table>
+    <p>Real mutexes mix both. On Linux, <code>pthread_mutex_lock</code> is built on a <strong>futex</strong> ("fast user-space mutex"). If the lock is free, it is taken with one atomic instruction and no system call. Only when there is a fight does the thread ask the kernel to sleep. Many runtimes also spin for a short moment before sleeping.</p>
+    <h3>Lock granularity</h3>
+    <p><strong>Granularity</strong> is how much data one lock protects.</p>
+    <ul>
+      <li><strong>Coarse-grained:</strong> one big lock for a whole data structure. Simple and safe, but threads queue up behind each other. Python's old global interpreter lock (GIL) is the most famous example. Python 3.13 added an optional "free-threaded" build without it, and 3.14 made that build officially supported, which is exactly why Python code now has to care more about fine-grained locks.</li>
+      <li><strong>Fine-grained:</strong> many small locks, such as one per bucket of a hash table. More parallel, but more chances for deadlock (section 9).</li>
+    </ul>
+    <h3>Reader-writer locks</h3>
+    <p>Many structures are read often and written rarely. A <strong>reader-writer lock</strong> lets many readers in at once, but a writer gets the lock alone. Examples: <code>pthread_rwlock_t</code>, Go's <code>sync.RWMutex</code>, Java's <code>ReentrantReadWriteLock</code>.</p>
+  </section>
+
+  <section id="semaphores">
+    <h2>6. Semaphores</h2>
+    <p>A <strong>semaphore</strong> is an integer counter with two atomic operations. It was invented by Edsger Dijkstra in the 1960s.</p>
+    <ul>
+      <li><code>wait()</code> (also called <code>P</code>, <code>down</code>, or <code>acquire</code>): if the value is above 0, subtract 1 and continue. If it is 0, sleep until it is above 0.</li>
+      <li><code>signal()</code> (also called <code>V</code>, <code>up</code>, or <code>release</code>): add 1, and wake one sleeping thread if any.</li>
+    </ul>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> a semaphore is a bowl of tokens at a parking lot gate. Each car takes a token to enter (<code>wait</code>). If the bowl is empty, cars wait in line. A car leaving puts a token back (<code>signal</code>). The starting number of tokens is the number of parking spots.
+    </div>
+    <h3>Two kinds</h3>
+    <ul>
+      <li><strong>Binary semaphore</strong> (starts at 1): works like a lock. Only one thread can be inside.</li>
+      <li><strong>Counting semaphore</strong> (starts at N): lets up to N threads in. Good for "at most 10 database connections" or "at most 4 GPU jobs at once".</li>
+    </ul>
+    <h3>Worked example: tracing a semaphore</h3>
+    <p>A semaphore <code>S</code> starts at 2. Threads T1, T2, T3 each call <code>wait(S)</code>, work, then <code>signal(S)</code>.</p>
+    <table>
+      <thead><tr><th>Step</th><th>Event</th><th>S after</th><th>Sleeping</th><th>Inside</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>T1 wait</td><td>1</td><td>none</td><td>T1</td></tr>
+        <tr><td>2</td><td>T2 wait</td><td>0</td><td>none</td><td>T1, T2</td></tr>
+        <tr><td>3</td><td>T3 wait (S is 0, so sleep)</td><td>0</td><td>T3</td><td>T1, T2</td></tr>
+        <tr><td>4</td><td>T1 signal (wakes T3, which takes the token)</td><td>0</td><td>none</td><td>T2, T3</td></tr>
+        <tr><td>5</td><td>T2 signal</td><td>1</td><td>none</td><td>T3</td></tr>
+        <tr><td>6</td><td>T3 signal</td><td>2</td><td>none</td><td>none</td></tr>
+      </tbody>
+    </table>
+    <p>A quick check: the value always returns to its start value when every <code>wait</code> has a matching <code>signal</code>. If it does not, some path forgot to release.</p>
+    <h3>Semaphores for ordering</h3>
+    <p>A semaphore that starts at 0 makes one thread wait for another. "Run B only after A is done":</p>
+    <pre><code>done = Semaphore(0)
+
+Thread A:            Thread B:
+  do_step_a()          done.wait()     # sleeps until A signals
+  done.signal()        do_step_b()</code></pre>
+  </section>
+
+  <section id="condvars">
+    <h2>7. Condition Variables and Monitors</h2>
+    <p>Often a thread needs to wait until some <em>condition</em> is true: "the queue is not empty", "the job is finished". A <strong>condition variable</strong> is a place to sleep until another thread says "something changed, check again". It is always used together with a mutex.</p>
+    <ul>
+      <li><code>wait(cv, mutex)</code>: unlock the mutex and sleep, as one atomic step. When woken, lock the mutex again before returning.</li>
+      <li><code>signal(cv)</code> (or <code>notify</code>): wake one sleeper.</li>
+      <li><code>broadcast(cv)</code> (or <code>notify_all</code>): wake all sleepers.</li>
+    </ul>
+    <pre><code>import threading
+
+items = []
+lock = threading.Lock()
+not_empty = threading.Condition(lock)
+
+def consumer():
+    with not_empty:                 # lock the mutex
+        while len(items) == 0:      # WHILE, not IF
+            not_empty.wait()        # unlock + sleep, relock on wake
+        item = items.pop(0)
+    print("got", item)
+
+def producer(x):
+    with not_empty:
+        items.append(x)
+        not_empty.notify()          # wake one waiting consumer</code></pre>
+    <div class="callout">
+      <strong>Always check the condition in a <code>while</code> loop.</strong> A thread can wake up and find the condition false again. Another consumer may have taken the item first, or the OS may wake a thread for no reason (a <em>spurious wakeup</em>). With <code>if</code>, the thread would run on with a false belief and crash on an empty list.
+    </div>
+    <p>A <strong>monitor</strong> is a language feature that bundles data, a lock, and condition variables together, so the lock is taken automatically. Java's <code>synchronized</code> methods with <code>wait()</code> and <code>notify()</code> are a monitor. Python's <code>with lock:</code> block is a small step toward the same idea: the lock is always released, even if an exception happens.</p>
+  </section>
+
+  <section id="classic">
+    <h2>8. Three Classic Problems</h2>
+    <p>These three problems appear in every OS course because real systems are full of them. Learn the pattern, and you will recognise it in a web server, a message queue, or a GPU job scheduler.</p>
+
+    <h3>8.1 Producer-consumer (bounded buffer)</h3>
+    <p>Producers put items into a buffer with N slots. Consumers take items out. Producers must wait when the buffer is full. Consumers must wait when it is empty. This is the shape of every work queue, log pipeline, and LLM request queue.</p>
+    <pre><code>  producers                buffer (N = 3 slots)             consumers
+  +--------+     put     +------+------+------+     take     +--------+
+  |   P    | ----------&gt; |  i1  |  i2  |      | -----------&gt; |   C    |
+  +--------+             +------+------+------+              +--------+
+       empty = free slots (starts at N)    full = filled slots (starts at 0)</code></pre>
+    <p>The classic solution uses three semaphores. This Python version runs as written:</p>
+    <pre><code>import threading, time
+
+N = 3                                  # buffer size
+buffer = []
+mutex = threading.Lock()               # protects the buffer list
+empty = threading.Semaphore(N)         # counts free slots
+full  = threading.Semaphore(0)         # counts filled slots
+
+def producer():
+    for item in range(6):
+        empty.acquire()                # wait for a free slot
+        with mutex:
+            buffer.append(item)
+            print(f"produced {item}  buffer={buffer}")
+        full.release()                 # one more filled slot
+
+def consumer():
+    for _ in range(6):
+        full.acquire()                 # wait for a filled slot
+        with mutex:
+            item = buffer.pop(0)
+            print(f"consumed {item}  buffer={buffer}")
+        empty.release()                # one more free slot
+        time.sleep(0.05)               # consumer is slower
+
+p = threading.Thread(target=producer); c = threading.Thread(target=consumer)
+p.start(); c.start(); p.join(); c.join()</code></pre>
+    <p>One real run (the exact order can change):</p>
+    <pre><code>produced 0  buffer=[0]
+produced 1  buffer=[0, 1]
+produced 2  buffer=[0, 1, 2]
+consumed 0  buffer=[1, 2]
+produced 3  buffer=[1, 2, 3]
+consumed 1  buffer=[2, 3]
+...</code></pre>
+    <p>Notice the buffer never grows past 3. The producer is forced to wait on <code>empty</code>. This is called <strong>backpressure</strong>: a slow consumer slows the producer down instead of letting memory fill up.</p>
+    <div class="callout">
+      <strong>Order matters:</strong> if the producer took <code>mutex</code> <em>before</em> <code>empty.acquire()</code>, a full buffer would make it sleep while holding the mutex. The consumer could then never get the mutex to free a slot. That is a deadlock. Always wait on the counting semaphore first, then take the mutex.
+    </div>
+
+    <h3>8.2 Readers-writers</h3>
+    <p>Many threads read shared data. A few write it. Readers can share; a writer needs the data alone. The tricky part is fairness:</p>
+    <ul>
+      <li><strong>Reader preference:</strong> a new reader may join while other readers are inside. A steady stream of readers can starve the writer forever.</li>
+      <li><strong>Writer preference:</strong> once a writer is waiting, new readers must wait. Now readers can starve.</li>
+    </ul>
+    <p>Real reader-writer locks pick a policy. For example, Go's <code>sync.RWMutex</code> blocks new readers once a writer is waiting, so writers do not starve.</p>
+
+    <h3>8.3 Dining philosophers</h3>
+    <p>Five philosophers sit at a round table. Between each pair is one fork, so there are five forks. To eat, a philosopher needs both the left and the right fork.</p>
+    <pre><code>              P0
+         F4        F0
+      P4              P1
+         F3        F1
+          P3   F2   P2
+
+  Pi needs fork Fi (right) and fork F(i-1) (left), with F(-1) = F4.</code></pre>
+    <p>If every philosopher picks up their left fork at the same moment, each one holds one fork and waits for the other. No one can eat, ever. This is the simplest picture of a deadlock, and it leads straight to the next section.</p>
+    <p>Fixes, each of which breaks one deadlock condition:</p>
+    <ul>
+      <li><strong>Number the forks and always take the lower number first.</strong> P1 to P4 each take their left fork first (F0, F1, F2, F3). But P0 needs F4 and F0, so it takes F0 first, which is its <em>right</em> fork. Because one philosopher reaches in the other direction, the circle of waiting cannot close.</li>
+      <li>Allow at most four philosophers at the table at once (a counting semaphore of 4).</li>
+      <li>Pick up both forks together or none (take a lock that guards both).</li>
+    </ul>
+  </section>
+
+  <section id="deadlock">
+    <h2>9. Deadlock: The Four Conditions</h2>
+    <p>A <strong>deadlock</strong> is a state where a group of threads each wait for something that another thread in the same group holds. Nobody can move, and nothing outside will help.</p>
+    <p>Here is a real deadlock in Python. Two transfers lock two accounts, but in opposite orders:</p>
+    <pre><code>import threading, time
+
+lock_a = threading.Lock()   # protects account A
+lock_b = threading.Lock()   # protects account B
+
+def transfer(first, second, name):
+    with first:
+        print(name, "holds its first lock")
+        time.sleep(0.1)          # widen the window so the bug shows every time
+        with second:
+            print(name, "holds both locks, moving money")
+
+t1 = threading.Thread(target=transfer, args=(lock_a, lock_b, "T1"), daemon=True)
+t2 = threading.Thread(target=transfer, args=(lock_b, lock_a, "T2"), daemon=True)
+t1.start(); t2.start()
+t1.join(timeout=2); t2.join(timeout=2)
+print("deadlocked!" if t1.is_alive() and t2.is_alive() else "finished")</code></pre>
+    <p>Output:</p>
+    <pre><code>T1 holds its first lock
+T2 holds its first lock
+deadlocked!</code></pre>
+    <h3>The resource allocation graph</h3>
+    <p>We can draw who holds what. Circles are threads, boxes are resources. An arrow from a resource to a thread means "held by". An arrow from a thread to a resource means "waiting for".</p>
+    <pre><code>        holds                waits for
+  [lock_a] -----&gt; (T1) ---------------+
+     ^                                |
+     |                                v
+     +-------- (T2) &lt;----------- [lock_b]
+     waits for          holds
+
+  Follow the arrows: T1 -&gt; lock_b -&gt; T2 -&gt; lock_a -&gt; T1.  A cycle.</code></pre>
+    <p>When every resource has only one instance (like a lock), <strong>a cycle in this graph means deadlock</strong>. When resources have several instances (like 3 printers), a cycle means deadlock is <em>possible</em>, but not certain.</p>
+    <h3>The four Coffman conditions</h3>
+    <p>A deadlock can only happen when all four of these are true at the same time (Coffman and others, 1971):</p>
+    <table>
+      <thead><tr><th>Condition</th><th>Plain meaning</th><th>In the transfer example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1. Mutual exclusion</strong></td><td>A resource can be held by only one thread at a time.</td><td>A lock has one owner.</td></tr>
+        <tr><td><strong>2. Hold and wait</strong></td><td>A thread holds one resource while waiting for another.</td><td>T1 holds lock_a and waits for lock_b.</td></tr>
+        <tr><td><strong>3. No preemption</strong></td><td>Nobody can take a resource away; the holder must give it up.</td><td>Python will not force T2 to drop lock_b.</td></tr>
+        <tr><td><strong>4. Circular wait</strong></td><td>There is a cycle of threads, each waiting for the next.</td><td>T1 waits on T2, T2 waits on T1.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> four cars reach a four-way crossing at once. Each one has moved a little into the middle (hold), each needs the space in front (wait), nobody will reverse (no preemption), and each blocks the next one around the square (circular wait). Remove any one of these and traffic flows.
+    </div>
+  </section>
+
+  <section id="handling">
+    <h2>10. Handling Deadlock: Prevent, Avoid, Detect</h2>
+    <p>There are four overall strategies. Real systems usually mix the first and third.</p>
+    <h3>10.1 Prevention: make one condition impossible</h3>
+    <table>
+      <thead><tr><th>Break this</th><th>How</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Mutual exclusion</td><td>Use data that can be shared: read-only data, atomics, copy-on-write</td><td>Not possible for most real resources</td></tr>
+        <tr><td>Hold and wait</td><td>Request every resource at once at the start, or release everything before asking for more</td><td>Resources sit idle; you must know your needs up front</td></tr>
+        <tr><td>No preemption</td><td>Use <code>trylock</code> or a timeout; if you cannot get the next lock, release what you hold and retry later</td><td>Wasted work; can cause livelock (section 12)</td></tr>
+        <tr><td><strong>Circular wait</strong></td><td><strong>Give every lock a number. Always take locks in increasing order.</strong></td><td>You must agree on the order across the whole codebase</td></tr>
+      </tbody>
+    </table>
+    <p>Lock ordering is by far the most used fix. Here is the transfer code with a fixed global order. It finishes every time:</p>
+    <pre><code>def transfer(first, second, name):
+    # Rule: always lock in a fixed global order (here: by id()).
+    lo, hi = sorted([first, second], key=id)
+    with lo:
+        time.sleep(0.1)
+        with hi:
+            print(name, "holds both locks, moving money")</code></pre>
+    <p>In a real bank you would sort by account number. Why does it work? A cycle needs someone to hold a "higher" lock while waiting for a "lower" one. The rule forbids that, so no cycle can form.</p>
+
+    <h3>10.2 Avoidance: only grant safe requests</h3>
+    <p>The system knows the <em>maximum</em> each thread may ever ask for. Before granting a request, it checks whether the system would still be in a <strong>safe state</strong>: a state where there is some order in which every thread can still finish. If not, the request waits even though the resource is free. The classic method is the Banker's algorithm (next section). It is mostly used in teaching and in some embedded and batch systems, because real programs rarely know their maximum needs.</p>
+
+    <h3>10.3 Detection and recovery</h3>
+    <p>Let deadlocks happen, look for cycles every so often, then break them. To recover, you can:</p>
+    <ul>
+      <li>Kill one thread or abort one transaction in the cycle (the "victim"), often the one that did the least work.</li>
+      <li>Roll a thread back to an earlier checkpoint.</li>
+    </ul>
+    <p>Databases do exactly this. PostgreSQL checks for a cycle when a lock wait lasts longer than <code>deadlock_timeout</code> (1 second by default), then aborts one transaction with <code>ERROR: deadlock detected</code>. Your app must catch that error and retry. See <a href="../Databases/dbms-transactions-isolation-mvcc.html#locking">Locks, Two-Phase Locking, and Deadlocks</a>.</p>
+
+    <h3>10.4 Ignore it</h3>
+    <p>Most general-purpose operating systems do not try to prevent deadlocks between user programs. They assume deadlocks are rare and leave it to programmers and to a reboot. This is sometimes called the "ostrich algorithm". It sounds silly, but the cost of the other methods is often higher than the cost of a rare restart.</p>
+  </section>
+
+  <section id="bankers">
+    <h2>11. The Banker's Algorithm, Worked by Hand</h2>
+    <p>The name comes from a bank that never lends out so much cash that it could not satisfy all customers' maximum needs in some order. We use the standard textbook example, so you can check your answer against any OS book.</p>
+    <h3>Setup</h3>
+    <p>Five processes (P0 to P4) and three resource types (A, B, C). Total instances: A = 10, B = 5, C = 7.</p>
+    <ul>
+      <li><strong>Allocation:</strong> what each process holds right now.</li>
+      <li><strong>Max:</strong> the most each process will ever need.</li>
+      <li><strong>Need = Max - Allocation:</strong> what it may still ask for.</li>
+      <li><strong>Available:</strong> free right now = Total - sum of Allocation = (3, 3, 2).</li>
+    </ul>
+    <table>
+      <thead><tr><th>Process</th><th>Allocation (A B C)</th><th>Max (A B C)</th><th>Need (A B C)</th></tr></thead>
+      <tbody>
+        <tr><td>P0</td><td>0 1 0</td><td>7 5 3</td><td>7 4 3</td></tr>
+        <tr><td>P1</td><td>2 0 0</td><td>3 2 2</td><td>1 2 2</td></tr>
+        <tr><td>P2</td><td>3 0 2</td><td>9 0 2</td><td>6 0 0</td></tr>
+        <tr><td>P3</td><td>2 1 1</td><td>2 2 2</td><td>0 1 1</td></tr>
+        <tr><td>P4</td><td>0 0 2</td><td>4 3 3</td><td>4 3 1</td></tr>
+      </tbody>
+    </table>
+    <h3>The safety check, step by step</h3>
+    <p>Start with <code>Work = Available = (3, 3, 2)</code>. Repeatedly find a process that is not finished and whose <code>Need &le; Work</code> in every column. Pretend it runs to the end and returns everything it holds: <code>Work = Work + Allocation</code>. Scan from P0 each time.</p>
+    <table>
+      <thead><tr><th>Step</th><th>Check</th><th>Result</th><th>Work after</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>P0: need (7,4,3) &le; (3,3,2)? No (7 &gt; 3). P1: need (1,2,2) &le; (3,3,2)? Yes</td><td>P1 finishes, returns (2,0,0)</td><td>(5, 3, 2)</td></tr>
+        <tr><td>2</td><td>P0: (7,4,3) &le; (5,3,2)? No. P2: (6,0,0)? No (6 &gt; 5). P3: (0,1,1)? Yes</td><td>P3 finishes, returns (2,1,1)</td><td>(7, 4, 3)</td></tr>
+        <tr><td>3</td><td>P0: (7,4,3) &le; (7,4,3)? Yes</td><td>P0 finishes, returns (0,1,0)</td><td>(7, 5, 3)</td></tr>
+        <tr><td>4</td><td>P2: (6,0,0) &le; (7,5,3)? Yes</td><td>P2 finishes, returns (3,0,2)</td><td>(10, 5, 5)</td></tr>
+        <tr><td>5</td><td>P4: (4,3,1) &le; (10,5,5)? Yes</td><td>P4 finishes, returns (0,0,2)</td><td>(10, 5, 7)</td></tr>
+      </tbody>
+    </table>
+    <p>Every process can finish, so the state is <strong>safe</strong>. One safe sequence is <strong>&lt;P1, P3, P0, P2, P4&gt;</strong>. Other orders also work (for example &lt;P1, P3, P4, P0, P2&gt;). Any valid order is a correct answer. The final Work equals the total (10, 5, 7), which is a good self-check.</p>
+    <h3>Handling a request</h3>
+    <p>Now P1 asks for (1, 0, 2). The algorithm runs three checks:</p>
+    <ol>
+      <li>Is the request &le; P1's Need (1,2,2)? Yes.</li>
+      <li>Is the request &le; Available (3,3,2)? Yes.</li>
+      <li><strong>Pretend</strong> to grant it: Available becomes (2,3,0), P1's Allocation becomes (3,0,2), P1's Need becomes (0,2,0). Run the safety check on this pretend state.</li>
+    </ol>
+    <p>Starting from Work = (2,3,0): P1 needs (0,2,0), yes, Work becomes (5,3,2). From here the steps match the table above, so the state is safe. <strong>Grant the request.</strong></p>
+    <p>Next, in that new state, P0 asks for (0, 2, 0). Available is (2,3,0), so it fits. Pretend: Available becomes (2,1,0). Now check: P0 needs (7,2,3), no. P1 needs (0,2,0), no (2 &gt; 1). P2 needs (6,0,0), no. P3 needs (0,1,1), no (C: 1 &gt; 0). P4 needs (4,3,1), no. <strong>Nobody can finish, so the state is unsafe.</strong> P0 must wait, even though the resources are free right now.</p>
+    <div class="callout">
+      <strong>Unsafe is not the same as deadlocked.</strong> An unsafe state means a deadlock <em>could</em> happen if processes ask for their maximum. It might not. The Banker's algorithm plays it safe and refuses.
+    </div>
+    <p>Cost: each check looks at n processes and m resource types, up to n times, so it takes about <code>m &times; n&sup2;</code> steps. That is fine for 5 processes, but too slow to run on every lock request in a big system.</p>
+  </section>
+
+  <section id="liveness">
+    <h2>12. Starvation, Livelock, and Priority Inversion</h2>
+    <p>A program can be free of deadlock and still fail to make progress.</p>
+    <h3>Starvation</h3>
+    <p>A thread waits forever because others keep getting chosen first. Example: the reader-preference lock above, where the writer never gets in. Fix: fair queues (first come, first served), or <strong>aging</strong> (raise the priority of anything that has waited a long time, as in <a href="os-processes-threads-scheduling.html">CPU scheduling</a>).</p>
+    <h3>Livelock</h3>
+    <p>Threads are not blocked. They keep running, but they keep undoing each other's work. Picture two people in a corridor who both step left, then both step right, again and again. In code, this happens when two threads use "trylock, release on failure, retry" with the exact same timing. Fix: wait a <em>random</em> amount of time before retrying (random backoff). Ethernet and Wi-Fi use the same trick when two machines talk at once.</p>
+    <h3>Priority inversion</h3>
+    <p>A high-priority task waits for a lock held by a low-priority task. A medium-priority task, which needs no lock, keeps the CPU busy, so the low task never runs and never releases the lock. In effect, the high task is now stuck behind the medium one.</p>
+    <pre><code>time  ---&gt;
+High   :  ......... wants lock L .... blocked ..............................
+Medium :                 runs runs runs runs runs runs (no lock needed)
+Low    :  holds L .. (never gets CPU, never releases L) ....................</code></pre>
+    <p>This really happened on NASA's Mars Pathfinder lander in 1997. A watchdog timer kept resetting the computer. Engineers fixed it from Earth by turning on <strong>priority inheritance</strong>: while a low task holds a lock that a high task wants, the low task temporarily gets the high priority, so it finishes and releases the lock quickly. Linux offers this for pthread mutexes with the <code>PTHREAD_PRIO_INHERIT</code> setting.</p>
+  </section>
+
+  <section id="scenario">
+    <h2>13. Scenario: The Frozen Payments Service</h2>
+    <p><strong>Situation.</strong> A small payments API runs fine in testing. On the first busy sale day, a few requests start hanging. After 20 minutes, all worker threads are stuck. CPU use is near 0%. Restarting fixes it for a while, then it happens again.</p>
+    <h3>Step 1: read the clues</h3>
+    <ul>
+      <li><strong>CPU near 0% while requests hang</strong> means threads are <em>waiting</em>, not working. That points to locks, I/O, or a pool that ran dry. A busy loop or livelock would show high CPU.</li>
+      <li><strong>Only under load</strong> means a timing problem. Two requests must overlap in a special way.</li>
+    </ul>
+    <h3>Step 2: look at what threads are waiting on</h3>
+    <p>Take a <strong>thread dump</strong>: a list of every thread and the line of code it is stopped on. Tools: <code>jstack &lt;pid&gt;</code> for Java, <code>py-spy dump --pid &lt;pid&gt;</code> for Python, sending <code>SIGQUIT</code> to a Go program, or <code>gdb -p &lt;pid&gt;</code> then <code>thread apply all bt</code> for C. The JVM even prints "Found one Java-level deadlock" for you.</p>
+    <pre><code>Thread "worker-7":  waiting to lock  account:1042   held by "worker-3"
+                    holding          account:2210
+Thread "worker-3":  waiting to lock  account:2210   held by "worker-7"
+                    holding          account:1042</code></pre>
+    <p>That is the cycle from section 9. One request sent money from 2210 to 1042. Another sent from 1042 to 2210 at the same moment. Each locked "from" first, then "to".</p>
+    <h3>Step 3: fix the cause</h3>
+    <ol>
+      <li><strong>Lock in a fixed order.</strong> Always lock the smaller account number first, whatever the direction of the transfer. This breaks circular wait.</li>
+      <li><strong>Add a timeout</strong> to every lock wait, so a future mistake causes one failed request (with a clear log line) instead of a frozen server.</li>
+      <li><strong>Keep critical sections short.</strong> The code was also calling a fraud-check API <em>while holding both locks</em>. Moving the network call outside the locked region cut lock hold time from 300 ms to under 1 ms, which also made collisions far rarer.</li>
+    </ol>
+    <h3>Step 4: prove the fix</h3>
+    <p>Write a stress test: 50 threads making random transfers between 3 accounts (few accounts means many collisions) for 60 seconds. Check two things at the end: no thread is stuck, and the total money across all accounts is unchanged. Run it in CI. The broken version freezes within seconds; the fixed one passes every time.</p>
+    <div class="callout">
+      <strong>If the locks live in the database</strong> (<code>SELECT ... FOR UPDATE</code>), the same lesson applies: lock rows in a fixed order (for example <code>ORDER BY id</code>), and retry on a deadlock error. The OS idea and the database idea are the same idea.
+    </div>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Forgetting to unlock on an error path.</strong> An early <code>return</code> or an exception skips the unlock, and the next thread waits forever. Use <code>with lock:</code> (Python), <code>defer mu.Unlock()</code> (Go), <code>try/finally</code> (Java), or RAII guards like <code>std::lock_guard</code> (C++).</li>
+      <li><strong>Doing slow work while holding a lock.</strong> Network calls, disk reads, and <code>sleep</code> inside a critical section turn a lock into a traffic jam.</li>
+      <li><strong>Checking a condition with <code>if</code> instead of <code>while</code></strong> before <code>wait()</code>.</li>
+      <li><strong>Protecting a variable with a lock in one place but not in another.</strong> A lock only helps if <em>every</em> access takes it.</li>
+      <li><strong>"It passed the test, so it is safe."</strong> Races hide. Use tools: ThreadSanitizer (<code>gcc -fsanitize=thread</code>), Go's <code>go test -race</code>, and Java's jcstress.</li>
+      <li><strong>Locking the same non-reentrant mutex twice in one thread.</strong> A thread can deadlock with itself. Either restructure the code, or use a reentrant lock (Python's <code>threading.RLock</code>) on purpose.</li>
+      <li><strong>Assuming <code>x += 1</code> is atomic in a high-level language.</strong> It is not in C, Java, Go, or free-threaded Python.</li>
+      <li><strong>Mixing up semaphore order</strong> in producer-consumer (taking the mutex before waiting on the counting semaphore).</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Need</th><th>Tool</th></tr></thead>
+      <tbody>
+        <tr><td>Share one number safely</td><td>Atomic integer / CAS</td></tr>
+        <tr><td>Only one thread in a block of code</td><td>Mutex (with <code>with</code> / <code>defer</code> / RAII)</td></tr>
+        <tr><td>Many readers, few writers</td><td>Reader-writer lock</td></tr>
+        <tr><td>At most N at once (connections, GPUs)</td><td>Counting semaphore</td></tr>
+        <tr><td>Wait until something becomes true</td><td>Condition variable, checked in a <code>while</code> loop</td></tr>
+        <tr><td>Hand work between threads</td><td>Bounded queue (producer-consumer)</td></tr>
+        <tr><td>Avoid deadlock with many locks</td><td>Global lock order; timeouts</td></tr>
+        <tr><td>Avoid livelock</td><td>Random backoff before retry</td></tr>
+        <tr><td>Avoid priority inversion</td><td>Priority inheritance</td></tr>
+        <tr><td>Find races</td><td>ThreadSanitizer, <code>go test -race</code>, stress tests</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Deadlock needs all four:</strong> mutual exclusion + hold and wait + no preemption + circular wait.</p>
+    <p><strong>Banker's safety check:</strong> Work = Available; repeat: find unfinished Pi with Need &le; Work; Work += Allocation(Pi). Safe if all finish.</p>
+    <p class="refer-link"><small>Refer: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/" rel="noopener noreferrer">Operating Systems: Three Easy Pieces (Concurrency chapters, free online)</a> &middot; <a href="https://man7.org/linux/man-pages/man7/futex.7.html" rel="noopener noreferrer">futex(7) man page</a> &middot; <a href="https://docs.python.org/3/library/threading.html" rel="noopener noreferrer">Python threading docs</a> &middot; <a href="https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS" rel="noopener noreferrer">PostgreSQL docs: Deadlocks</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a> &middot; <a href="../Databases/dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

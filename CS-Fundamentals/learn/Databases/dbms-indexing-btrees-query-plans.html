@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Indexing, B+ Trees &amp; Query Plans | CS Fundamentals</title>
+  <meta name="description" content="Database indexing from zero: pages and full table scans, B+ trees drawn and built by hand with node splits, tree height math, hash indexes, clustered vs secondary indexes, composite indexes and the leftmost-prefix rule, covering indexes, selectivity, reading PostgreSQL EXPLAIN ANALYZE output, the write cost of indexes, LSM trees, and a slow-query fix.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Indexing &amp; Query Plans</p>
+  </nav>
+  <h1>Indexing, B+ Trees &amp; Query Plans</h1>
+  <p>How a database finds 8 rows out of a million in a tenth of a millisecond, why the same database sometimes reads the whole table anyway, and how to read the plan it prints. All query plans on this page are real output from PostgreSQL 17 on a one-million-row table you can build yourself.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#problem">The Problem: Finding Rows Fast</a></li>
+    <li><a href="#pages">How Tables Live on Disk</a></li>
+    <li><a href="#idea">The Idea of an Index</a></li>
+    <li><a href="#btree">B+ Trees, Drawn Out</a></li>
+    <li><a href="#build">Building a B+ Tree by Hand</a></li>
+    <li><a href="#height">How Tall Is the Tree? The Math</a></li>
+    <li><a href="#hash">Hash Indexes</a></li>
+    <li><a href="#clustered">Clustered, Secondary, and Covering Indexes</a></li>
+    <li><a href="#composite">Composite Indexes and the Leftmost-Prefix Rule</a></li>
+    <li><a href="#selectivity">Selectivity: When the Index Is Ignored</a></li>
+    <li><a href="#explain">Reading EXPLAIN: A Hands-On Lab</a></li>
+    <li><a href="#writes">The Cost of Indexes on Writes</a></li>
+    <li><a href="#lsm">LSM Trees: The Write-Friendly Alternative</a></li>
+    <li><a href="#scenario">Scenario: The Slow "My Orders" Page</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="problem">
+    <h2>1. The Problem: Finding Rows Fast</h2>
+    <p>An online shop has an <code>orders</code> table with one million rows. A customer opens "My orders", and the app runs:</p>
+    <pre><code>SELECT * FROM orders WHERE customer_id = 4242;</code></pre>
+    <p>Only 8 rows match. Without help, the database has no idea where those 8 rows are. It must read <em>every</em> row and check it. This is called a <strong>full table scan</strong> (PostgreSQL calls it a <strong>Seq Scan</strong>, short for sequential scan).</p>
+    <p>On our test table this took about 26 ms. That sounds fast, but:</p>
+    <ul>
+      <li>The time grows with the table. At 100 million rows it is 100 times slower.</li>
+      <li>Every scan pushes useful data out of memory and uses CPU that other queries need.</li>
+      <li>If 500 users open the page per second, the database does 500 full scans per second.</li>
+    </ul>
+    <p>After adding one index, the same query took <strong>0.096 ms</strong>. That is about 270 times faster, and the gap grows as the table grows. This page explains exactly why.</p>
+  </section>
+
+  <section id="pages">
+    <h2>2. How Tables Live on Disk</h2>
+    <p>A database does not read single rows from disk. It reads fixed-size blocks called <strong>pages</strong>. In PostgreSQL a page is 8 KB. In MySQL's InnoDB engine it is 16 KB. One page holds many rows.</p>
+    <pre><code>  orders table file (the "heap")
+  +-----------+-----------+-----------+-----     -----+-----------+
+  |  page 0   |  page 1   |  page 2   |   ...         | page 7739 |
+  | rows 1-129| rows ...  |           |               |           |
+  +-----------+-----------+-----------+-----     -----+-----------+
+                    7,740 pages x 8 KB = about 60 MB</code></pre>
+    <p>Our real table: 1,000,000 rows took <strong>7,740 pages (60 MB)</strong>, so about 129 rows fit in each page. The <strong>heap</strong> is the name for this main table file. Rows sit in it in no special order, roughly in the order they were inserted.</p>
+    <div class="callout">
+      <strong>The key cost model:</strong> the time of a query is mostly about <em>how many pages it touches</em>. Reading a page from memory is cheap. Reading it from disk is much more expensive, and random reads (jumping around) cost more than sequential reads (one page after another). Hold on to this idea. Everything else follows from it.
+    </div>
+    <p>A full scan of our table touches all 7,740 pages to find 8 rows. That is the waste we want to remove.</p>
+  </section>
+
+  <section id="idea">
+    <h2>3. The Idea of an Index</h2>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> the index at the back of a textbook. Words are listed in sorted order, and each word points to page numbers. To find "deadlock", you do not read the whole book. You jump to "D", find the word, and go straight to pages 212 and 340.
+    </div>
+    <p>A database <strong>index</strong> is a separate data structure that stores the values of one or more columns in sorted order. Each entry points to where the full row lives. In PostgreSQL that pointer is called a <strong>TID</strong> (tuple ID): a (page number, slot number) pair.</p>
+    <pre><code>  index on customer_id (sorted)          heap (unsorted)
+  +-------------+------------+
+  | customer_id | points to  |            page 12:  ... row for 4242 ...
+  +-------------+------------+            page 803: ... row for 4242 ...
+  |    4241     |  (55, 3)   |            page 5120:... row for 4242 ...
+  |    4242     |  (12, 7)   | ------&gt;
+  |    4242     |  (803, 1)  | ------&gt;
+  |    4242     |  (5120, 9) | ------&gt;
+  |    4243     |  (77, 2)   |
+  +-------------+------------+</code></pre>
+    <p>Since the index is sorted, we can find a value with <strong>binary search</strong>: look at the middle, throw away the half that cannot contain the value, repeat. For one million sorted values, that takes at most log<sub>2</sub>(1,000,000) &asymp; 20 steps instead of one million.</p>
+    <p>But a plain sorted array has two problems on disk. Inserting a value in the middle means shifting everything after it. And each binary search step may land on a different disk page, so 20 steps could mean 20 page reads. The <strong>B+ tree</strong> fixes both.</p>
+  </section>
+
+  <section id="btree">
+    <h2>4. B+ Trees, Drawn Out</h2>
+    <p>A <strong>B+ tree</strong> is a tree where each node is one page and holds <em>many</em> keys, not just one or two. It is the default index type in PostgreSQL, MySQL, SQLite, SQL Server, and Oracle.</p>
+    <pre><code>                          [ 40 | 80 ]                     &lt;- root (level 2)
+                   /           |            \
+        [ 15 | 30 ]       [ 55 | 70 ]        [ 90 ]       &lt;- internal nodes (level 1)
+        /    |    \       /    |    \        /    \
+   [5 10] [15 20] [30 35] [40 50] [55 60] [70 75] [80 85] [90 95]   &lt;- leaves (level 0)
+     &lt;-&gt;    &lt;-&gt;     &lt;-&gt;     &lt;-&gt;     &lt;-&gt;     &lt;-&gt;     &lt;-&gt;           (leaves linked in order)</code></pre>
+    <p>The rules, in plain words:</p>
+    <ul>
+      <li><strong>Leaves</strong> (the bottom row) hold every key, in sorted order, each with a pointer to its row in the heap.</li>
+      <li><strong>Internal nodes</strong> hold only "signposts". In <code>[40 | 80]</code>, the left branch has keys below 40, the middle has keys from 40 up to 80, and the right has keys 80 and above.</li>
+      <li><strong>All leaves are at the same depth.</strong> The tree is always balanced, so every lookup costs the same number of steps.</li>
+      <li><strong>Leaves are linked</strong> to their neighbours, left and right. Once you find the start of a range, you walk sideways without going back up.</li>
+      <li>Each node is at least half full (except the root). This keeps the tree short.</li>
+    </ul>
+    <h3>Point lookup: find 60</h3>
+    <ol>
+      <li>Root <code>[40 | 80]</code>: 60 is between 40 and 80, so go to the middle child.</li>
+      <li>Internal <code>[55 | 70]</code>: 60 is between 55 and 70, so go to the middle child.</li>
+      <li>Leaf <code>[55 60]</code>: found 60. Follow its pointer to the heap page.</li>
+    </ol>
+    <p>Three node reads plus one heap read. The number of steps equals the height of the tree.</p>
+    <h3>Range lookup: find all keys from 33 to 57</h3>
+    <ol>
+      <li>Search for 33 as above: root (go left), <code>[15 | 30]</code> (go right), reach leaf <code>[30 35]</code>.</li>
+      <li>Walk the leaf chain: take 35, move right to <code>[40 50]</code>, take 40 and 50, move right to <code>[55 60]</code>, take 55, see 60 &gt; 57 and stop.</li>
+      <li>Result: 35, 40, 50, 55.</li>
+    </ol>
+    <p>That linked leaf chain is why B+ trees are good at <code>BETWEEN</code>, <code>&lt;</code>, <code>&gt;</code>, <code>ORDER BY</code>, and <code>LIKE 'abc%'</code>.</p>
+    <div class="callout">
+      <strong>B tree vs B+ tree:</strong> in a plain B tree, internal nodes also hold row pointers, and each key appears only once. In a B+ tree, all data sits in the leaves and internal nodes only guide the search. That makes internal nodes smaller (more keys fit per page) and makes range scans a simple walk along the leaves. When a database says "B-tree index", it almost always means a B+ tree.
+    </div>
+  </section>
+
+  <section id="build">
+    <h2>5. Building a B+ Tree by Hand</h2>
+    <p>To learn how the tree stays balanced, build a tiny one. Our rule: <strong>a node holds at most 3 keys</strong>. Insert the keys 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 in that order.</p>
+    <h3>Insert 10, 20, 30</h3>
+    <pre><code>[10 20 30]          one leaf, which is also the root</code></pre>
+    <h3>Insert 40: the first split</h3>
+    <p>The leaf would hold 4 keys, which is too many. <strong>Split</strong> it into two halves and send a copy of the first key of the right half up to a new parent.</p>
+    <pre><code>  overflow: [10 20 30 40]
+
+          [30]                 &lt;- new root; 30 is COPIED up (it stays in the leaf too)
+         /    \
+   [10 20]    [30 40]</code></pre>
+    <h3>Insert 50, then 60: a second leaf split</h3>
+    <p>50 goes into <code>[30 40]</code>, making <code>[30 40 50]</code>. Then 60 overflows it to <code>[30 40 50 60]</code>. Split into <code>[30 40]</code> and <code>[50 60]</code>, and copy 50 up.</p>
+    <pre><code>           [30 | 50]
+         /     |     \
+   [10 20]  [30 40]  [50 60]</code></pre>
+    <h3>Insert 70, then 80</h3>
+    <p>70 fits: <code>[50 60 70]</code>. 80 overflows it: split into <code>[50 60]</code> and <code>[70 80]</code>, copy 70 up. The root now holds 3 keys, which is still allowed.</p>
+    <pre><code>              [30 | 50 | 70]
+           /      |      |      \
+     [10 20]  [30 40]  [50 60]  [70 80]</code></pre>
+    <h3>Insert 90, then 100: the tree grows taller</h3>
+    <p>90 fits: <code>[70 80 90]</code>. 100 overflows it: split into <code>[70 80]</code> and <code>[90 100]</code>, and send 90 up. Now the root would be <code>[30 50 70 90]</code>, which is 4 keys, too many. So the <em>root</em> splits too.</p>
+    <p>When an <strong>internal</strong> node splits, the middle key <strong>moves</strong> up (it does not stay below, unlike in a leaf split). Middle of <code>[30 50 70 90]</code>: we push up 70. Left gets <code>[30 50]</code>, right gets <code>[90]</code>.</p>
+    <pre><code>                      [70]                   &lt;- new root, tree is now 3 levels
+                  /           \
+           [30 | 50]            [90]
+          /    |    \          /    \
+    [10 20] [30 40] [50 60] [70 80] [90 100]</code></pre>
+    <p>Check it with a lookup for 80: root says 80 &ge; 70, go right. <code>[90]</code> says 80 &lt; 90, go left. Leaf <code>[70 80]</code> has it.</p>
+    <div class="callout callout-intuition">
+      <strong>Why the tree stays balanced:</strong> a B+ tree never grows downward. It only gets taller when the <em>root</em> splits, and that adds one level above <em>every</em> leaf at the same time. So all leaves are always at the same depth. That is the whole trick.
+    </div>
+    <p>Deleting works in reverse. If a node drops below half full, it borrows a key from a neighbour or merges with it. (Many real databases are lazy about merging and clean up later, for example PostgreSQL during <code>VACUUM</code>.)</p>
+    <h3>Practice</h3>
+    <p>Start from the final tree above and insert 35, then 36. Where does each go, and does anything split? (Answer: 35 goes into <code>[30 40]</code> to make <code>[30 35 40]</code>. 36 overflows it to <code>[30 35 36 40]</code>, which splits into <code>[30 35]</code> and <code>[36 40]</code>, and 36 is copied up into <code>[30 | 50]</code>, making <code>[30 | 36 | 50]</code>. That internal node now has 3 keys, which is allowed, so the split stops there.)</p>
+  </section>
+
+  <section id="height">
+    <h2>6. How Tall Is the Tree? The Math</h2>
+    <p>Real nodes are pages, not 3-key toys. The number of children one node can have is called the <strong>fanout</strong>.</p>
+    <h3>Estimate the fanout</h3>
+    <ul>
+      <li>Page size: 8,192 bytes.</li>
+      <li>One entry in a PostgreSQL index on an integer is about 16 bytes, plus a 4-byte slot pointer. So about 20 bytes.</li>
+      <li>Fanout &asymp; 8,192 / 20 &asymp; 400. Pages are not always full, so real fanout is a few hundred.</li>
+    </ul>
+    <h3>Height for N rows</h3>
+    <p>With fanout f, a tree of height h can reach about f<sup>h</sup> leaf entries. So height &asymp; log<sub>f</sub>(N).</p>
+    <table>
+      <thead><tr><th>Levels</th><th>Entries reachable (f = 400)</th></tr></thead>
+      <tbody>
+        <tr><td>1 (root only)</td><td>400</td></tr>
+        <tr><td>2</td><td>160,000</td></tr>
+        <tr><td>3</td><td>64,000,000</td></tr>
+        <tr><td>4</td><td>25,600,000,000</td></tr>
+      </tbody>
+    </table>
+    <p>So a table with one million rows needs a tree only <strong>3 levels</strong> tall. We checked this on the real table using the <code>pageinspect</code> extension:</p>
+    <pre><code>CREATE EXTENSION pageinspect;
+SELECT level AS root_level FROM bt_metap('orders_customer_idx');
+ root_level
+------------
+          2          -- levels 2, 1, 0 = a 3-level tree</code></pre>
+    <p>The whole index is 1,136 pages (9 MB), compared to 7,740 pages for the table. A lookup reads 3 index pages plus one heap page per matching row. And the top levels are used by every lookup, so they almost always sit in memory. In practice only the leaf and the heap page may need disk reads.</p>
+    <div class="callout">
+      <strong>Worked comparison for the 8 matching rows:</strong> full scan = 7,740 pages. Index = 3 index pages + at most 8 heap pages = 11 pages. That is about 700 times fewer pages, which matches the speedup we measured.
+    </div>
+    <p>Why did more entries fit per page than the estimate (1,000,000 entries in about 1,100 pages)? Each customer has about 10 orders, and since version 13 PostgreSQL stores repeated keys only once in a leaf, with a list of row pointers. This is called <strong>deduplication</strong>.</p>
+  </section>
+
+  <section id="hash">
+    <h2>7. Hash Indexes</h2>
+    <p>A <strong>hash index</strong> runs each key through a hash function (a formula that turns a value into a bucket number) and stores the pointer in that bucket.</p>
+    <pre><code>  hash(4242) mod 8 = 3      bucket 3 -&gt; [(12,7), (803,1), (5120,9)]</code></pre>
+    <table>
+      <thead><tr><th></th><th>B+ tree</th><th>Hash index</th></tr></thead>
+      <tbody>
+        <tr><td><code>=</code> lookup</td><td>A few page reads</td><td>Usually one bucket read</td></tr>
+        <tr><td>Range (<code>&lt;</code>, <code>BETWEEN</code>)</td><td>Yes</td><td><strong>No.</strong> Hashing destroys order.</td></tr>
+        <tr><td><code>ORDER BY</code></td><td>Yes, rows come out sorted</td><td>No</td></tr>
+        <tr><td>Prefix (<code>LIKE 'ab%'</code>)</td><td>Yes</td><td>No</td></tr>
+      </tbody>
+    </table>
+    <p>Because a B+ tree is almost as fast for equality and can also do ranges and sorting, it is the default. Hash indexes are mostly used inside the database engine, for example in <strong>hash joins</strong> (a way to join two tables by building a temporary hash table) and in key-value stores like Redis.</p>
+    <p>Other index types you will meet: <strong>GIN</strong> (for searching inside arrays, JSON, and full text), <strong>GiST</strong> (for geometry and ranges), <strong>BRIN</strong> (tiny indexes for huge tables whose rows are naturally in order, such as logs by time), and <strong>vector indexes</strong> like HNSW for finding similar embeddings. See <a href="../../../AI Engineer/learn/Prompting-and-Retrieval/ai-engineering-vector-databases.html">Vector Databases</a> for that last one.</p>
+  </section>
+
+  <section id="clustered">
+    <h2>8. Clustered, Secondary, and Covering Indexes</h2>
+    <h3>Clustered index</h3>
+    <p>A <strong>clustered index</strong> is one where the table rows themselves are stored inside the index leaves, in key order. A table can have only one, because rows can only be stored in one order.</p>
+    <ul>
+      <li><strong>MySQL InnoDB:</strong> the table <em>is</em> a B+ tree on the primary key. Every other index (a <strong>secondary index</strong>) stores the primary key value, not a page address. So a secondary lookup does two tree searches: one in the secondary index to find the primary key, and one in the primary key tree to find the row.</li>
+      <li><strong>PostgreSQL:</strong> the table is an unordered heap. Every index, including the primary key, is secondary and points to a TID. (The <code>CLUSTER</code> command sorts the heap once, but new rows do not keep the order.)</li>
+    </ul>
+    <pre><code>  InnoDB secondary lookup:                 PostgreSQL lookup:
+  email index --&gt; primary key 77           email index --&gt; TID (803, 1)
+  PK tree     --&gt; full row                 heap page 803, slot 1 --&gt; full row</code></pre>
+    <p>This is also why, in InnoDB, a short primary key matters: it is copied into every secondary index. A random UUID as primary key also spreads inserts all over the tree. Time-ordered IDs, such as UUIDv7, avoid that.</p>
+    <h3>Covering index and index-only scan</h3>
+    <p>If an index already contains <em>every column the query needs</em>, the database can skip the heap completely. This is an <strong>index-only scan</strong>, and the index is said to <strong>cover</strong> the query.</p>
+    <pre><code>CREATE INDEX orders_cust_cov_idx ON orders (customer_id) INCLUDE (amount);
+
+EXPLAIN ANALYZE SELECT customer_id, amount FROM orders
+WHERE customer_id BETWEEN 4000 AND 4010;
+
+ Index Only Scan using orders_cust_cov_idx on orders
+     (cost=0.42..6.49 rows=103 width=10) (actual time=0.032..0.039 rows=107 loops=1)
+   Index Cond: ((customer_id &gt;= 4000) AND (customer_id &lt;= 4010))
+   Heap Fetches: 0
+ Execution Time: 0.056 ms</code></pre>
+    <p><code>INCLUDE (amount)</code> stores <code>amount</code> in the leaves without making it part of the sort key. <code>Heap Fetches: 0</code> means no table pages were read. In PostgreSQL this only works well after <code>VACUUM</code> has marked pages as "all visible", because of <a href="dbms-transactions-isolation-mvcc.html#mvcc">MVCC</a>: the index does not know which row versions your transaction may see.</p>
+  </section>
+
+  <section id="composite">
+    <h2>9. Composite Indexes and the Leftmost-Prefix Rule</h2>
+    <p>A <strong>composite index</strong> (also called a multi-column index) sorts by several columns: first by the first column, then by the second within ties, and so on.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> a phone book sorted by (last name, first name). Finding "Sharma, Priya" is fast. Finding every "Sharma" is fast. But finding every "Priya" is hopeless: Priyas are scattered across every last name. You would read the whole book.
+    </div>
+    <p>Take <code>CREATE INDEX ON orders (customer_id, created_at DESC)</code>. The leaves look like this:</p>
+    <pre><code>(4241, 2026-10-02)  (4241, 2026-03-11)  (4242, 2026-11-01)  (4242, 2026-09-14)
+(4242, 2026-05-30)  (4242, 2026-01-08)  (4243, 2026-08-20)  ...</code></pre>
+    <p>The <strong>leftmost-prefix rule</strong>: the index can jump straight to a spot only for conditions on a <em>leading</em> part of its column list.</p>
+    <table>
+      <thead><tr><th>Query condition</th><th>Can the index seek?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>customer_id = 4242</code></td><td>Yes</td><td>First column</td></tr>
+        <tr><td><code>customer_id = 4242 AND created_at &gt; '2026-06-01'</code></td><td>Yes, very well</td><td>Both columns, in order</td></tr>
+        <tr><td><code>customer_id = 4242 ORDER BY created_at DESC LIMIT 5</code></td><td>Yes, and no sort needed</td><td>Rows for 4242 are already in date order</td></tr>
+        <tr><td><code>created_at &gt; now() - interval '1 day'</code></td><td><strong>No</strong></td><td>Skips the first column, like searching by first name</td></tr>
+        <tr><td><code>customer_id &gt; 4000 AND created_at &gt; '2026-06-01'</code></td><td>Only on customer_id</td><td>After a range on column 1, column 2 is no longer sorted across the range</td></tr>
+      </tbody>
+    </table>
+    <p>Real plans from the test table confirm the first and the fourth rows:</p>
+    <pre><code>EXPLAIN ANALYZE SELECT * FROM orders
+WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 5;
+
+ Limit  (actual time=0.026..0.040 rows=5 loops=1)
+   -&gt;  Index Scan using orders_cust_created_idx on orders  (rows=5 loops=1)
+         Index Cond: (customer_id = 4242)
+ Execution Time: 0.052 ms
+
+EXPLAIN ANALYZE SELECT * FROM orders
+WHERE created_at &gt; now() - interval '1 day';
+
+ Gather  (actual time=0.431..82.509 rows=2688 loops=1)
+   Workers Planned: 2
+   -&gt;  Parallel Seq Scan on orders
+         Filter: (created_at &gt; (now() - '1 day'::interval))
+         Rows Removed by Filter: 332437
+ Execution Time: 82.614 ms</code></pre>
+    <p>The second query needs its own index on <code>created_at</code>.</p>
+    <h3>Choosing column order</h3>
+    <ol>
+      <li>Columns tested with <code>=</code> go first.</li>
+      <li>Then the column used for a range or for <code>ORDER BY</code>.</li>
+      <li>Among equality columns, think about which other queries can reuse the index through its leading columns.</li>
+    </ol>
+    <p>One index on <code>(a, b)</code> also serves queries on <code>a</code> alone. So you usually do not need a separate index on <code>a</code>.</p>
+  </section>
+
+  <section id="selectivity">
+    <h2>10. Selectivity: When the Index Is Ignored</h2>
+    <p><strong>Selectivity</strong> is the fraction of rows a condition keeps. <code>customer_id = 4242</code> keeps 8 in a million (very selective). <code>status = 'paid'</code> keeps 62.5% (not selective at all).</p>
+    <p>We created an index on <code>status</code> and asked again:</p>
+    <pre><code>EXPLAIN SELECT * FROM orders WHERE status = 'paid';        -- 625,677 rows
+ Seq Scan on orders  (cost=0.00..20240.00 rows=619667 width=32)
+   Filter: (status = 'paid'::text)
+
+EXPLAIN SELECT * FROM orders WHERE status = 'cancelled';   -- 125,132 rows
+ Bitmap Heap Scan on orders  (cost=1434.49..10777.83 rows=128267 width=32)
+   Recheck Cond: (status = 'cancelled'::text)
+   -&gt;  Bitmap Index Scan on orders_status_idx  (rows=128267 width=0)</code></pre>
+    <p>The planner <em>chose not to use</em> the index for "paid". That is the right choice. Using the index would mean jumping to a random heap page for each of 625,000 rows, touching nearly every page anyway, but in random order. Reading all 7,740 pages in order is cheaper.</p>
+    <p>The <strong>query planner</strong> (the part of the database that picks how to run a query) estimates the cost of each option using <strong>statistics</strong>: how many rows the table has and how values are spread. <code>ANALYZE</code> refreshes those statistics. Rough guide for PostgreSQL:</p>
+    <table>
+      <thead><tr><th>Rows matched</th><th>Typical plan</th></tr></thead>
+      <tbody>
+        <tr><td>A handful</td><td>Index Scan</td></tr>
+        <tr><td>Hundreds to tens of thousands</td><td>Bitmap Index Scan + Bitmap Heap Scan</td></tr>
+        <tr><td>A large share of the table</td><td>Seq Scan</td></tr>
+      </tbody>
+    </table>
+    <p>A <strong>bitmap scan</strong> first collects all matching TIDs from the index, sorts them by page, then visits each heap page once in order. It is the middle ground between random index lookups and a full scan.</p>
+    <div class="callout">
+      <strong>Partial index trick:</strong> if you only ever query the rare value, index only those rows: <code>CREATE INDEX ON orders (created_at) WHERE status = 'cancelled';</code> The index is small and the planner uses it whenever your query has the same <code>WHERE</code> condition.
+    </div>
+  </section>
+
+  <section id="explain">
+    <h2>11. Reading EXPLAIN: A Hands-On Lab</h2>
+    <p>You can repeat every result on this page. Start any PostgreSQL 13 or newer (a local install or a Docker container), then run:</p>
+    <pre><code>CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id int     NOT NULL,
+  status      text    NOT NULL,
+  amount      numeric(10,2) NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+
+INSERT INTO orders (customer_id, status, amount, created_at)
+SELECT (random()*99999)::int + 1,
+       (ARRAY['paid','paid','paid','shipped','cancelled'])[1 + (random()*4)::int],
+       round((random()*500)::numeric, 2),
+       now() - (random() * interval '365 days')
+FROM generate_series(1, 1000000);
+
+ANALYZE orders;</code></pre>
+    <p>Your exact numbers will differ a little because the data is random.</p>
+    <h3>Before the index</h3>
+    <pre><code>EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 4242;
+
+ Gather  (cost=1000.00..13949.43 rows=11 width=32) (actual time=2.498..25.644 rows=8 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   -&gt;  Parallel Seq Scan on orders  (cost=0.00..12948.33 rows=5 width=32)
+                                    (actual time=5.399..20.032 rows=3 loops=3)
+         Filter: (customer_id = 4242)
+         Rows Removed by Filter: 333331
+ Planning Time: 0.098 ms
+ Execution Time: 25.659 ms</code></pre>
+    <h3>How to read a plan</h3>
+    <ul>
+      <li><strong>Read from the innermost (most indented) line outward.</strong> Each line is a step, and its output feeds the line above it.</li>
+      <li><strong><code>cost=A..B</code></strong> is the planner's <em>guess</em> in made-up units. A is the cost before the first row comes out; B is the cost for all rows. Use it to compare plans, not as time.</li>
+      <li><strong><code>rows=11</code></strong> (in the cost part) is the guessed row count. <strong><code>actual ... rows=8</code></strong> is the real count. If guess and reality are far apart (say 10 vs 100,000), statistics are stale or the planner is confused. Run <code>ANALYZE</code>.</li>
+      <li><strong><code>loops=3</code></strong> means the step ran 3 times (here, once in each of 3 parallel processes). Multiply per-loop rows by loops: 3 &times; 3 &asymp; 8 after rounding.</li>
+      <li><strong><code>Rows Removed by Filter: 333331</code></strong> per worker means about one million rows were read and thrown away. This is the number that screams "missing index".</li>
+      <li><strong>Gather</strong> collects results from parallel workers.</li>
+    </ul>
+    <h3>After the index</h3>
+    <pre><code>CREATE INDEX orders_customer_idx ON orders (customer_id);
+
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 4242;
+
+ Bitmap Heap Scan on orders  (cost=4.51..47.40 rows=11 width=32) (actual time=0.041..0.086 rows=8 loops=1)
+   Recheck Cond: (customer_id = 4242)
+   Heap Blocks: exact=8
+   -&gt;  Bitmap Index Scan on orders_customer_idx  (cost=0.00..4.51 rows=11 width=0)
+                                                 (actual time=0.030..0.030 rows=8 loops=1)
+         Index Cond: (customer_id = 4242)
+ Planning Time: 0.129 ms
+ Execution Time: 0.096 ms</code></pre>
+    <p>Reading it from the inside out: the index found 8 TIDs (<code>Index Cond</code>). The heap step visited exactly 8 pages (<code>Heap Blocks: exact=8</code>), one per row, because each order of this customer sits on a different page. Total: 0.096 ms instead of 25.7 ms.</p>
+    <h3>Common plan nodes</h3>
+    <table>
+      <thead><tr><th>Node</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>Seq Scan</td><td>Read the whole table</td></tr>
+        <tr><td>Index Scan</td><td>Walk the index, fetch each row from the heap</td></tr>
+        <tr><td>Index Only Scan</td><td>Answer from the index alone</td></tr>
+        <tr><td>Bitmap Index Scan + Bitmap Heap Scan</td><td>Collect TIDs, then read heap pages in order</td></tr>
+        <tr><td>Sort</td><td>Sort rows (watch for "external merge Disk", meaning it spilled to disk)</td></tr>
+        <tr><td>Nested Loop / Hash Join / Merge Join</td><td>Three ways to join two tables</td></tr>
+        <tr><td>Limit</td><td>Stop after N rows</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Safety note:</strong> <code>EXPLAIN</code> only plans. <code>EXPLAIN ANALYZE</code> really runs the query. For an <code>UPDATE</code> or <code>DELETE</code>, wrap it: <code>BEGIN; EXPLAIN ANALYZE DELETE ...; ROLLBACK;</code>. Add <code>BUFFERS</code> (<code>EXPLAIN (ANALYZE, BUFFERS)</code>) to see how many pages came from memory ("shared hit") or disk ("read").
+    </div>
+  </section>
+
+  <section id="writes">
+    <h2>12. The Cost of Indexes on Writes</h2>
+    <p>Indexes are not free. Every <code>INSERT</code> must add an entry to every index on the table. Every <code>UPDATE</code> of an indexed column must change the index too. Every index also uses disk and memory.</p>
+    <p>We measured it: insert 300,000 rows into two identical tables. One has only a primary key. The other has the primary key plus 4 more indexes.</p>
+    <table>
+      <thead><tr><th>Table</th><th>Indexes</th><th>Insert time (two runs)</th></tr></thead>
+      <tbody>
+        <tr><td>t0</td><td>1 (primary key)</td><td>664 ms, 689 ms</td></tr>
+        <tr><td>t5</td><td>5</td><td>2,781 ms, 2,644 ms</td></tr>
+      </tbody>
+    </table>
+    <p>About <strong>4 times slower</strong>. The extra work for each written row, beyond the row itself, is called <strong>write amplification</strong>.</p>
+    <p>Rules that follow:</p>
+    <ul>
+      <li>Add an index for a real, frequent query, not "just in case".</li>
+      <li>Remove unused indexes. In PostgreSQL, <code>SELECT relname, indexrelname, idx_scan FROM pg_stat_user_indexes ORDER BY idx_scan;</code> shows indexes that are never used (<code>idx_scan = 0</code>).</li>
+      <li>On a live table, build with <code>CREATE INDEX CONCURRENTLY</code> so writes are not blocked while it builds. It is slower, but your app stays up.</li>
+      <li>For a big one-time load, load first and create indexes after.</li>
+    </ul>
+  </section>
+
+  <section id="lsm">
+    <h2>13. LSM Trees: The Write-Friendly Alternative</h2>
+    <p>B+ trees update pages in place, which means random writes. Systems that take a huge stream of writes (metrics, logs, chat messages, event streams) often use a <strong>log-structured merge tree</strong> (LSM tree) instead. RocksDB, Cassandra, ScyllaDB, and many time-series databases use one.</p>
+    <pre><code>  write --&gt; [ memtable (sorted, in memory) ]
+                    | when full, write out as one sorted file
+                    v
+  disk:   L0: [SST] [SST] [SST]          newest, small files
+          L1: [   SST   ] [   SST   ]     background "compaction" merges them
+          L2: [        SST        ] ...   oldest, biggest files</code></pre>
+    <ul>
+      <li><strong>Writes</strong> go to memory first (and to a log for safety), then are flushed as big sorted files. All disk writes are sequential, which is fast.</li>
+      <li><strong>Reads</strong> may have to check several files, newest first. <strong>Bloom filters</strong> (a small structure that can say "this key is definitely not in this file") skip most files.</li>
+      <li><strong>Compaction</strong> merges files in the background and drops old versions.</li>
+    </ul>
+    <table>
+      <thead><tr><th></th><th>B+ tree</th><th>LSM tree</th></tr></thead>
+      <tbody>
+        <tr><td>Write speed</td><td>Good</td><td>Very good</td></tr>
+        <tr><td>Read speed</td><td>Very good and steady</td><td>Good, a bit less predictable</td></tr>
+        <tr><td>Background work</td><td>Little</td><td>Compaction uses disk and CPU</td></tr>
+        <tr><td>Typical use</td><td>OLTP databases (PostgreSQL, MySQL)</td><td>Write-heavy stores (RocksDB, Cassandra)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="scenario">
+    <h2>14. Scenario: The Slow "My Orders" Page</h2>
+    <p><strong>Situation.</strong> The "My orders" page loads in 2 seconds at busy times, and the database CPU sits at 90%. The page runs:</p>
+    <pre><code>SELECT id, status, amount, created_at
+FROM orders
+WHERE customer_id = $1
+ORDER BY created_at DESC
+LIMIT 20;</code></pre>
+    <h3>Step 1: find the expensive query</h3>
+    <p>Turn on the <code>pg_stat_statements</code> extension and sort by total time. This query is at the top: it runs 300 times a second and each run takes about 40 ms.</p>
+    <pre><code>SELECT calls, round(mean_exec_time::numeric, 1) AS avg_ms, query
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 5;</code></pre>
+    <h3>Step 2: look at the plan</h3>
+    <p><code>EXPLAIN ANALYZE</code> shows <code>Parallel Seq Scan on orders</code> with <code>Rows Removed by Filter</code> close to the table size. No index on <code>customer_id</code>.</p>
+    <h3>Step 3: design the index from the query</h3>
+    <ul>
+      <li><code>customer_id = $1</code> is equality, so it goes first.</li>
+      <li><code>ORDER BY created_at DESC</code> goes second, so rows come out already sorted and <code>LIMIT 20</code> can stop after 20 rows.</li>
+      <li>Optional: <code>INCLUDE (status, amount)</code> makes it covering, so the heap can be skipped.</li>
+    </ul>
+    <pre><code>CREATE INDEX CONCURRENTLY orders_customer_recent_idx
+  ON orders (customer_id, created_at DESC) INCLUDE (status, amount);</code></pre>
+    <h3>Step 4: verify</h3>
+    <p>The new plan shows <code>Limit -&gt; Index Only Scan using orders_customer_recent_idx</code>, no Sort node, and about 0.05 ms. The database CPU drops to 20%. Check again a week later with <code>pg_stat_user_indexes</code> that the index is used, and remove any older index on <code>customer_id</code> alone, because the new one covers those queries through its leading column.</p>
+    <p>For a version of this problem that crosses several layers (network, app, and database together), see <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API End to End</a>.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Wrapping the column in a function.</strong> <code>WHERE lower(email) = '...'</code> cannot use an index on <code>email</code>. Real result: a Seq Scan. Fix: an <strong>expression index</strong>, <code>CREATE INDEX ON users (lower(email));</code>, after which the plan became <code>Index Scan using users_email_lower_idx</code>. The same happens with <code>WHERE customer_id + 0 = 4242</code> or <code>WHERE created_at::date = '2026-06-01'</code>. Rewrite the last one as a range: <code>created_at &gt;= '2026-06-01' AND created_at &lt; '2026-06-02'</code>.</li>
+      <li><strong>Leading wildcard.</strong> <code>LIKE '%42@example.com'</code> cannot use a B+ tree, because the start of the string is unknown. Use a trigram index (<code>pg_trgm</code> with GIN) or full-text search.</li>
+      <li><strong>Wrong column order</strong> in a composite index (section 9).</li>
+      <li><strong>Type mismatch.</strong> Comparing a text column to a number, or a <code>bigint</code> to a parameter sent as text, can force a cast on every row and skip the index.</li>
+      <li><strong>Stale statistics</strong> after a big load. Estimated rows look nothing like actual rows. Run <code>ANALYZE</code>.</li>
+      <li><strong>Indexing everything.</strong> Each index slows every write (section 12).</li>
+      <li><strong>Testing on a tiny table.</strong> On 100 rows, a Seq Scan is the best plan, so the planner ignores your index and you think it is broken. Test with realistic data sizes.</li>
+      <li><strong>Forgetting <code>OR</code>.</strong> <code>WHERE a = 1 OR b = 2</code> needs indexes on both columns (PostgreSQL can combine them with a BitmapOr), or a rewrite as <code>UNION</code>.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Query shape</th><th>Index</th></tr></thead>
+      <tbody>
+        <tr><td><code>WHERE a = ?</code></td><td><code>(a)</code></td></tr>
+        <tr><td><code>WHERE a = ? AND b &gt; ?</code></td><td><code>(a, b)</code>: equality first, range last</td></tr>
+        <tr><td><code>WHERE a = ? ORDER BY b LIMIT n</code></td><td><code>(a, b)</code>: no sort needed</td></tr>
+        <tr><td><code>WHERE lower(x) = ?</code></td><td>Expression index <code>(lower(x))</code></td></tr>
+        <tr><td>Only a rare value is queried</td><td>Partial index <code>... WHERE status = 'cancelled'</code></td></tr>
+        <tr><td>Avoid heap reads</td><td>Covering index with <code>INCLUDE (...)</code></td></tr>
+        <tr><td>Huge, naturally ordered log table</td><td>BRIN</td></tr>
+        <tr><td>JSON, arrays, full text</td><td>GIN</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Tree height:</strong> about log<sub>fanout</sub>(rows). Fanout is a few hundred, so 3 to 4 levels covers millions to billions of rows.</p>
+    <p><strong>Plan red flags:</strong> Seq Scan with a large "Rows Removed by Filter"; estimated rows far from actual rows; Sort spilling to disk.</p>
+    <p class="refer-link"><small>Refer: <a href="https://www.postgresql.org/docs/current/indexes.html" rel="noopener noreferrer">PostgreSQL docs: Indexes</a> &middot; <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="noopener noreferrer">PostgreSQL docs: Using EXPLAIN</a> &middot; <a href="https://use-the-index-luke.com/" rel="noopener noreferrer">Use The Index, Luke (free book)</a> &middot; <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html" rel="noopener noreferrer">MySQL: Clustered and Secondary Indexes</a> &middot; <a href="https://dataintensive.net/" rel="noopener noreferrer">Designing Data-Intensive Applications, chapter 3</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a> &middot; <a href="../Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> &middot; <a href="../../../AI Engineer/learn/Prompting-and-Retrieval/ai-engineering-vector-databases.html">Vector Databases</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check internal links in the static site.
 
-Verifies that every relative href/src points to an existing file and that every
+Verifies that every relative or root-relative (/...) href/src points to an existing file and that every
 #fragment (same-page or cross-page) matches an id on the target page.
 
 Usage:
@@ -41,7 +41,11 @@ for html in sorted(scan.rglob("*.html")):
             continue
         checked += 1
         path_part, _, fragment = ref.partition("#")
-        target = (html.parent / unquote(path_part)).resolve() if path_part else html
+        if path_part.startswith("/"):
+            # root-relative link (used by 404.html, which can be served at any depth)
+            target = (root / unquote(path_part.lstrip("/"))).resolve()
+        else:
+            target = (html.parent / unquote(path_part)).resolve() if path_part else html
         if not target.exists():
             broken.append((html.relative_to(root).as_posix(), ref, "missing file"))
             continue

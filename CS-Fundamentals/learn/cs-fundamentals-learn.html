@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="../../assets/logo.svg" type="image/svg+xml">
   <title>Learn | CS Fundamentals</title>
-  <meta name="description" content="CS Fundamentals learning track: operating systems, databases, and computer networks from zero.">
+  <meta name="description" content="CS Fundamentals learning track: operating systems, databases, computer networks, and real-world scenarios, from zero.">
   <link rel="stylesheet" href="../../styles.css">
 </head>
 <body class="learn-page">
@@ -21,6 +21,21 @@
 <main>
 
   <section>
+    <h2>Suggested reading order</h2>
+    <p>New to these subjects? This order builds each idea on the one before it. Every page also stands on its own.</p>
+    <ol class="learning-path">
+      <li><a href="Operating-Systems/os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a>: what a running program is</li>
+      <li><a href="Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a>: how programs see memory</li>
+      <li><a href="Operating-Systems/os-concurrency-synchronization-deadlocks.html">Concurrency, Synchronization &amp; Deadlocks</a>: what goes wrong when threads share data</li>
+      <li><a href="Databases/dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a>: the same problems inside a database</li>
+      <li><a href="Databases/dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a>: how databases find data fast</li>
+      <li><a href="Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a>: how bytes cross the network reliably</li>
+      <li><a href="Computer-Networks/cn-dns-http.html">DNS &amp; HTTP</a>: from a name to a web page</li>
+      <li><a href="Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API End to End</a>: everything above, used together</li>
+    </ol>
+  </section>
+
+  <section>
     <h2>Operating Systems</h2>
     <ul>
       <li><a href="Operating-Systems/os-processes-threads-scheduling.html"><strong>Processes, Threads &amp; CPU Scheduling</strong></a>  -  process states, context switches, fork/exec, threads, FCFS/SJF/SRTF/Round Robin worked by hand, Linux EEVDF and sched_ext, container CPU throttling</li>
@@ -32,6 +47,7 @@
     <h2>Databases</h2>
     <ul>
       <li><a href="Databases/dbms-transactions-isolation-mvcc.html"><strong>Transactions, Isolation Levels &amp; MVCC</strong></a>  -  ACID, write-ahead logging, anomalies as timelines, PostgreSQL vs MySQL isolation, MVCC internals, locking and deadlocks, a hands-on lab</li>
+      <li><a href="Databases/dbms-indexing-btrees-query-plans.html"><strong>Indexing, B+ Trees &amp; Query Plans</strong></a>  -  pages and full scans, B+ trees built by hand with splits, tree height math, hash, clustered and covering indexes, the leftmost-prefix rule, reading real PostgreSQL EXPLAIN output, write cost, LSM trees</li>
     </ul>
   </section>
 
@@ -39,6 +55,14 @@
     <h2>Computer Networks</h2>
     <ul>
       <li><a href="Computer-Networks/cn-tcp-deep-dive.html"><strong>TCP Deep Dive</strong></a>  -  handshake with real sequence numbers, retransmission, flow and congestion control (CUBIC, BBR), TIME_WAIT, TLS 1.3 and HTTP/3 latency budgets, debugging recipes</li>
+      <li><a href="Computer-Networks/cn-dns-http.html"><strong>DNS &amp; HTTP: From a Name to a Web Page</strong></a>  -  the DNS tree, a lookup traced step by step, record types with real answers, TTL math, Kubernetes ndots, HTTP messages, idempotency, status codes, cookies, caching with ETag and 304, a zero-downtime DNS move</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Scenarios</h2>
+    <ul>
+      <li><a href="Scenarios/scenario-slow-api-debugging.html"><strong>Debugging a Slow API End to End</strong></a>  -  percentiles, RED and USE, splitting time with curl, uptime and vmstat, Little's law for connection pools, pg_stat_statements and EXPLAIN, retry storms, load shedding, a blameless postmortem, practice problems</li>
     </ul>
   </section>
 
