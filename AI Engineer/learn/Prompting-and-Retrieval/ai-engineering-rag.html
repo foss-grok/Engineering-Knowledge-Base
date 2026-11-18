@@ -5,97 +5,413 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
   <title>RAG | AI Engineering</title>
+  <meta name="description" content="Retrieval-Augmented Generation from zero with a real experiment: chunking, BM25 keyword search worked by hand, dense embeddings, hybrid search with reciprocal rank fusion, cross-encoder reranking, grounded prompts, recall@k and MRR, a debugging walkthrough, and practice problems.">
   <link rel="stylesheet" href="../../../styles.css">
+  <script src="../../../assets/mathjax.js"></script>
 </head>
 <body class="learn-page">
 <header>
   <nav aria-label="Breadcrumb">
-    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; RAG</p>
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; RAG</p>
   </nav>
   <h1>Retrieval-Augmented Generation (RAG)</h1>
-  <p>Grounding LLM responses in retrieved documents to improve factuality and domain coverage.</p>
+  <p>Grounding LLM answers in your own documents. We build a small RAG retriever for real, compare keyword search, embedding search, hybrid search, and reranking on the same questions, and learn to debug the failures. All results on this page come from the code shown.</p>
 </header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why RAG Exists</a></li>
+    <li><a href="#big-picture">The Big Picture</a></li>
+    <li><a href="#ingestion">Ingestion and Chunking</a></li>
+    <li><a href="#bm25">Keyword Search: BM25 by Hand</a></li>
+    <li><a href="#dense">Meaning Search: Dense Embeddings</a></li>
+    <li><a href="#experiment">A Real Experiment: 12 Documents, 10 Questions</a></li>
+    <li><a href="#hybrid">Hybrid Search and Reciprocal Rank Fusion</a></li>
+    <li><a href="#rerank">Reranking with a Cross-Encoder</a></li>
+    <li><a href="#generation">Generation: Grounded Prompts</a></li>
+    <li><a href="#evaluation">Measuring RAG</a></li>
+    <li><a href="#advanced">Advanced Patterns</a></li>
+    <li><a href="#scenario">Scenario: "The Bot Says It Does Not Know"</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
 <main class="article">
 
-  <section>
-    <h2>Why RAG Exists</h2>
-    <p>LLMs memorize training data imperfectly and cannot know private or post-training facts. RAG retrieves relevant passages at query time and injects them into the prompt so the model answers from supplied evidence. Benefits include reduced hallucination on factual QA, access to proprietary data without full fine-tuning, and easier updates by refreshing the document index instead of retraining weights.</p>
-    <p>RAG does not guarantee truth. The model can still ignore context, misread passages, or combine retrieved facts incorrectly. Retrieval quality and generation discipline both matter.</p>
+  <section id="why">
+    <h2>1. Why RAG Exists</h2>
+    <p>An LLM only knows what was in its training data. It does not know your company's help docs, last week's policy change, or a private contract. It also remembers facts imperfectly, and may make up an answer that sounds right. This is called <strong>hallucination</strong>.</p>
+    <p><strong>RAG</strong> (Retrieval-Augmented Generation) fixes this at question time: first <em>retrieve</em> the passages that are relevant to the question, then put them in the prompt, and ask the model to answer <em>from those passages</em>.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> RAG turns a closed-book exam into an open-book exam. The student (the LLM) is still the one writing the answer, but now it can look things up. If the wrong page is opened, the answer will still be wrong, so finding the right page is most of the work.
+    </div>
+    <p>Benefits: fewer made-up facts, access to private data without retraining, and easy updates (change the documents, not the model). RAG does not guarantee truth. The model can still ignore or misread the passages.</p>
   </section>
 
-  <section>
-    <h2>Ingestion Pipeline</h2>
-    <p>Documents flow through parsing, cleaning, chunking, embedding, and indexing:</p>
-    
-    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/abs/2005.11401" rel="noopener noreferrer">Original RAG paper</a> &middot; <a href="https://docs.llamaindex.ai/en/stable/understanding/rag/" rel="noopener noreferrer">LlamaIndex RAG guide</a></small></p>
+  <section id="big-picture">
+    <h2>2. The Big Picture</h2>
+<pre><code>OFFLINE (when documents change)
+  documents --&gt; parse --&gt; split into chunks --&gt; embed each chunk --&gt; store in index
+                                         \--&gt; keyword index (BM25)
+
+ONLINE (every question)
+  question --&gt; (rewrite?) --&gt; search index(es) --&gt; top 20-100 candidates
+           --&gt; rerank --&gt; top 3-10 chunks --&gt; build prompt with sources
+           --&gt; LLM --&gt; answer with citations</code></pre>
+    <p>Words used below:</p>
     <ul>
-      <li><strong>Parsing</strong> - PDF, HTML, DOCX, tickets, code repos into plain text with structure hints</li>
-      <li><strong>Chunking</strong> - split into segments (256-1024 tokens typical) with overlap to preserve continuity</li>
-      <li><strong>Metadata</strong> - title, URL, section, ACL, version, timestamp for filtering and citations</li>
-      <li><strong>Embedding</strong> - batch encode chunks with a retrieval-tuned model</li>
-      <li><strong>Indexing</strong> - store in vector DB plus optional sparse index for hybrid search</li>
+      <li><strong>Chunk:</strong> a small piece of a document, a few sentences to a few paragraphs. We retrieve chunks, not whole documents.</li>
+      <li><strong>Index:</strong> a data structure that makes searching fast.</li>
+      <li><strong>Top-k:</strong> the k best results. "Top-5" means the five highest-scoring chunks.</li>
+      <li><strong>Embedding:</strong> a list of numbers that represents the meaning of a text. Similar meanings give nearby lists. See <a href="ai-engineering-embeddings.html">Embeddings</a>.</li>
     </ul>
-    <p>Chunking strategy is a top quality lever: semantic chunking, heading-aware splits, and parent-child indexes (small chunks for retrieval, large parents for generation context) often beat naive fixed-size windows.</p>
   </section>
 
-  <section>
-    <h2>Retrieval Stage</h2>
-    <p>At query time the system embeds the user question (sometimes rewritten), searches the index, and returns top-k chunks. Improvements include:</p>
+  <section id="ingestion">
+    <h2>3. Ingestion and Chunking</h2>
+    <p>Documents flow through: <strong>parsing</strong> (PDF, HTML, DOCX, tickets into plain text, keeping headings), <strong>cleaning</strong> (remove menus, footers, duplicates), <strong>chunking</strong>, attaching <strong>metadata</strong> (title, URL, section, date, who may see it), <strong>embedding</strong>, and <strong>indexing</strong>.</p>
+    <h3>Why chunk at all?</h3>
     <ul>
-      <li><strong>Query rewriting</strong> - HyDE, multi-query expansion, or LLM-generated sub-questions</li>
-      <li><strong>Hybrid search</strong> - dense plus BM25 fusion</li>
-      <li><strong>Reranking</strong> - cross-encoder or LLM reranker on top 50-100 candidates to refine top 5-10</li>
-      <li><strong>Metadata filters</strong> - scope to user permissions and product area</li>
+      <li>An embedding of a 30-page document is a blurry average of everything in it. A small chunk has a sharp meaning.</li>
+      <li>The prompt has limited room. Small chunks let you include only the relevant parts.</li>
     </ul>
+    <h3>Chunking, seen in a real run</h3>
+    <p>A 30-word help text, split into chunks of 10 words:</p>
+    <pre><code>size=10 overlap=0
+  chunk 0: To reset your password, open Settings and choose Security. Click
+  chunk 1: Reset password. We email you a link. The link expires
+  chunk 2: after 30 minutes. If it expires, request a new one.
+size=10 overlap=3
+  chunk 0: To reset your password, open Settings and choose Security. Click
+  chunk 1: choose Security. Click Reset password. We email you a link.
+  chunk 2: you a link. The link expires after 30 minutes. If
+  chunk 3: 30 minutes. If it expires, request a new one.
+  chunk 4: new one.</code></pre>
+    <p>What to notice:</p>
+    <ul>
+      <li>Without overlap, "The link expires" and "after 30 minutes" landed in different chunks. A question like "how long is the reset link valid?" may now match neither chunk well.</li>
+      <li><strong>Overlap</strong> repeats the last few words of each chunk at the start of the next, so ideas that cross a boundary survive in at least one chunk.</li>
+      <li>Overlap has a cost: more chunks to store and search, and duplicates in results. It also made a useless tail chunk, "new one." Real chunkers merge tiny tails into the previous chunk.</li>
+    </ul>
+    <h3>Better chunking strategies</h3>
+    <table>
+      <thead><tr><th>Strategy</th><th>How</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed size + overlap</td><td>Every N tokens, overlap M</td><td>Quick start, plain text</td></tr>
+        <tr><td>Structure-aware</td><td>Split on headings, paragraphs, list items; never mid-sentence</td><td>Docs, manuals, web pages</td></tr>
+        <tr><td>Parent-child</td><td>Search over small chunks, but send the larger parent section to the LLM</td><td>Precise search plus enough context</td></tr>
+        <tr><td>Semantic</td><td>Start a new chunk where the topic changes (embedding similarity drops)</td><td>Long mixed documents</td></tr>
+      </tbody>
+    </table>
+    <p>Common starting sizes are a few hundred tokens. Measure with your own questions (section 10) instead of trusting any one number.</p>
+  </section>
+
+  <section id="bm25">
+    <h2>4. Keyword Search: BM25 by Hand</h2>
+    <p><strong>BM25</strong> is the classic search-engine scoring formula. It scores a chunk higher when:</p>
+    <ol>
+      <li><strong>The query words appear in it</strong>, more times is better, but with diminishing returns (the 10th mention adds little).</li>
+      <li><strong>The words are rare</strong> across all chunks. Matching "ERR-4012" means much more than matching "page". This is measured by <strong>IDF</strong> (inverse document frequency).</li>
+      <li><strong>The chunk is short.</strong> One match in a short chunk is stronger evidence than one match in a long one.</li>
+    </ol>
+    <p>For a query word \(t\), with \(N\) chunks, of which \(n_t\) contain the word:</p>
+    <p>\[ \text{IDF}(t) = \ln\!\left(\frac{N - n_t + 0.5}{n_t + 0.5} + 1\right) \]</p>
+    <p>\[ \text{score} = \sum_{t \in \text{query}} \text{IDF}(t)\cdot\frac{f_t\,(k_1 + 1)}{f_t + k_1\left(1 - b + b\,\frac{\text{len}}{\text{avglen}}\right)} \]</p>
+    <p>\(f_t\) is how many times the word appears in this chunk. \(k_1\) (usually 1.2 to 2) controls the diminishing returns. \(b\) (usually 0.75) controls the length adjustment. We used \(k_1 = 1.5, b = 0.75\).</p>
+    <h3>Worked IDF numbers from our experiment</h3>
+    <p>Our corpus has \(N = 12\) chunks (listed in section 6).</p>
+    <ul>
+      <li>"err-4012" is in 1 chunk: \(\ln(11.5/1.5 + 1) = \ln(8.667) = 2.159\).</li>
+      <li>"billing" is in 2 chunks: IDF = 1.649.</li>
+      <li>"api" is in 3 chunks: \(\ln(9.5/3.5 + 1) = \ln(3.714) = 1.312\).</li>
+    </ul>
+    <p>Rarer word, bigger weight. That is exactly what you want for error codes, product names, and IDs.</p>
     <div class="callout">
-      <strong>Bottleneck insight:</strong> Most RAG failures are retrieval failures, not generation failures. Invest in eval for recall before tuning prompts.
+      <strong>Big weakness:</strong> BM25 only matches the same words. "I forgot my login credentials" shares no word with "To reset your password..." so BM25 scores it 0.
     </div>
   </section>
 
-  <section>
-    <h2>Generation Stage</h2>
-    <p>Retrieved chunks are packed into the context window with clear delimiters and citation instructions. The system prompt should require grounding: answer only from provided context, cite sources, and refuse when context is insufficient.</p>
-    <pre><code>from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-
-vectorstore = Chroma.from_documents(chunks, OpenAIEmbeddings())
-qa = RetrievalQA.from_chain_type(
-    llm=ChatOpenAI(model="gpt-4o-mini", temperature=0),
-    retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
-    return_source_documents=True,
-)
-result = qa.invoke({"query": user_question})</code></pre>
-    <p>Context packing must respect token limits. Prioritize highest rerank scores, deduplicate near-identical chunks, and optionally summarize long passages before injection. Lost-in-the-middle phenomenon means models may underweight context placed in the center of very long prompts; put critical chunks near the start or end.</p>
+  <section id="dense">
+    <h2>5. Meaning Search: Dense Embeddings</h2>
+    <p>An embedding model turns each chunk into a vector (we used <code>all-MiniLM-L6-v2</code>, which makes 384 numbers per text). The question is embedded the same way. The score is the <strong>cosine similarity</strong>: how closely the two vectors point in the same direction, from -1 to 1, higher is more similar.</p>
+    <p>Because the model was trained on many pairs of related texts, "forgot my login credentials" and "reset your password" end up close together even with no shared words. This is called <strong>dense retrieval</strong> (dense because every one of the 384 numbers is used, unlike a keyword index where most entries are zero).</p>
+    <p>Weakness: exact strings. Codes like ERR-4012 and ERR-4013 look almost the same to an embedding model, even though they mean different things. At scale, a <a href="ai-engineering-vector-databases.html">vector database</a> finds the nearest vectors quickly with approximate search.</p>
   </section>
 
-  <section>
-    <h2>Advanced Patterns</h2>
-    <h3>Agentic RAG</h3>
-    <p>The LLM decides when to retrieve, which tools to call, or whether to decompose questions into sub-queries iteratively.</p>
-    <h3>Graph RAG</h3>
-    <p>Knowledge graphs link entities across documents for multi-hop reasoning when flat chunk retrieval misses connections.</p>
-    <h3>Corrective RAG (CRAG)</h3>
-    <p>A grader scores retrieved relevance and triggers re-retrieval or web fallback when chunks are off-topic.</p>
+  <section id="experiment">
+    <h2>6. A Real Experiment: 12 Documents, 10 Questions</h2>
+    <p>We wrote 12 short help-centre chunks for a made-up app, and 10 user questions, each with one correct chunk (the "gold" answer). Some questions use different words from the docs (paraphrases), some contain exact codes.</p>
+    <table>
+      <thead><tr><th>ID</th><th>Chunk (shortened)</th></tr></thead>
+      <tbody>
+        <tr><td>D1</td><td>To reset your password, open Settings, choose Security, and click Reset password...</td></tr>
+        <tr><td>D2</td><td>Invoices are created on the first day of each month... download past invoices...</td></tr>
+        <tr><td>D3</td><td>Error ERR-4012 means your API key has expired...</td></tr>
+        <tr><td>D4</td><td>You can cancel your subscription at any time from the Billing page...</td></tr>
+        <tr><td>D5</td><td>Two-factor authentication adds a second step when you sign in...</td></tr>
+        <tr><td>D6</td><td>The free plan allows 1,000 API requests per day...</td></tr>
+        <tr><td>D7</td><td>If you exceed the request limit, the API returns status 429...</td></tr>
+        <tr><td>D8</td><td>To delete your account permanently, contact support...</td></tr>
+        <tr><td>D9</td><td>Refunds are given within 14 days of a charge if the service was not used.</td></tr>
+        <tr><td>D10</td><td>Webhooks send an HTTP POST to your server when an event happens...</td></tr>
+        <tr><td>D11</td><td>Error ERR-4013 means the request body is not valid JSON...</td></tr>
+        <tr><td>D12</td><td>Every response includes an X-Request-Id header...</td></tr>
+      </tbody>
+    </table>
+    <h3>Results: rank of the correct chunk (1 is best, "none" means not found)</h3>
+    <table>
+      <thead><tr><th>Question</th><th>Gold</th><th>BM25</th><th>Dense</th><th>Hybrid (RRF)</th></tr></thead>
+      <tbody>
+        <tr><td>I forgot my login credentials, how do I get back in?</td><td>D1</td><td>none</td><td>1</td><td>1</td></tr>
+        <tr><td>what does ERR-4012 mean</td><td>D3</td><td>1</td><td>1</td><td>1</td></tr>
+        <tr><td>how do I stop paying for the service</td><td>D4</td><td>none (found D9)</td><td>1</td><td>2</td></tr>
+        <tr><td>getting 429 too many requests</td><td>D7</td><td>1</td><td>1</td><td>1</td></tr>
+        <tr><td>can I get my money back</td><td>D9</td><td>none</td><td>1</td><td>1</td></tr>
+        <tr><td>enable 2FA</td><td>D5</td><td>none</td><td>1</td><td>1</td></tr>
+        <tr><td>where are my monthly bills</td><td>D2</td><td>none</td><td>1</td><td>1</td></tr>
+        <tr><td>remove my account forever</td><td>D8</td><td>1</td><td>1</td><td>1</td></tr>
+        <tr><td>ERR-4013</td><td>D11</td><td>1</td><td>1</td><td>1</td></tr>
+        <tr><td>X-Request-Id</td><td>D12</td><td>1</td><td>1</td><td>1</td></tr>
+      </tbody>
+    </table>
+    <h3>What we learn</h3>
+    <ul>
+      <li><strong>BM25 found nothing at all for 4 of 10 questions, and the wrong chunk for a fifth</strong>. Users said "bills" and the doc said "invoices", "2FA" versus "Two-factor authentication", and so on. For "stop paying for the service" it matched the word "service" in the refund chunk and returned the wrong answer.</li>
+      <li><strong>Dense search ranked every gold chunk first</strong> on this small, paraphrase-heavy set.</li>
+      <li><strong>But look at the margins.</strong> For "ERR-4013", dense gave the right chunk D11 a similarity of 0.583 and the wrong one, D3 (ERR-4012), 0.545. Very close. BM25 matched D11 only, because "err-4013" is a different word from "err-4012". With thousands of error codes, that thin margin becomes wrong answers.</li>
+      <li>This is a tiny test made to teach. On real data, which method wins depends on how your users write. Measure on your own questions.</li>
+    </ul>
+    <h3>The code</h3>
+    <pre><code>import math, re
+from sentence_transformers import SentenceTransformer   # sentence-transformers 6.3.0
+
+tok = lambda s: re.findall(r"[a-z0-9]+(?:-[0-9]+)?", s.lower())
+STOP = set("a an the to of and or is in on at your you my i do how what can it "
+           "for from as if be this are with get by".split())
+ids = list(docs)                                   # docs = {"D1": "...", ...}
+toks = {d: [t for t in tok(docs[d]) if t not in STOP] for d in ids}
+N = len(ids); avgdl = sum(map(len, toks.values())) / N
+df = {}
+for words in toks.values():
+    for t in set(words): df[t] = df.get(t, 0) + 1
+idf = lambda t: math.log((N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1)
+
+def bm25(q, k1=1.5, b=0.75):
+    qt = [t for t in tok(q) if t not in STOP]
+    out = {}
+    for d in ids:
+        s = 0.0
+        for t in qt:
+            f = toks[d].count(t)
+            if f:
+                s += idf(t) * f * (k1 + 1) / (f + k1 * (1 - b + b * len(toks[d]) / avgdl))
+        out[d] = s
+    return out
+
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+E = model.encode([docs[d] for d in ids], normalize_embeddings=True)
+def dense(q):
+    v = model.encode([q], normalize_embeddings=True)[0]
+    return dict(zip(ids, (E @ v).tolist()))      # cosine similarity
+
+def ranking(scores):                             # drop chunks with no match at all
+    return [d for d in sorted(ids, key=lambda d: -scores[d]) if scores[d] &gt; 0]</code></pre>
   </section>
 
-  <section>
-    <h2>Evaluation and Operations</h2>
-    <p>Measure retrieval (recall@k, MRR) and end-to-end answer quality (faithfulness, citation accuracy) separately. Log retrieved chunk IDs with each response for debugging user reports. Refresh pipelines on schedule and on document change events. Version embedding models and indexes together to avoid mixed-vector search.</p>
-    <p>Cost control: cache embeddings for static corpora, limit k and reranker calls, and route simple queries to smaller models when retrieval confidence is high.</p>
+  <section id="hybrid">
+    <h2>7. Hybrid Search and Reciprocal Rank Fusion</h2>
+    <p>Keyword and dense search fail in different ways, so production systems often run both and merge the lists. This is <strong>hybrid search</strong>. The scores are on different scales (BM25 6.4 versus cosine 0.67), so instead of adding scores, a simple and popular method merges <em>ranks</em>: <strong>Reciprocal Rank Fusion (RRF)</strong>.</p>
+    <p>\[ \text{RRF}(d) = \sum_{\text{each list}} \frac{1}{k + \text{rank of } d \text{ in that list}} \qquad (k = 60 \text{ is the usual choice}) \]</p>
+    <pre><code>def rrf(rankings, k=60):
+    out = {d: 0.0 for d in ids}
+    for r in rankings:
+        for i, d in enumerate(r):
+            out[d] += 1 / (k + i + 1)
+    return out</code></pre>
+    <h3>Worked example: where hybrid went wrong</h3>
+    <p>Question: "how do I stop paying for the service". Correct chunk: D4.</p>
+    <ul>
+      <li>BM25 list: [D9] (it matched "service").</li>
+      <li>Dense list: [D4, D9, D6, ...].</li>
+    </ul>
+    <table>
+      <thead><tr><th>Chunk</th><th>From BM25</th><th>From dense</th><th>RRF total</th></tr></thead>
+      <tbody>
+        <tr><td>D9</td><td>1/(60+1) = 0.016393</td><td>1/(60+2) = 0.016129</td><td><strong>0.032522</strong></td></tr>
+        <tr><td>D4</td><td>not in list: 0</td><td>1/(60+1) = 0.016393</td><td>0.016393</td></tr>
+        <tr><td>D6</td><td>0</td><td>1/(60+3) = 0.015873</td><td>0.015873</td></tr>
+      </tbody>
+    </table>
+    <p>D9 appears in both lists, so it wins, even though it is the wrong answer. Over the 10 questions, hybrid was in between: recall@1 was 0.9 (BM25 0.5, dense 1.0). The right answer was still in hybrid's top 3 every time, which is why the next stage, reranking, exists.</p>
+    <div class="callout">
+      <strong>Lesson:</strong> hybrid search is mainly a <em>recall</em> tool: it makes sure the right chunk is somewhere in the candidate list. Ordering the list well is the reranker's job.
+    </div>
+  </section>
+
+  <section id="rerank">
+    <h2>8. Reranking with a Cross-Encoder</h2>
+    <p>The embedding model encodes the question and each chunk <em>separately</em>, so it is fast enough to search millions of chunks. A <strong>cross-encoder</strong> reads the question and one chunk <em>together</em> and outputs a relevance score. It is more accurate but much slower, so it is only used on the top 20 to 100 candidates.</p>
+    <p>We ran the open <code>cross-encoder/ms-marco-MiniLM-L-6-v2</code> model on five candidates per question: hybrid search's top 3 plus two other chunks (scores are raw model outputs; only the order matters):</p>
+    <pre><code>how do I stop paying for the service
+  D4: -2.505      &lt;- correct chunk, now first
+  D9: -5.804
+  D6: -10.542
+  D8: -10.705
+  D1: -11.260
+can I get my money back
+  D8: -10.279
+  D4: -10.367
+  D9: -10.676     &lt;- correct chunk, pushed down to third
+  D2: -11.109
+  D6: -11.324</code></pre>
+    <ul>
+      <li>For the first question the reranker fixed the hybrid mistake: D4 is now first by a wide margin.</li>
+      <li>For the second, it made things <em>worse</em>: dense and hybrid had D9 first, the reranker put it third. All five scores are very low and close together, which means the model is unsure. This reranker was trained on web search queries (the MS MARCO dataset), not casual support questions.</li>
+    </ul>
+    <p>So rerankers usually help, but not always. Test them on your data, and consider a reranker trained on data like yours.</p>
+    <pre><code>from sentence_transformers import CrossEncoder
+ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+scores = ce.predict([(question, docs[d]) for d in candidates])</code></pre>
+  </section>
+
+  <section id="generation">
+    <h2>9. Generation: Grounded Prompts</h2>
+    <p>The retrieved chunks go into the prompt with clear labels, and the instructions require the model to stay grounded:</p>
+    <pre><code>SYSTEM:
+You are a support assistant. Answer ONLY from the sources below.
+Cite the source ID in brackets after each fact, like [D4].
+If the sources do not contain the answer, say "I don't know based on our docs."
+
+SOURCES:
+[D4] You can cancel your subscription at any time from the Billing page.
+     Access continues until the end of the paid period.
+[D9] Refunds are given within 14 days of a charge if the service was not used.
+
+USER:
+how do I stop paying for the service</code></pre>
+    <p>Guidelines:</p>
+    <ul>
+      <li><strong>Fit the context budget.</strong> Put the highest-ranked chunks first, remove near-duplicates.</li>
+      <li><strong>Mind the middle.</strong> Research found that models use information at the start and end of a long context better than information in the middle ("lost in the middle"). Do not bury the best chunk in the middle of 30 others.</li>
+      <li><strong>Allow "I don't know".</strong> Without it, the model fills gaps by guessing.</li>
+      <li><strong>Filter by permissions before retrieval</strong>, not after. Never let a user's question pull in documents they are not allowed to see.</li>
+    </ul>
+  </section>
+
+  <section id="evaluation">
+    <h2>10. Measuring RAG</h2>
+    <p>Measure the two halves separately. If you only measure the final answer, you cannot tell whether search or the LLM failed.</p>
+    <h3>Retrieval metrics</h3>
+    <ul>
+      <li><strong>Recall@k:</strong> share of questions where the correct chunk is in the top k. Our results: BM25 recall@3 = 0.5, dense = 1.0, hybrid = 1.0.</li>
+      <li><strong>MRR</strong> (mean reciprocal rank): for each question take 1 / (rank of the correct chunk), or 0 if not found, then average. Rewards putting it near the top. Our results: BM25 0.5, dense 1.0, hybrid 0.95.</li>
+    </ul>
+    <p><strong>Check hybrid's MRR by hand:</strong> nine questions at rank 1 give 1 each; one question at rank 2 gives 0.5. (9 + 0.5) / 10 = 0.95.</p>
+    <h3>Answer metrics</h3>
+    <ul>
+      <li><strong>Faithfulness:</strong> is every claim in the answer supported by the retrieved chunks?</li>
+      <li><strong>Answer relevance / correctness:</strong> does it actually answer the question, compared with a reference answer?</li>
+      <li><strong>Citation accuracy:</strong> do the cited chunks really contain the cited facts?</li>
+    </ul>
+    <p>These are usually scored with an LLM judge plus human spot checks. See <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a> for golden sets, judges, and CI gates.</p>
+    <h3>Operations</h3>
+    <ul>
+      <li>Log the retrieved chunk IDs with every answer. When a user reports a bad answer, you can see whether search or generation failed.</li>
+      <li>Version the embedding model and the index together. Mixing vectors from two embedding models in one index silently breaks search.</li>
+      <li>Re-index when documents change, and on a schedule.</li>
+    </ul>
+  </section>
+
+  <section id="advanced">
+    <h2>11. Advanced Patterns</h2>
+    <ul>
+      <li><strong>Query rewriting:</strong> an LLM rewrites a vague question ("it's not working") into a search-friendly one, or splits a complex question into sub-questions. HyDE asks the LLM to write a fake answer first and searches with that.</li>
+      <li><strong>Agentic RAG:</strong> the LLM decides when to search, what to search for, and whether to search again. See <a href="../Agents-and-Protocols/ai-engineering-agents.html">Agents</a>.</li>
+      <li><strong>Graph RAG:</strong> build a knowledge graph of entities and links across documents, for questions that need several hops ("which teams use the service that failed yesterday?").</li>
+      <li><strong>Corrective RAG (CRAG):</strong> a grader checks whether the retrieved chunks are relevant; if not, it searches again or falls back to another source.</li>
+      <li><strong>Long-context models vs RAG:</strong> even with very long context windows, RAG is still useful for cost, speed, freshness, and permissions. The two are often combined.</li>
+    </ul>
+  </section>
+
+  <section id="scenario">
+    <h2>12. Scenario: "The Bot Says It Does Not Know"</h2>
+    <p><strong>Situation.</strong> Users ask "How long is the password reset link valid?" The bot answers "I don't know based on our docs." But the docs clearly say "The link expires after 30 minutes."</p>
+    <h3>Step 1: split the problem</h3>
+    <p>Open the logged chunk IDs for that answer. Was the correct chunk retrieved?</p>
+    <ul>
+      <li>If <strong>yes</strong>, the problem is generation: prompt, context order, or the model. Go to step 4.</li>
+      <li>If <strong>no</strong>, the problem is retrieval. Continue.</li>
+    </ul>
+    <h3>Step 2: search for the chunk yourself</h3>
+    <p>Find which chunk contains "expires after 30 minutes". You discover the chunker split the sentence: one chunk ends with "The link expires", the next begins "after 30 minutes" (exactly what happened in section 3 without overlap). Neither half matches the question well.</p>
+    <h3>Step 3: fix retrieval</h3>
+    <ol>
+      <li>Switch to sentence- and heading-aware chunking so sentences are never cut.</li>
+      <li>Add overlap.</li>
+      <li>Add the section title to each chunk ("Password reset: ..."), which helps both BM25 and embeddings.</li>
+      <li>Add this question to your eval set, re-index, and check recall@5 went up without hurting other questions.</li>
+    </ol>
+    <h3>Step 4: if retrieval was fine</h3>
+    <ul>
+      <li>Was the chunk cut off by the context budget? Check the final prompt that was sent.</li>
+      <li>Was it buried in the middle of many chunks? Rerank and send fewer.</li>
+      <li>Is the "say I don't know" instruction too strong? Test a softer version on your eval set.</li>
+    </ul>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Tuning prompts when retrieval is the problem.</strong> Check recall@k first. Most RAG failures are retrieval failures.</li>
+      <li><strong>Cutting sentences in half</strong> with naive fixed-size chunks.</li>
+      <li><strong>Dense-only search for codes, IDs, and names.</strong> Add BM25 (hybrid).</li>
+      <li><strong>No eval set.</strong> Without 50 to 200 real questions with known answers, every change is a guess.</li>
+      <li><strong>Stale index.</strong> Docs changed, index did not.</li>
+      <li><strong>Permissions applied after retrieval</strong>, or not at all.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: IDF</h3>
+    <p>A corpus has 100 chunks. "kubernetes" is in 50 of them, "kubelet" in 1. Compute the IDF of each with the formula in section 4.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>kubernetes: ln((100 - 50 + 0.5)/(50 + 0.5) + 1) = ln(1 + 1) = ln 2 = 0.693. kubelet: ln((100 - 1 + 0.5)/(1 + 0.5) + 1) = ln(66.33 + 1) = ln(67.33) = 4.21. A match on "kubelet" counts about 6 times more.</p>
+    </details>
+    <h3>Problem 2: RRF</h3>
+    <p>BM25 returns [A, B, C]. Dense returns [C, A, D]. With k = 60, what is the fused order?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>A: 1/61 + 1/62 = 0.016393 + 0.016129 = 0.032522. C: 1/63 + 1/61 = 0.015873 + 0.016393 = 0.032266. B: 1/62 = 0.016129. D: 1/63 = 0.015873. Order: A, C, B, D.</p>
+    </details>
+    <h3>Problem 3: recall and MRR</h3>
+    <p>For 4 questions, the correct chunk was at rank 1, 3, not found, and 2. Compute recall@1, recall@3, and MRR.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>recall@1 = 1/4 = 0.25. recall@3 = 3/4 = 0.75 (ranks 1, 3, 2). MRR = (1 + 1/3 + 0 + 1/2)/4 = 1.8333/4 = 0.458.</p>
+    </details>
+    <h3>Problem 4: choose the retriever</h3>
+    <p>You are building search over an internal bug tracker. Users mostly paste error messages and ticket IDs like PAY-2231. What retrieval setup would you start with?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Hybrid with strong BM25 weight (exact error strings and IDs are critical), dense search to catch paraphrased descriptions, then a reranker. Keep the tokenizer from splitting "PAY-2231" into meaningless pieces, and build an eval set of real pasted errors to confirm.</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/abs/2005.11401" rel="noopener noreferrer">Original RAG paper (Lewis et al., 2020)</a> &middot; <a href="https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf" rel="noopener noreferrer">The Probabilistic Relevance Framework: BM25 and Beyond (Robertson and Zaragoza)</a> &middot; <a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" rel="noopener noreferrer">Reciprocal Rank Fusion (Cormack et al., 2009)</a> &middot; <a href="https://arxiv.org/abs/2307.03172" rel="noopener noreferrer">Lost in the Middle (Liu et al., 2023)</a> &middot; <a href="https://www.sbert.net/" rel="noopener noreferrer">Sentence Transformers docs</a> &middot; <a href="https://docs.llamaindex.ai/en/stable/understanding/rag/" rel="noopener noreferrer">LlamaIndex RAG guide</a></small></p>
   </section>
 
   <nav class="page-footer-nav">
+    <p>Related: <a href="ai-engineering-embeddings.html">Embeddings</a> &middot; <a href="ai-engineering-vector-databases.html">Vector Databases</a> &middot; <a href="ai-engineering-prompt-compression.html">Prompt Compression</a> &middot; <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a></p>
     <p><a class="interview-link" href="../../interview/Prompting-and-Retrieval/ai-engineering-interview-rag.html">Interview questions on RAG</a></p>
-    <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
   </nav>
 </main>
 <footer>
   <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
 </footer>
-  <script src="../../../assets/site.js"></script>
-  <script src="../../../assets/search.js" defer></script>
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
 </body>
 </html>
-
-

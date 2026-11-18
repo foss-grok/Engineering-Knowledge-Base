@@ -955,3 +955,59 @@ main section[id] {
   line-height: 1.4rem;
   text-align: center;
 }
+
+/* Section link ("#") after learn-page h2 headings (added by assets/site.js) */
+.learn-page .heading-anchor {
+  margin-left: 0.45rem;
+  color: var(--text-muted);
+  font-weight: 400;
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.learn-page h2:hover .heading-anchor,
+.learn-page .heading-anchor:focus-visible {
+  opacity: 1;
+  color: var(--accent);
+}
+
+@media (hover: none) {
+  .learn-page .heading-anchor {
+    opacity: 0.45;
+  }
+}
+
+/* "Back to top" button on long learn pages (added by assets/site.js) */
+.back-to-top {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 50;
+  padding: 0.45rem 0.8rem;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+.back-to-top:hover,
+.back-to-top:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.back-to-top[hidden] {
+  display: none;
+}
+
+@media print {
+  .back-to-top,
+  .learn-page .heading-anchor {
+    display: none;
+  }
+}

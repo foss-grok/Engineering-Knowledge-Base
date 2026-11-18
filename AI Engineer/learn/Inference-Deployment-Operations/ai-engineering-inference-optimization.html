@@ -183,6 +183,7 @@ slot 3:   C    C    C    C    C    F    F       (C done at 5, F joins at 6)</cod
       </tbody>
     </table>
     <p>Quantization sensitivity varies by model size and task. Always evaluate after quantizing; math, code, and strict JSON tasks are often more fragile than open chat. See <a href="ai-engineering-evaluation.html">Evaluation</a>.</p>
+    <p>For how quantization works step by step (scales, outliers, group-wise INT4, GPTQ, AWQ, FP8) with real measured errors, read the <a href="ai-engineering-quantization.html">Quantization Deep Dive</a>.</p>
     <div class="callout">
       <strong>Rule:</strong> quantize weights to fit and speed up the model; quantize the KV cache separately when long contexts make the cache dominate memory.
     </div>

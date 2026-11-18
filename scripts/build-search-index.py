@@ -31,7 +31,7 @@ HUB_PATTERNS = [
 # Extra search keywords for pages whose path matches a pattern.
 KEYWORDS = [
     (r"reinforcement", ["RL", "reinforcement learning", "PPO", "DPO", "GRPO", "policy gradient", "reward"]),
-    (r"rag", ["retrieval", "augmented generation", "RAG"]),
+    (r"-rag\.html$", ["retrieval", "augmented generation", "RAG"]),
     (r"transformer", ["attention", "transformer", "self-attention"]),
     (r"inference-optimization", ["KV cache", "PagedAttention", "vLLM", "continuous batching",
                                  "speculative decoding", "TTFT", "prefill", "decode", "LLM serving"]),
@@ -53,6 +53,15 @@ KEYWORDS = [
     (r"scenario-slow-api", ["scenario", "latency", "p99", "percentile", "Little's law", "connection pool",
                             "RED method", "USE method", "vmstat", "postmortem", "retry storm", "debugging"]),
     (r"gpu-scheduling", ["GPU", "MIG", "DRA", "device plugin", "NVIDIA", "Kueue", "time-slicing"]),
+    (r"-fine-tuning\.html$", ["fine-tuning", "LoRA", "QLoRA", "PEFT", "SFT", "adapters", "instruction tuning"]),
+    (r"classical-ml", ["machine learning", "ML", "linear regression", "logistic regression", "gradient descent",
+                       "overfitting", "cross-validation", "precision", "recall", "F1", "ROC", "AUC",
+                       "confusion matrix", "data leakage", "scikit-learn", "train test split"]),
+    (r"quantization", ["quantization", "INT8", "INT4", "FP8", "BF16", "GPTQ", "AWQ", "SmoothQuant",
+                       "NF4", "GGUF", "llama.cpp", "bitsandbytes", "W4A16", "W8A8"]),
+    (r"devops-cicd-mlops", ["CI/CD", "CI", "CD", "DevOps", "MLOps", "GitHub Actions", "GitOps", "Argo CD",
+                            "canary", "blue-green", "rollback", "model registry", "MLflow", "drift", "PSI",
+                            "KServe", "pipeline"]),
 ]
 
 

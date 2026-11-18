@@ -53,7 +53,7 @@ Open [http://localhost:8080](http://localhost:8080).
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`AI Engineer/ai-engineering.html`](AI%20Engineer/ai-engineering.html) | 1 |
-| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 26 |
+| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 30 |
 | Interview | [`AI Engineer/interview/`](AI%20Engineer/interview/) | 23 |
 | Research | [`AI Engineer/research/`](AI%20Engineer/research/) | 2 |
 
@@ -73,11 +73,12 @@ Operating systems, databases, and computer networks from zero, grouped by subjec
 ```
 Engineering-Knowledge-Base/
 ├── index.html
+├── .github/workflows/site-checks.yml   # CI: fails a PR if the search index is stale or a link is broken
 ├── 404.html               # Custom not-found page (root-relative links; served by the host for missing URLs)
 ├── styles.css
 ├── assets/
 │   ├── logo.svg
-│   ├── site.js              # Path normalization for local browsing, code copy buttons, wide-math fix
+│   ├── site.js              # Path normalization for local browsing, code copy buttons, wide-math fix, section links, back-to-top
 │   ├── search.js            # Fuzzy site search
 │   ├── search-index.js      # Generated index (commit with content changes)
 │   └── search-index.json
@@ -118,6 +119,8 @@ python3 scripts/build-search-index.py
 python3 scripts/check-links.py            # whole site; exits 1 if any internal link or #anchor is broken
 python3 scripts/check-links.py AI\ Engineer   # one folder
 ```
+
+Both checks also run automatically on every pull request (`.github/workflows/site-checks.yml`).
 
 ## Contributing
 

@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Classical ML from Zero | AI Engineering</title>
+  <meta name="description" content="Machine learning basics from zero with real runs: features and labels, linear regression with gradient descent, logistic regression, train/validation/test splits, overfitting, cross-validation, confusion matrix, precision, recall, F1, ROC-AUC, feature scaling, and data leakage, with practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+  <script src="../../../assets/mathjax.js"></script>
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Classical ML</p>
+  </nav>
+  <h1>Classical Machine Learning from Zero</h1>
+  <p>The ideas every model is built on, before neural networks. We train real models, measure them the right way, and catch the mistakes that make good-looking results false. Every number on this page comes from a real run you can repeat.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#what-is-ml">What Machine Learning Is</a></li>
+    <li><a href="#problem-types">Kinds of Problems</a></li>
+    <li><a href="#linear-regression">Linear Regression and Gradient Descent</a></li>
+    <li><a href="#logistic-regression">Logistic Regression: Predicting Yes or No</a></li>
+    <li><a href="#splits">Train, Validation, Test, and Overfitting</a></li>
+    <li><a href="#cross-validation">Cross-Validation</a></li>
+    <li><a href="#metrics">Measuring a Classifier</a></li>
+    <li><a href="#scaling">Feature Scaling</a></li>
+    <li><a href="#leakage">Data Leakage: the Silent Result Killer</a></li>
+    <li><a href="#recipe">The Full Recipe in Code</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="what-is-ml">
+    <h2>1. What Machine Learning Is</h2>
+    <p>In normal programming, you write the rules. In machine learning, you give the computer <strong>examples</strong>, and it finds the rules by itself.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> A child learns what a dog is by seeing many dogs, not by reading a definition. A model learns the same way. It sees many examples with answers, and slowly adjusts itself until its guesses match the answers.
+    </div>
+    <p>A few words you will see everywhere:</p>
+    <table>
+      <thead><tr><th>Word</th><th>Plain meaning</th><th>Example (house prices)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Example</strong> (or sample, row)</td><td>One thing we know about</td><td>One house</td></tr>
+        <tr><td><strong>Feature</strong></td><td>A number that describes the example (an input)</td><td>Size in square metres, number of rooms</td></tr>
+        <tr><td><strong>Label</strong> (or target)</td><td>The answer we want to predict</td><td>The sale price</td></tr>
+        <tr><td><strong>Model</strong></td><td>A formula with adjustable numbers inside</td><td>price = w &times; size + b</td></tr>
+        <tr><td><strong>Parameters</strong> (or weights)</td><td>The adjustable numbers the model learns</td><td>w and b</td></tr>
+        <tr><td><strong>Training</strong></td><td>Adjusting the parameters so predictions match labels</td><td>Finding good w and b</td></tr>
+        <tr><td><strong>Loss</strong></td><td>One number that says how wrong the model is. Lower is better.</td><td>Average squared error in price</td></tr>
+        <tr><td><strong>Inference</strong> (or prediction)</td><td>Using the trained model on new examples</td><td>Pricing a house that is not sold yet</td></tr>
+      </tbody>
+    </table>
+    <p>Neural networks and large language models use the same ideas. They just have far more parameters. See <a href="ai-engineering-foundations.html">Foundations</a> for the neural network version.</p>
+  </section>
+
+  <section id="problem-types">
+    <h2>2. Kinds of Problems</h2>
+    <ul>
+      <li><strong>Regression:</strong> the label is a number. "What will this house sell for?"</li>
+      <li><strong>Classification:</strong> the label is a category. "Is this email spam or not?" "Is this tumour malignant or benign?"</li>
+      <li><strong>Supervised learning:</strong> every training example has a label. Both problems above are supervised.</li>
+      <li><strong>Unsupervised learning:</strong> no labels. The model finds structure by itself, for example grouping customers into clusters.</li>
+    </ul>
+    <p>This page covers supervised learning, because most real work starts there.</p>
+  </section>
+
+  <section id="linear-regression">
+    <h2>3. Linear Regression and Gradient Descent</h2>
+    <h3>3.1 The model</h3>
+    <p>Linear regression draws the best straight line through the data. With one feature \(x\), the model is:</p>
+    <p>\[ \hat{y} = w x + b \]</p>
+    <p>Here \(\hat{y}\) ("y hat") is the prediction, \(w\) is the slope (how much \(\hat{y}\) grows when \(x\) grows by 1), and \(b\) is the bias (the value when \(x = 0\)).</p>
+    <h3>3.2 The loss: mean squared error</h3>
+    <p>For each example, the <strong>error</strong> is prediction minus truth. We square it (so negative and positive errors do not cancel, and big errors count more) and take the average. This is the <strong>mean squared error (MSE)</strong>:</p>
+    <p>\[ L = \frac{1}{n}\sum_{i=1}^{n} (\hat{y}_i - y_i)^2 \]</p>
+    <h3>3.3 Gradient descent, step by step</h3>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> You stand on a foggy hill and want to reach the lowest point. You cannot see far. So you feel which way the ground slopes under your feet, and take a small step downhill. Repeat. The "slope under your feet" is the <strong>gradient</strong>. The step size is the <strong>learning rate</strong>.
+    </div>
+    <p>The gradient tells us how the loss changes when we nudge each parameter. For MSE, calculus gives:</p>
+    <p>\[ \frac{\partial L}{\partial w} = \frac{2}{n}\sum_i (\hat{y}_i - y_i)\,x_i \qquad \frac{\partial L}{\partial b} = \frac{2}{n}\sum_i (\hat{y}_i - y_i) \]</p>
+    <p>Then we move each parameter a little <em>against</em> its gradient (downhill):</p>
+    <p>\[ w \leftarrow w - \eta \frac{\partial L}{\partial w} \qquad b \leftarrow b - \eta \frac{\partial L}{\partial b} \]</p>
+    <p>\(\eta\) ("eta") is the learning rate.</p>
+
+    <h3>3.4 Worked example by hand</h3>
+    <p>Data: four points that lie exactly on the line \(y = 2x + 1\). So we know the right answer is \(w = 2, b = 1\). Let us see if gradient descent finds it.</p>
+    <table>
+      <thead><tr><th>x</th><th>1</th><th>2</th><th>3</th><th>4</th></tr></thead>
+      <tbody><tr><td>y</td><td>3</td><td>5</td><td>7</td><td>9</td></tr></tbody>
+    </table>
+    <p>Start with \(w = 0, b = 0\) and learning rate \(\eta = 0.05\).</p>
+    <ol>
+      <li><strong>Predict.</strong> Every prediction is 0.</li>
+      <li><strong>Errors</strong> (prediction minus truth): \(-3, -5, -7, -9\).</li>
+      <li><strong>Loss:</strong> \((9 + 25 + 49 + 81)/4 = 41\).</li>
+      <li><strong>Gradient for w:</strong> error &times; x gives \(-3, -10, -21, -36\). The mean is \(-17.5\). Times 2 is \(-35\).</li>
+      <li><strong>Gradient for b:</strong> mean error is \(-6\). Times 2 is \(-12\).</li>
+      <li><strong>Update:</strong> \(w = 0 - 0.05 \times (-35) = 1.75\). \(b = 0 - 0.05 \times (-12) = 0.6\).</li>
+    </ol>
+    <p>One step took us from loss 41 to loss 1.1288. Here is the real run of the same loop (code below):</p>
+    <pre><code>step 1: w=0.0000 b=0.0000 loss=41.0000 dw=-35.0000 db=-12.0000
+step 2: w=1.7500 b=0.6000 loss=1.1288 dw=-5.7500 db=-2.0500
+step 3: w=2.0375 b=0.7025 loss=0.0433 dw=-0.9250 db=-0.4075
+step 10: w=2.0851 b=0.7498 loss=0.0105 dw=0.0255 db=-0.0749
+step 100: w=2.0219 b=0.9356 loss=0.0007 dw=0.0066 db=-0.0193
+step 1000: w=2.0000 b=1.0000 loss=0.0000 dw=0.0000 db=-0.0000</code></pre>
+    <pre><code>import numpy as np
+x = np.array([1.0, 2.0, 3.0, 4.0]); y = np.array([3.0, 5.0, 7.0, 9.0])
+w, b, lr = 0.0, 0.0, 0.05
+for step in range(1, 1001):
+    err = (w * x + b) - y
+    loss = (err ** 2).mean()
+    dw = 2 * (err * x).mean()
+    db = 2 * err.mean()
+    w -= lr * dw
+    b -= lr * db
+print(w, b)   # 2.0 1.0 (rounded)</code></pre>
+    <p>Notice: after step 3, \(w\) is already a bit <em>above</em> 2 while \(b\) is still too small. The two parameters trade off, and slowly settle. This "zig-zag then settle" is normal.</p>
+
+    <h3>3.5 The learning rate matters a lot</h3>
+    <p>Same data, 100 steps, three learning rates (real run):</p>
+    <table>
+      <thead><tr><th>Learning rate</th><th>Loss after 100 steps</th><th>What happened</th></tr></thead>
+      <tbody>
+        <tr><td>0.01</td><td>0.0075</td><td>Too careful. Still walking downhill.</td></tr>
+        <tr><td>0.05</td><td>0.00067</td><td>Good.</td></tr>
+        <tr><td>0.2</td><td>2.9 &times; 10<sup>75</sup></td><td>Too big. Each step jumps over the valley and lands higher. The loss explodes (this is called <strong>divergence</strong>).</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Rule:</strong> if your loss goes up or becomes <code>nan</code> (not a number), lower the learning rate first.
+    </div>
+  </section>
+
+  <section id="logistic-regression">
+    <h2>4. Logistic Regression: Predicting Yes or No</h2>
+    <p>For classification we want a <strong>probability</strong> between 0 and 1, not any number. Logistic regression takes the same straight-line score \(z = w \cdot x + b\) and squashes it with the <strong>sigmoid</strong> function:</p>
+    <p>\[ \sigma(z) = \frac{1}{1 + e^{-z}} \]</p>
+    <table>
+      <thead><tr><th>Score z</th><th>-2</th><th>0</th><th>2</th><th>4</th></tr></thead>
+      <tbody><tr><td>\(\sigma(z)\)</td><td>0.1192</td><td>0.5</td><td>0.8808</td><td>0.9820</td></tr></tbody>
+    </table>
+    <p>Big positive score means "very likely yes". Big negative score means "very likely no". Then we pick a <strong>threshold</strong> (often 0.5): above it, predict yes.</p>
+    <h3>Loss: log loss (cross-entropy)</h3>
+    <p>If the true label is 1 and the model says probability \(p\), the loss is \(-\ln p\). If the true label is 0, the loss is \(-\ln(1-p)\).</p>
+    <ul>
+      <li>True label 1, model says 0.9: loss = \(-\ln 0.9 = 0.105\). Small, good.</li>
+      <li>True label 1, model says 0.5: loss = 0.693.</li>
+      <li>True label 1, model says 0.1: loss = 2.303. Confident and wrong is punished hard.</li>
+    </ul>
+    <p>Training uses gradient descent again, just with this loss. Large language models use the same loss to predict the next token, only with many classes instead of two.</p>
+  </section>
+
+  <section id="splits">
+    <h2>5. Train, Validation, Test, and Overfitting</h2>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> If a teacher gives you the exact exam questions to practise, you can score 100% by memorising answers without learning anything. To know if a student really learned, you test on <em>new</em> questions. Models are the same.
+    </div>
+    <p>So we split the data into three parts:</p>
+    <ul>
+      <li><strong>Training set:</strong> the model learns from it.</li>
+      <li><strong>Validation set:</strong> we use it to make choices (which model, which settings). The model never trains on it.</li>
+      <li><strong>Test set:</strong> touched <em>once</em>, at the very end, to report the final score. If you keep checking it and tweaking, it slowly becomes a second validation set and your score becomes too optimistic.</li>
+    </ul>
+    <h3>Overfitting, seen in a real run</h3>
+    <p>We made 30 noisy points from a smooth wave (a sine curve plus random noise, fixed random seed). We trained polynomial curves of different <strong>degree</strong> (degree 1 is a straight line, higher degrees can bend more) on 20 points and checked the other 10:</p>
+    <table>
+      <thead><tr><th>Degree</th><th>Train error (MSE)</th><th>Validation error (MSE)</th><th>Diagnosis</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0.2140</td><td>0.2378</td><td><strong>Underfitting:</strong> a straight line cannot follow a wave. Both errors high.</td></tr>
+        <tr><td>3</td><td>0.0274</td><td>0.0332</td><td>Good fit. Both low and close.</td></tr>
+        <tr><td>9</td><td>0.0166</td><td>0.0653</td><td>Starting to memorise noise. Train better, validation worse.</td></tr>
+        <tr><td>15</td><td>0.0071</td><td>3.3761</td><td><strong>Overfitting:</strong> nearly perfect on training data, terrible on new data.</td></tr>
+      </tbody>
+    </table>
+<pre><code>error
+  ^
+  |  \                                  /  validation error
+  |   \                               /
+  |    \                           _/
+  |     \__                   ___/
+  |        \___          ____/
+  |            \________/   &lt;-- best: lowest validation error
+  |   \__
+  |      \____
+  |           \_______
+  |                   \____________   training error
+  +-------------------------------------&gt; model complexity
+     underfit       just right      overfit</code></pre>
+    <p><strong>How to read it:</strong> training error almost always goes down as the model gets more flexible. Validation error goes down, then up. Pick the point where validation error is lowest. For more theory see the bias-variance section of <a href="ai-engineering-foundations.html">Foundations</a>.</p>
+  </section>
+
+  <section id="cross-validation">
+    <h2>6. Cross-Validation</h2>
+    <p>With little data, one validation split is noisy: you might get lucky or unlucky. <strong>k-fold cross-validation</strong> fixes this. Split the training data into k equal parts (folds). Train k times. Each time, hold out a different fold for validation. Average the k scores.</p>
+<pre><code>5-fold cross-validation (V = validation fold, T = train)
+round 1:  V T T T T
+round 2:  T V T T T
+round 3:  T T V T T
+round 4:  T T T V T
+round 5:  T T T T V   -&gt; report mean and spread of the 5 scores</code></pre>
+    <p>Real run on the breast cancer dataset (details in the next section), 5 folds of the 426 training rows:</p>
+    <pre><code>5-fold CV [0.9767 0.9765 0.9765 0.9882 0.9647] mean 0.9765 std 0.0074</code></pre>
+    <p>The spread (standard deviation 0.0074) tells you how much the score moves just from which rows land in which fold. Differences between two models smaller than this are probably noise.</p>
+  </section>
+
+  <section id="metrics">
+    <h2>7. Measuring a Classifier</h2>
+    <h3>7.1 The dataset</h3>
+    <p>We use the Wisconsin breast cancer dataset that ships with scikit-learn: 569 tumours, 30 measured features each (radius, texture, area, and so on), 212 malignant and 357 benign. We call <strong>malignant the positive class</strong>, because that is the case we must not miss. We keep 25% (143 rows, 53 malignant) as a test set and train logistic regression on the rest.</p>
+    <h3>7.2 Accuracy can lie</h3>
+    <p>A "model" that always says benign gets <strong>62.94%</strong> accuracy on this test set (real run), while catching zero cancers. When one class is more common, accuracy alone is misleading. This is called <strong>class imbalance</strong>.</p>
+    <h3>7.3 The confusion matrix</h3>
+    <p>Count the four possible outcomes:</p>
+    <table>
+      <thead><tr><th></th><th>Predicted positive</th><th>Predicted negative</th></tr></thead>
+      <tbody>
+        <tr><th>Actually positive</th><td><strong>TP</strong> (true positive): caught it</td><td><strong>FN</strong> (false negative): missed it</td></tr>
+        <tr><th>Actually negative</th><td><strong>FP</strong> (false positive): false alarm</td><td><strong>TN</strong> (true negative): correctly ignored</td></tr>
+      </tbody>
+    </table>
+    <p>From these four counts:</p>
+    <ul>
+      <li><strong>Precision</strong> = TP / (TP + FP). "When the model says positive, how often is it right?"</li>
+      <li><strong>Recall</strong> = TP / (TP + FN). "Of all real positives, how many did we catch?"</li>
+      <li><strong>F1</strong> = 2 &times; precision &times; recall / (precision + recall). One number that is high only when both are high.</li>
+    </ul>
+    <h3>7.4 Real results, and the threshold trade-off</h3>
+    <p>The model outputs a probability. Changing the threshold moves the balance between misses and false alarms (real run on the 143 test rows):</p>
+    <table>
+      <thead><tr><th>Threshold</th><th>TP</th><th>FP</th><th>FN</th><th>TN</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th></tr></thead>
+      <tbody>
+        <tr><td>0.5</td><td>49</td><td>1</td><td>4</td><td>89</td><td>0.9650</td><td>0.9800</td><td>0.9245</td><td>0.9515</td></tr>
+        <tr><td>0.3</td><td>51</td><td>1</td><td>2</td><td>89</td><td>0.9790</td><td>0.9808</td><td>0.9623</td><td>0.9714</td></tr>
+        <tr><td>0.1</td><td>52</td><td>6</td><td>1</td><td>84</td><td>0.9510</td><td>0.8966</td><td>0.9811</td><td>0.9369</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Check one row by hand</strong> (threshold 0.5): precision = 49 / (49 + 1) = 0.98. Recall = 49 / (49 + 4) = 0.9245. F1 = 2 &times; 49 / (2 &times; 49 + 1 + 4) = 98 / 103 = 0.9515.</p>
+    <p>Lowering the threshold catches more cancers (recall up) but raises more false alarms (precision down). Which is right depends on the cost of each mistake. For a screening test, a miss is far worse than a false alarm, so a low threshold is reasonable. For a spam filter, a false alarm (losing a real email) is the worse mistake.</p>
+    <div class="callout">
+      <strong>Careful:</strong> we picked thresholds while looking at the test set here, only to teach. In a real project, choose the threshold on the validation set, then report the test score once.
+    </div>
+    <h3>7.5 ROC-AUC: one number for all thresholds</h3>
+    <p>The <strong>ROC curve</strong> plots recall (also called the true positive rate) against the false positive rate, FP / (FP + TN), for every possible threshold. <strong>AUC</strong> is the area under that curve. It has a simple meaning: pick one random positive and one random negative example; AUC is the chance the model gives the positive one a higher score. 0.5 is coin-flipping, 1.0 is perfect. Our model's test AUC is <strong>0.9962</strong>.</p>
+  </section>
+
+  <section id="scaling">
+    <h2>8. Feature Scaling</h2>
+    <p>In this dataset, "mean area" is in the hundreds or thousands, while "mean smoothness" is around 0.1. Gradient descent then struggles: one direction of the hill is steep and another is almost flat, so steps that suit one direction are wrong for the other.</p>
+    <p><strong>Standardisation</strong> fixes this. For each feature, subtract its mean and divide by its standard deviation, so every feature has mean 0 and spread 1:</p>
+    <p>\[ x' = \frac{x - \text{mean}}{\text{std}} \]</p>
+    <p>Real run, same split: without scaling, logistic regression hit its limit of 100 optimisation steps without finishing (scikit-learn warns about this) and scored 0.9441 test accuracy. With scaling it finished and scored 0.9650.</p>
+    <div class="callout">
+      <strong>Important:</strong> compute the mean and std on the <em>training</em> data only, then apply the same numbers to validation and test data. A scikit-learn <code>Pipeline</code> does this for you.
+    </div>
+  </section>
+
+  <section id="leakage">
+    <h2>9. Data Leakage: the Silent Result Killer</h2>
+    <p><strong>Data leakage</strong> means information from the validation or test data sneaks into training. Scores look great, then the model fails in real use.</p>
+    <h3>A real experiment with pure noise</h3>
+    <p>We made 100 rows of 5,000 <em>random</em> features, and random 0/1 labels. There is nothing to learn, so honest accuracy should be about 50%.</p>
+    <ul>
+      <li><strong>Wrong way:</strong> pick the 20 features most related to the label using <em>all</em> 100 rows, then run 5-fold cross-validation. Result: <strong>0.91</strong> accuracy.</li>
+      <li><strong>Right way:</strong> put feature selection <em>inside</em> the cross-validation, so each fold picks features using only its own training rows. Result: <strong>0.47</strong> accuracy.</li>
+    </ul>
+    <p>Why? With 5,000 random features, some will match the labels by pure chance. Picking them while looking at the validation rows means the validation rows already "voted" for those features.</p>
+    <p>Other common leaks:</p>
+    <ul>
+      <li>Scaling or filling missing values using statistics from all data before splitting.</li>
+      <li>Features that are only known after the event, such as "refund issued" when predicting "will the customer complain".</li>
+      <li>The same person, patient, or document in both train and test (split by group, not by row).</li>
+      <li>Time series split randomly, so the model trains on the future and is tested on the past. Split by time instead.</li>
+    </ul>
+  </section>
+
+  <section id="recipe">
+    <h2>10. The Full Recipe in Code</h2>
+    <p>This is the code that produced the numbers above (scikit-learn 1.9.1, NumPy 2.5.5):</p>
+    <pre><code>import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, roc_auc_score
+
+data = load_breast_cancer()
+X, y = data.data, 1 - data.target          # make malignant = 1 (positive)
+
+# 1. split once, keep the test set locked away
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X, y, test_size=0.25, random_state=42, stratify=y)   # stratify keeps class ratio
+
+# 2. pipeline = scaling + model, so scaling is learned from training folds only
+model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+
+# 3. compare choices with cross-validation on the training set
+print(cross_val_score(model, X_tr, y_tr, cv=5).mean())
+
+# 4. train on all training data, evaluate once on the test set
+model.fit(X_tr, y_tr)
+p = model.predict_proba(X_te)[:, 1]          # probability of malignant
+pred = (p &gt;= 0.5).astype(int)
+print(confusion_matrix(y_te, pred).ravel())  # tn, fp, fn, tp
+print(precision_score(y_te, pred), recall_score(y_te, pred), roc_auc_score(y_te, p))</code></pre>
+    <ol>
+      <li>Look at the data first: sizes, class counts, missing values.</li>
+      <li>Split. Lock the test set away.</li>
+      <li>Build a simple baseline (always predict the common class, or a plain linear model).</li>
+      <li>Choose metrics that match the real cost of mistakes.</li>
+      <li>Try improvements, compare with cross-validation.</li>
+      <li>Pick the threshold on validation data.</li>
+      <li>Report the test score once.</li>
+    </ol>
+  </section>
+
+  <section id="pitfalls">
+    <h2>11. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Reporting accuracy on imbalanced data.</strong> Always show the confusion matrix, precision, and recall.</li>
+      <li><strong>Tuning on the test set.</strong> Your reported number becomes too good to be true.</li>
+      <li><strong>Preprocessing before splitting.</strong> Causes leakage. Use pipelines.</li>
+      <li><strong>Ignoring convergence warnings.</strong> The model did not finish training. Scale features or raise the step limit.</li>
+      <li><strong>Trusting tiny differences.</strong> A 0.3% gain is noise if cross-validation scores move by 0.7%.</li>
+      <li><strong>Skipping the baseline.</strong> Without it you cannot tell if 90% is good or bad.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>12. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: one gradient step</h3>
+    <p>Data: x = [1, 2], y = [2, 4]. Start at w = 0, b = 0, learning rate 0.1. What are w and b after one step?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Predictions are 0, 0. Errors are -2, -4. Gradient for w = 2 &times; mean(-2 &times; 1, -4 &times; 2) = 2 &times; mean(-2, -8) = 2 &times; (-5) = -10. Gradient for b = 2 &times; mean(-2, -4) = -6. New w = 0 - 0.1 &times; (-10) = 1.0. New b = 0 - 0.1 &times; (-6) = 0.6.</p>
+    </details>
+    <h3>Problem 2: precision and recall</h3>
+    <p>A fraud model flags 40 transactions. 30 are really fraud. There were 50 frauds in total. Find precision, recall, and F1.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>TP = 30, FP = 40 - 30 = 10, FN = 50 - 30 = 20. Precision = 30/40 = 0.75. Recall = 30/50 = 0.60. F1 = 2 &times; 0.75 &times; 0.60 / (0.75 + 0.60) = 0.9 / 1.35 = 0.667.</p>
+    </details>
+    <h3>Problem 3: diagnose the curve</h3>
+    <p>Training accuracy is 99%. Validation accuracy is 71%. What is happening, and name two fixes.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Overfitting: the model memorised the training data. Fixes: a simpler model (fewer features, lower degree), stronger regularisation (a penalty on large weights), or more training data.</p>
+    </details>
+    <h3>Problem 4: spot the leak</h3>
+    <p>To predict whether a hospital patient will be readmitted, a team uses the feature "number of days in the follow-up ward". Their validation score is excellent. What is wrong?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Days in the follow-up ward are only known after the patient comes back, which is the thing being predicted. The feature leaks the answer. At prediction time it does not exist, so the model will fail in practice. Only use features available at the moment you make the prediction.</p>
+    </details>
+    <h3>Problem 5: pick the metric</h3>
+    <p>You build a model that decides which support tickets to escalate to a senior engineer. Senior time is expensive, and a wrongly escalated ticket wastes an hour. A missed urgent ticket is fixed the next day by the normal queue. Which metric should you watch most?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Precision. False positives (wrong escalations) are the costly mistake, so you want "when we escalate, we are right" to be high. Keep a reasonable recall floor so urgent tickets are not all missed.</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://scikit-learn.org/stable/modules/cross_validation.html" rel="noopener noreferrer">scikit-learn: Cross-validation</a> &middot; <a href="https://scikit-learn.org/stable/modules/model_evaluation.html" rel="noopener noreferrer">scikit-learn: Metrics and scoring</a> &middot; <a href="https://scikit-learn.org/stable/common_pitfalls.html" rel="noopener noreferrer">scikit-learn: Common pitfalls (leakage)</a> &middot; <a href="https://archive.ics.uci.edu/dataset/17/breast+cancer+wisconsin+diagnostic" rel="noopener noreferrer">UCI: Breast Cancer Wisconsin (Diagnostic) dataset</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Next: <a href="ai-engineering-foundations.html">Foundations (neural networks)</a> &middot; Related: <a href="../Inference-Deployment-Operations/ai-engineering-metrics.html">Metrics</a> &middot; <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a> &middot; <a href="../../../Docker-Kubernetes/learn/DevOps/devops-cicd-mlops.html#scenario">Scenario: a model that quietly got worse</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

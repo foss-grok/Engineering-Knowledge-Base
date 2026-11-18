@@ -1,0 +1,31 @@
+name: site-checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Search index is up to date
+        run: |
+          python3 scripts/build-search-index.py
+          if ! git diff --quiet -- assets/search-index.json assets/search-index.js; then
+            echo "::error::Search index is stale. Run: python3 scripts/build-search-index.py and commit the result."
+            git diff --stat -- assets/search-index.json assets/search-index.js
+            exit 1
+          fi
+
+      - name: Internal links and #anchors resolve
+        run: python3 scripts/check-links.py
