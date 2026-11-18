@@ -195,3 +195,59 @@
     window.addEventListener('load', whenTypeset);
   }
 })();
+
+// Learn pages: a "#" link next to each section heading (so a reader can copy a
+// direct link to that section), and a "Back to top" button on long pages.
+(function () {
+  'use strict';
+
+  function addHeadingAnchors() {
+    document.querySelectorAll('.learn-page main section[id] > h2').forEach(function (h) {
+      if (h.querySelector('.heading-anchor')) return;
+      var id = h.parentElement.id;
+      var a = document.createElement('a');
+      a.className = 'heading-anchor';
+      a.href = '#' + id;
+      a.textContent = '#';
+      a.setAttribute('aria-label', 'Link to this section: ' + h.textContent.trim());
+      h.appendChild(a);
+    });
+  }
+
+  function addBackToTop() {
+    if (!document.body.classList.contains('learn-page')) return;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'back-to-top';
+    btn.textContent = '\u2191 Top';
+    btn.setAttribute('aria-label', 'Back to top of page');
+    btn.hidden = true;
+    btn.addEventListener('click', function () {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    document.body.appendChild(btn);
+    var ticking = false;
+    function update() {
+      btn.hidden = window.scrollY < window.innerHeight * 1.5;
+      ticking = false;
+    }
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(update);
+      }
+    }, { passive: true });
+    update();
+  }
+
+  function init() {
+    addHeadingAnchors();
+    addBackToTop();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();

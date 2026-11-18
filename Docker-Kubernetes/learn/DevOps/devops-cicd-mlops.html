@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>CI/CD and MLOps on Kubernetes | Docker &amp; Kubernetes</title>
+  <meta name="description" content="CI/CD and MLOps from zero: pipelines, GitHub Actions, building and tagging images, GitOps with Argo CD, rolling, blue-green and canary releases, rollbacks, pipeline secrets, data and model versioning, model registries, model quality gates, drift monitoring with PSI, and a real walkthrough of a model that quietly got worse.">
+  <link rel="stylesheet" href="../../../styles.css">
+  <script src="../../../assets/mathjax.js"></script>
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; CI/CD and MLOps</p>
+  </nav>
+  <h1>CI/CD and MLOps on Kubernetes</h1>
+  <p>How code, and then models, travel from a developer's laptop to production safely and automatically. We build a real pipeline (checked with linters), deploy it the GitOps way, add a model quality gate, and walk through a real drift incident with measured numbers.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Pipelines Exist</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#ci">CI Step by Step: a GitHub Actions Workflow</a></li>
+    <li><a href="#cd">CD: Getting the Image onto Kubernetes</a></li>
+    <li><a href="#releases">Release Strategies and Rollbacks</a></li>
+    <li><a href="#secrets">Secrets and Permissions in Pipelines</a></li>
+    <li><a href="#mlops">What Changes for Machine Learning (MLOps)</a></li>
+    <li><a href="#gate">A Model Quality Gate (Real Run)</a></li>
+    <li><a href="#serving">Serving Models on Kubernetes</a></li>
+    <li><a href="#monitoring">Monitoring Models: Drift and PSI</a></li>
+    <li><a href="#scenario">Scenario: the Model That Quietly Got Worse</a></li>
+    <li><a href="#this-repo">A Real Pipeline: This Site's Own Checks</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Pipelines Exist</h2>
+    <p>Imagine releasing software by hand: someone runs the tests (if they remember), builds the app on their own laptop, copies it to a server, and restarts it. Every step can go wrong, and every release is a little different. People then release rarely, so each release is big and scary.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> A pipeline is a factory assembly line for code. Every change goes through the same stations in the same order: check, test, package, ship. A broken part is stopped at the station that finds it, not discovered by a customer.
+    </div>
+    <p>With a pipeline, releasing becomes boring and safe, so teams release small changes often. Small changes are easier to test and easier to undo.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>CI</strong> (continuous integration)</td><td>Every change is automatically built and tested as soon as it is pushed, so problems are found within minutes.</td></tr>
+        <tr><td><strong>Continuous delivery</strong></td><td>Every change that passes CI is packaged and <em>ready</em> to release. A human presses the button.</td></tr>
+        <tr><td><strong>Continuous deployment</strong></td><td>Every change that passes goes to production automatically, no button.</td></tr>
+        <tr><td><strong>Pipeline</strong></td><td>The ordered list of automated steps.</td></tr>
+        <tr><td><strong>Artifact</strong></td><td>The thing the pipeline produces and ships, for example a container image or a model file.</td></tr>
+        <tr><td><strong>Registry</strong></td><td>A store for artifacts. Container registries hold images (GHCR, Docker Hub, ECR). Model registries hold models.</td></tr>
+        <tr><td><strong>Environment</strong></td><td>A place the app runs: dev, staging (a production copy for final checks), production.</td></tr>
+        <tr><td><strong>GitOps</strong></td><td>Git holds the desired state of the cluster. A tool inside the cluster keeps the cluster matching Git.</td></tr>
+        <tr><td><strong>Rollback</strong></td><td>Going back to the previous working version.</td></tr>
+      </tbody>
+    </table>
+<pre><code>developer pushes code
+      |
+      v
+  +------------- CI -------------+     +----------- CD ------------+
+  | lint -&gt; unit tests -&gt; build  | --&gt; | update deploy repo        |
+  | image -&gt; scan -&gt; push image  |     | -&gt; Argo CD syncs cluster  |
+  +------------------------------+     | -&gt; canary -&gt; full rollout |
+      | any step fails = stop          +---------------------------+
+      v                                         |
+  developer gets a red X on the PR              v
+                                       monitoring, alerts, rollback</code></pre>
+  </section>
+
+  <section id="ci">
+    <h2>3. CI Step by Step: a GitHub Actions Workflow</h2>
+    <p><strong>GitHub Actions</strong> runs pipelines defined in YAML files inside your repository, in the folder <code>.github/workflows/</code>. The parts:</p>
+    <ul>
+      <li><strong>on:</strong> which events start it (a pull request, a push to main, a schedule).</li>
+      <li><strong>jobs:</strong> groups of steps. Jobs run in parallel unless one <code>needs</code> another.</li>
+      <li><strong>runs-on:</strong> the kind of machine (runner) the job uses.</li>
+      <li><strong>steps:</strong> either <code>uses:</code> (a ready-made action, like checking out the code) or <code>run:</code> (a shell command).</li>
+    </ul>
+    <p>Here is a complete workflow for a Python API that also ships a model. It runs tests on every pull request, runs a model quality gate (section 8), and on a push to main builds an image and pushes it to the GitHub container registry:</p>
+    <pre><code>name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: ruff check .
+      - run: pytest -q
+
+  model-gate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python gate.py   # exits 1 if the new model is worse
+
+  build-and-push:
+    needs: [test, model-gate]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}</code></pre>
+    <p>We checked this file with <code>actionlint</code> 1.7.7, a linter for GitHub Actions workflows. Result: no problems found.</p>
+    <h3>Read it line by line</h3>
+    <ul>
+      <li><code>permissions:</code> gives the job's built-in token only what it needs: read the code, write packages. The default can be broader; always narrow it.</li>
+      <li><code>cache: pip</code> reuses downloaded Python packages between runs, so CI is faster.</li>
+      <li><code>needs: [test, model-gate]</code> means the image is only built if tests and the gate pass.</li>
+      <li><code>if: github.event_name == 'push'</code> means pull requests are tested but never pushed to the registry.</li>
+      <li><strong>The image tag is the commit SHA</strong> (<code>${{ github.sha }}</code>), the unique ID of the commit. Never deploy a tag like <code>latest</code>: it changes over time, so you cannot tell what is running or go back to it. A SHA tag always points to exactly one build.</li>
+    </ul>
+    <div class="callout">
+      <strong>Golden rule:</strong> build once, promote the same artifact. The exact image tested in staging is the one that goes to production. Never rebuild for production. See also <a href="../Docker/docker-advanced.html#cicd">Docker in CI/CD</a> for scanning and signing images.
+    </div>
+  </section>
+
+  <section id="cd">
+    <h2>4. CD: Getting the Image onto Kubernetes</h2>
+    <h3>Push style vs pull style</h3>
+    <ul>
+      <li><strong>Push:</strong> the CI job runs <code>kubectl apply</code> or <code>helm upgrade</code> against the cluster. Simple, but CI now holds powerful cluster credentials, and nobody notices if someone changes the cluster by hand.</li>
+      <li><strong>Pull (GitOps):</strong> the desired Kubernetes YAML lives in a Git repository. A controller <em>inside</em> the cluster (Argo CD or Flux) watches that repository and applies changes. CI only needs permission to commit to Git. Every change is a reviewed commit, and rollback is <code>git revert</code>.</li>
+    </ul>
+    <h3>The Kubernetes side</h3>
+    <p>A Deployment and Service for the API. CD changes only one line: the image tag.</p>
+    <pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/acme/shop/api:3f2c1d9   # CD changes only this line
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 8000</code></pre>
+    <p><code>maxUnavailable: 0</code> and <code>maxSurge: 1</code> mean: start one new pod, wait until its readiness probe passes, then remove one old pod, and repeat. Capacity never drops. (Deployments and probes are explained in <a href="../Kubernetes/kubernetes-workloads.html">Workloads</a>.)</p>
+    <h3>The GitOps side: an Argo CD Application</h3>
+    <pre><code>apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/acme/shop-deploy
+    targetRevision: main
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true</code></pre>
+    <ul>
+      <li><code>automated</code>: apply changes as soon as they land in Git.</li>
+      <li><code>selfHeal: true</code>: if someone edits the cluster by hand, Argo CD puts it back to match Git. This is called fixing <strong>drift</strong> (here meaning config drift, not data drift).</li>
+      <li><code>prune: true</code>: delete resources that were removed from Git.</li>
+    </ul>
+    <p>The last CI step then becomes: "change the image tag in the deploy repo and commit". Tools like Argo CD Image Updater or a small script can do this.</p>
+    <p>We validated the manifests in this section and section 5 against the Kubernetes 1.33 API schemas (plus the Argo CD and Argo Rollouts CRD schemas) with <code>kubeconform</code> 0.8.0 in strict mode. Result: <code>4 resources found in 3 files - Valid: 4, Invalid: 0, Errors: 0</code>. As a sanity check we also broke one on purpose (<code>replicas: "ten"</code>), and kubeconform rejected it with <code>got string, want integer</code>.</p>
+  </section>
+
+  <section id="releases">
+    <h2>5. Release Strategies and Rollbacks</h2>
+    <table>
+      <thead><tr><th>Strategy</th><th>How it works</th><th>Good</th><th>Watch out</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Rolling</strong></td><td>Replace pods a few at a time (the Deployment above)</td><td>Built in, no extra capacity</td><td>Old and new versions run side by side for a while, so both must work with the same database and APIs</td></tr>
+        <tr><td><strong>Blue-green</strong></td><td>Run the full new version ("green") next to the old ("blue"), then switch all traffic at once</td><td>Instant switch and instant rollback</td><td>Needs double capacity during the switch</td></tr>
+        <tr><td><strong>Canary</strong></td><td>Send a small share of traffic (say 10%) to the new version, watch metrics, then increase</td><td>A bad release hurts only a few users</td><td>Needs good metrics to judge the canary</td></tr>
+        <tr><td><strong>Feature flags</strong></td><td>Ship the code turned off, switch it on in config</td><td>Separates deploying from releasing</td><td>Old flags pile up; clean them</td></tr>
+      </tbody>
+    </table>
+    <h3>A canary with Argo Rollouts</h3>
+    <pre><code>apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: api
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/acme/shop/api:3f2c1d9
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: {duration: 10m}
+        - setWeight: 50
+        - pause: {duration: 10m}</code></pre>
+    <p>This sends 10% of traffic to the new version, waits 10 minutes, goes to 50%, waits again, then finishes. Argo Rollouts can also run automatic analysis (for example, query Prometheus for the error rate) and abort if the canary looks worse.</p>
+    <h3>Rolling back</h3>
+    <pre><code># plain Deployment: go back to the previous revision
+kubectl rollout undo deployment/api
+kubectl rollout status deployment/api
+
+# GitOps: revert the commit that changed the tag; Argo CD syncs the old tag back
+git revert &lt;commit-sha&gt; &amp;&amp; git push</code></pre>
+    <p>With GitOps, prefer the <code>git revert</code> route. If you only run <code>kubectl rollout undo</code>, Git still says "new version", and self-heal will put the bad version right back.</p>
+  </section>
+
+  <section id="secrets">
+    <h2>6. Secrets and Permissions in Pipelines</h2>
+    <ul>
+      <li><strong>Never put passwords or keys in the workflow file or the repo.</strong> Use the CI system's secret store (in GitHub: repository or environment secrets).</li>
+      <li><strong>Prefer short-lived credentials.</strong> GitHub Actions can prove its identity to AWS, Google Cloud, or Azure with <strong>OIDC</strong> (a standard way to issue short-lived identity tokens). The cloud gives the job a token valid for minutes, so there is no long-lived key to leak.</li>
+      <li><strong>Least privilege:</strong> set <code>permissions:</code> in every workflow, and give deploy jobs access only to their own environment.</li>
+      <li><strong>Protect production:</strong> GitHub environments can require a reviewer's approval before a job that deploys to production runs.</li>
+      <li><strong>Pin third-party actions</strong> to a version tag or, safer, a full commit SHA, so a hijacked action cannot change under you.</li>
+      <li><strong>Pull request code from forks</strong> does not get your secrets by default. Keep it that way.</li>
+    </ul>
+  </section>
+
+  <section id="mlops">
+    <h2>7. What Changes for Machine Learning (MLOps)</h2>
+    <p>A normal app's behaviour is set by its <strong>code</strong>. An ML system's behaviour is set by <strong>code + data + trained model</strong>. Any of the three can change and break things. <strong>MLOps</strong> is CI/CD extended to cover data and models.</p>
+<pre><code>         code ----+
+                  |
+  data (version) -+--&gt; training pipeline --&gt; model + metrics --&gt; quality gate
+                  |        (tracked run)                          |  pass
+  config/params --+                                               v
+                                                           model registry
+                                                    (v12: "staging" -&gt; "production")
+                                                                  |
+                                                                  v
+                                                   serving on Kubernetes -&gt; monitoring
+                                                                  |
+                                    drift or new data -&gt; retrain (continuous training)</code></pre>
+    <table>
+      <thead><tr><th>Need</th><th>What it means</th><th>Common tools</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Data versioning</strong></td><td>Know exactly which data trained which model; be able to get it back</td><td>DVC, lakeFS, versioned tables (Delta Lake, Iceberg)</td></tr>
+        <tr><td><strong>Experiment tracking</strong></td><td>Record every training run: code version, data version, settings, metrics, files</td><td>MLflow, Weights &amp; Biases</td></tr>
+        <tr><td><strong>Model registry</strong></td><td>A catalogue of trained models with versions and stages (staging, production) and who approved them</td><td>MLflow Model Registry, cloud ML platforms</td></tr>
+        <tr><td><strong>Pipelines</strong></td><td>Training as repeatable automated steps, not a notebook run by hand</td><td>Kubeflow Pipelines, Argo Workflows, Airflow</td></tr>
+        <tr><td><strong>Reproducibility</strong></td><td>Same inputs give the same model</td><td>Pinned package versions, fixed random seeds, container images for training</td></tr>
+        <tr><td><strong>Continuous training (CT)</strong></td><td>Retrain automatically on a schedule or when drift is detected, then go through the same gate</td><td>Pipelines plus monitoring triggers</td></tr>
+      </tbody>
+    </table>
+    <p>For LLM apps (prompts, RAG, agents), the "model" step is often a new prompt, a new retrieval setup, or a new base model version. The same rules apply: version it, evaluate it in CI, release gradually. See <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a> and <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-llmops-monitoring.html">LLMOps and Monitoring</a>.</p>
+  </section>
+
+  <section id="gate">
+    <h2>8. A Model Quality Gate (Real Run)</h2>
+    <p>Unit tests check code. A <strong>quality gate</strong> checks the model: it scores the new ("candidate") model on a fixed, versioned test set and blocks the release if it is worse than the model in production.</p>
+    <p>Here is a small gate using the breast cancer classifier from <a href="../../../AI Engineer/learn/Foundations-and-Architecture/ai-engineering-classical-ml.html">Classical ML from Zero</a>. Two candidates are trained with different regularisation strength <code>C</code> (smaller C means a simpler, more constrained model). The rule: accuracy must be at least 0.95, and recall (the share of cancers caught) must not drop by more than 0.01.</p>
+    <pre><code>"""Model quality gate: exit 1 if the candidate model is worse than production."""
+import sys, warnings; warnings.filterwarnings("ignore")
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import accuracy_score, recall_score
+
+d = load_breast_cancer(); X, y = d.data, 1 - d.target      # 1 = malignant
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+
+def train(n_rows, C):
+    return make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=1000)).fit(Xtr[:n_rows], ytr[:n_rows])
+
+def score(m):
+    p = m.predict(Xte); return accuracy_score(yte, p), recall_score(yte, p)
+
+prod_acc, prod_rec = score(train(n_rows=426, C=1.0))      # model in production today
+for name, cand in [("candidate A", train(426, C=0.01)), ("candidate B", train(426, C=10.0))]:
+    acc, rec = score(cand)
+    ok = acc &gt;= 0.95 and rec &gt;= prod_rec - 0.01
+    print(f"{name}: acc={acc:.4f} recall={rec:.4f} | prod acc={prod_acc:.4f} recall={prod_rec:.4f} -&gt; {'PASS' if ok else 'FAIL'}")</code></pre>
+    <p>Real output (scikit-learn 1.9.1):</p>
+    <pre><code>candidate A: acc=0.9510 recall=0.8679 | prod acc=0.9650 recall=0.9245 -&gt; FAIL
+candidate B: acc=0.9650 recall=0.9245 | prod acc=0.9650 recall=0.9245 -&gt; PASS</code></pre>
+    <p>Candidate A would have missed about 6 more cancers in every 100 (recall 0.8679 versus 0.9245). Its accuracy alone (0.951) still looks fine, which is exactly why the gate checks recall, the metric that matches the real cost. In a real pipeline the script ends with <code>sys.exit(1)</code> on FAIL, so the CI job turns red and the build-and-push job never runs.</p>
+    <div class="callout">
+      <strong>Gate design tips:</strong> keep the test set fixed and versioned (otherwise scores move for reasons other than the model); compare against the current production model, not a fixed old number; check slices (for example each customer region), not only the average; and leave a small tolerance for noise.
+    </div>
+  </section>
+
+  <section id="serving">
+    <h2>9. Serving Models on Kubernetes</h2>
+    <h3>Where does the model file live?</h3>
+    <ul>
+      <li><strong>Baked into the image:</strong> one artifact, simple rollbacks. But images get huge (LLM weights are many GB) and every model update needs a new image.</li>
+      <li><strong>Downloaded at start-up</strong> from a model registry or object storage (an init container or the server itself fetches it). Small images, models change independently. Pin the exact model version in config, never "latest".</li>
+      <li><strong>On a shared volume</strong> that many pods mount. Avoids downloading the same big file on every pod start.</li>
+    </ul>
+    <h3>Model-serving platforms</h3>
+    <p><strong>KServe</strong> adds an <code>InferenceService</code> resource: you say "serve this model from this storage path with this runtime", and it creates the Deployment, Service, autoscaling, and canary routing for you:</p>
+    <pre><code>apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: cancer-screen
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: sklearn
+      storageUri: s3://models/cancer-screen/v12</code></pre>
+    <p>For LLMs, the model server is usually vLLM or a similar engine on GPU nodes. See <a href="../Kubernetes/kubernetes-gpu-scheduling.html#inference">Serving an LLM on Kubernetes</a>. Always give model servers a <code>startupProbe</code> with enough time to load the model, or Kubernetes will kill them mid-load.</p>
+  </section>
+
+  <section id="monitoring">
+    <h2>10. Monitoring Models: Drift and PSI</h2>
+    <p>Normal app monitoring asks "is it up, is it fast, is it erroring?" A model can be up, fast, and error-free while giving <em>wrong answers</em>. So model monitoring adds more layers:</p>
+    <table>
+      <thead><tr><th>Layer</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td>System</td><td>CPU, memory, GPU use, pod restarts</td></tr>
+        <tr><td>Service</td><td>Requests per second, latency, error rate</td></tr>
+        <tr><td>Data</td><td>Missing values, value ranges, input distributions</td></tr>
+        <tr><td>Model</td><td>Prediction distribution, confidence, and (when labels arrive later) accuracy and recall</td></tr>
+      </tbody>
+    </table>
+    <h3>Kinds of drift</h3>
+    <ul>
+      <li><strong>Data drift</strong> (covariate shift): the inputs change. New customers are younger; a sensor is replaced.</li>
+      <li><strong>Label drift</strong> (prior shift): how common each answer is changes. Fraud rises during a holiday sale.</li>
+      <li><strong>Concept drift:</strong> the relationship itself changes. The same behaviour that meant "safe" last year now means "fraud".</li>
+      <li><strong>Pipeline bugs:</strong> not real-world change at all, but broken data: a unit change, a renamed column, nulls filled with zero. In practice these are very common.</li>
+    </ul>
+    <h3>PSI: one number for "has this distribution moved?"</h3>
+    <p>The <strong>Population Stability Index</strong> compares a feature's distribution now with a reference (usually the training data):</p>
+    <ol>
+      <li>Split the reference values into bins (often 10 bins with equal counts).</li>
+      <li>For each bin, find the share of reference values \(r_i\) and the share of current values \(c_i\) that fall in it.</li>
+      <li>Add up:</li>
+    </ol>
+    <p>\[ \text{PSI} = \sum_i (c_i - r_i)\,\ln\frac{c_i}{r_i} \]</p>
+    <p><strong>Worked example</strong> with 2 bins. Reference shares 0.5 and 0.5; current shares 0.8 and 0.2.</p>
+    <p>\[ (0.8-0.5)\ln\frac{0.8}{0.5} + (0.2-0.5)\ln\frac{0.2}{0.5} = 0.3 \times 0.470 + (-0.3)\times(-0.916) = 0.141 + 0.275 = 0.416 \]</p>
+    <p>A common rule of thumb: below 0.1 means little change, 0.1 to 0.25 moderate, above 0.25 a big shift worth investigating. Treat these as starting points: with small samples, PSI is noisy (you will see this below).</p>
+    <p>Other tools: the <strong>KS test</strong> (Kolmogorov-Smirnov, a statistical test for "are these two samples from the same distribution?") and simple checks like "share of nulls" or "value outside the training range".</p>
+  </section>
+
+  <section id="scenario">
+    <h2>11. Scenario: the Model That Quietly Got Worse</h2>
+    <p>This walkthrough uses real runs. The model is the logistic regression cancer classifier from <a href="../../../AI Engineer/learn/Foundations-and-Architecture/ai-engineering-classical-ml.html">Classical ML from Zero</a> (an educational dataset, not a medical tool). The "production traffic" is its 143-row test set, with a bug injected exactly as described.</p>
+    <h3>The situation</h3>
+    <p>The model has served well for months: accuracy 0.9650, recall 0.9245, and it flags 34.97% of cases as malignant. An upstream team changes how the imaging system exports area measurements. All three area features ("mean area", "area error", "worst area") now arrive 100 times smaller. No error is raised. Every request still returns HTTP 200 in normal time.</p>
+    <h3>Step 1: what the model now does (measured)</h3>
+    <table>
+      <thead><tr><th>Metric</th><th>Before</th><th>After the upstream change</th></tr></thead>
+      <tbody>
+        <tr><td>Accuracy</td><td>0.9650</td><td>0.9021</td></tr>
+        <tr><td>Recall (cancers caught)</td><td>0.9245 (49 of 53)</td><td>0.7358 (39 of 53)</td></tr>
+        <tr><td>Missed cancers (FN)</td><td>4</td><td>14</td></tr>
+        <tr><td>Share flagged malignant</td><td>34.97%</td><td>27.27%</td></tr>
+      </tbody>
+    </table>
+    <p>The model misses 10 more cancers out of 53. But true labels (biopsy results) arrive weeks later, so on day one nobody can see the accuracy and recall columns. Service dashboards look perfect.</p>
+    <h3>Step 2: label-free signals that would have caught it</h3>
+    <ul>
+      <li><strong>Prediction distribution:</strong> the share flagged malignant fell from 34.97% to 27.27%. An alert on "positive rate moved more than X" fires the same day.</li>
+      <li><strong>PSI of the model's output probability:</strong> 0.370 against the training data, versus 0.048 for the healthy test set. Well above the 0.25 rule of thumb.</li>
+      <li><strong>Per-feature PSI:</strong></li>
+    </ul>
+    <pre><code>PSI mean area:            8.265
+PSI area error:           8.265
+PSI worst area:           8.265
+PSI worst texture:        0.129   &lt;- largest of the 27 untouched features
+PSI concave points error: 0.118</code></pre>
+    <p>Three features score 8.265, far above anything else: every value fell into the lowest bin. Notice that untouched features reached 0.129 just from sampling noise with only 143 rows, which is above the 0.1 rule of thumb. That is why alert thresholds should be set from what normal days look like, not copied blindly.</p>
+    <h3>Step 3: find the root cause</h3>
+    <p>The three drifted features have the same unit (area). The mean of "mean area" fell from 660.1 in training to 6.39 in production: exactly a factor of 100. Checking the upstream change log reveals the export change.</p>
+    <h3>Step 4: fix and prevent</h3>
+    <ol>
+      <li><strong>Fix now:</strong> convert the units back at the input boundary (we re-ran it: accuracy returns to 0.9650), or roll back the upstream change.</li>
+      <li><strong>Data contract:</strong> validate every request against expected types and ranges (for example "mean area between 100 and 3000"). Reject or flag out-of-range inputs instead of predicting on them.</li>
+      <li><strong>Alerts:</strong> per-feature PSI and prediction-rate alerts, with thresholds tuned on normal days.</li>
+      <li><strong>Add a test</strong> to CI that sends a known input and checks the prediction, so a schema change upstream fails a pipeline rather than patients.</li>
+    </ol>
+    <h3>A subtler lesson from the same data</h3>
+    <p>We first tried breaking <em>only</em> "mean area". Accuracy stayed at 0.9650 (recall dipped from 0.9245 to 0.9057), because other features carry similar information. Yet that feature's PSI was already 8.265. The model was running on broken input and looked fine. Silent bugs like this become loud the moment another feature drifts. Monitor inputs, not only outputs.</p>
+    <details>
+      <summary>Show the code used for this scenario</summary>
+      <pre><code>import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import accuracy_score, recall_score
+
+d = load_breast_cancer(); X, y, names = d.data, 1 - d.target, d.feature_names
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+m = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)).fit(Xtr, ytr)
+
+def psi(ref, cur, bins=10):
+    edges = np.quantile(ref, np.linspace(0, 1, bins + 1)); edges[0], edges[-1] = -np.inf, np.inf
+    r = np.histogram(ref, edges)[0] / len(ref); c = np.histogram(cur, edges)[0] / len(cur)
+    r, c = np.clip(r, 1e-4, None), np.clip(c, 1e-4, None)   # avoid log(0)
+    return float(((c - r) * np.log(c / r)).sum())
+
+area = [j for j, n in enumerate(names) if "area" in n]
+Xprod = Xte.copy(); Xprod[:, area] /= 100        # the upstream unit change
+pred = m.predict(Xprod)
+print(accuracy_score(yte, pred), recall_score(yte, pred), pred.mean())
+for j in range(X.shape[1]):
+    print(names[j], round(psi(Xtr[:, j], Xprod[:, j]), 3))
+print(psi(m.predict_proba(Xtr)[:, 1], m.predict_proba(Xprod)[:, 1]))</code></pre>
+    </details>
+  </section>
+
+  <section id="this-repo">
+    <h2>12. A Real Pipeline: This Site's Own Checks</h2>
+    <p>This knowledge base runs a small CI workflow of its own, in <code>.github/workflows/site-checks.yml</code>. On every pull request it:</p>
+    <ol>
+      <li>Rebuilds the search index and fails if the committed index is out of date (someone added a page but forgot to run the index script).</li>
+      <li>Runs the link checker, which fails on any internal link or <code>#anchor</code> that does not exist.</li>
+    </ol>
+    <p>It follows the rules on this page: read-only <code>permissions</code>, pinned action versions, and a clear error message that tells you the fix. See <a href="https://github.com/saqlain2204/Engineering-Knowledge-Base/blob/main/CONTRIBUTING.md" rel="noopener noreferrer">CONTRIBUTING.md</a>.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Deploying <code>latest</code>.</strong> You cannot tell what runs or roll back. Tag by commit SHA or digest.</li>
+      <li><strong>Rebuilding per environment.</strong> Staging tested a different artifact than production runs.</li>
+      <li><strong>Manual hotfixes in a GitOps cluster.</strong> Self-heal reverts them, or worse, they silently drift from Git.</li>
+      <li><strong>Long-lived cloud keys in CI secrets.</strong> Use OIDC short-lived credentials.</li>
+      <li><strong>Gates that only check average accuracy.</strong> Check the metric that matches the real cost, and important slices.</li>
+      <li><strong>Monitoring only latency and errors for models.</strong> Wrong answers return HTTP 200. Watch input and prediction distributions.</li>
+      <li><strong>Copying drift thresholds blindly.</strong> Tune them on normal days for your traffic volume.</li>
+      <li><strong>No owner for alerts.</strong> An alert nobody reads is the same as no alert.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: delivery or deployment?</h3>
+    <p>Every merge to main builds and tests an image and deploys it to staging automatically. Production needs a manager to click "approve". Is this continuous delivery or continuous deployment?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Continuous delivery. Every change is ready to release, but a human decides when it goes to production. In continuous deployment, production would update automatically.</p>
+    </details>
+    <h3>Problem 2: compute PSI</h3>
+    <p>A feature has 3 bins. Training shares: 0.2, 0.5, 0.3. Today's shares: 0.1, 0.5, 0.4. Compute PSI and say whether to worry.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Bin 1: (0.1 - 0.2) &times; ln(0.1/0.2) = (-0.1) &times; (-0.693) = 0.0693. Bin 2: 0 (no change). Bin 3: (0.4 - 0.3) &times; ln(0.4/0.3) = 0.1 &times; 0.2877 = 0.0288. Total = 0.098. Under the 0.1 rule of thumb: a small change. Keep watching, especially if it keeps growing day after day.</p>
+    </details>
+    <h3>Problem 3: the bad rollback</h3>
+    <p>Your cluster uses Argo CD with self-heal. A release breaks production, so an engineer runs <code>kubectl rollout undo deployment/api</code>. Two minutes later the broken version is back. Why, and what should they do?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Git still holds the new (broken) image tag. Argo CD sees the cluster differs from Git and "heals" it back to the broken version. Revert the commit in the deploy repo (<code>git revert</code>), so Git itself points at the old tag.</p>
+    </details>
+    <h3>Problem 4: design the gate</h3>
+    <p>You ship a spam filter. Losing a real email (false positive) is much worse than letting some spam through. Write a simple gate rule for a new model.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Example: on the fixed test set, the candidate's precision must be at least the production model's precision minus a small tolerance (say 0.005), and its recall must be at least a floor (say 0.90). Also check precision on important slices, such as emails from known contacts.</p>
+    </details>
+    <h3>Problem 5: what to monitor first</h3>
+    <p>A loan-approval model's true outcomes (did the borrower repay?) are known only after 12 months. What can you monitor from day one?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Input data quality (nulls, ranges, schema), per-feature drift (PSI or KS against training data), the prediction distribution (approval rate, score distribution, PSI of scores), and service health. Use early proxy labels if any exist (for example, first missed payment) before the full outcome arrives.</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions" rel="noopener noreferrer">GitHub Actions workflow syntax</a> &middot; <a href="https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect" rel="noopener noreferrer">GitHub: OIDC for deployments</a> &middot; <a href="https://argo-cd.readthedocs.io/en/stable/" rel="noopener noreferrer">Argo CD docs</a> &middot; <a href="https://argoproj.github.io/argo-rollouts/" rel="noopener noreferrer">Argo Rollouts docs</a> &middot; <a href="https://kserve.github.io/website/" rel="noopener noreferrer">KServe docs</a> &middot; <a href="https://mlflow.org/docs/latest/index.html" rel="noopener noreferrer">MLflow docs</a> &middot; <a href="https://github.com/rhysd/actionlint" rel="noopener noreferrer">actionlint</a> &middot; <a href="https://github.com/yannh/kubeconform" rel="noopener noreferrer">kubeconform</a> &middot; <a href="https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning" rel="noopener noreferrer">Google Cloud: MLOps continuous delivery and automation pipelines</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Docker/docker-advanced.html">Advanced Docker</a> &middot; <a href="../Kubernetes/kubernetes-workloads.html">Workloads</a> &middot; <a href="../Kubernetes/kubernetes-helm-observability.html">Helm &amp; Observability</a> &middot; <a href="../Kubernetes/kubernetes-gpu-scheduling.html">GPU Scheduling</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

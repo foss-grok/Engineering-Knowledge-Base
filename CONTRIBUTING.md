@@ -57,6 +57,8 @@ Commit `assets/search-index.js` and `assets/search-index.json`. Then check links
 python3 scripts/check-links.py
 ```
 
+The `site-checks` GitHub Actions workflow runs both steps on every pull request and fails if the committed search index is stale or any internal link is broken.
+
 ## Pull requests
 
 - Keep PRs focused when possible.

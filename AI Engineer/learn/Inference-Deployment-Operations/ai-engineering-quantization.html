@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Quantization Deep Dive | AI Engineering</title>
+  <meta name="description" content="LLM quantization from zero with real NumPy runs: number formats (FP16, BF16, FP8, INT8, INT4), scale and rounding by hand, outliers, per-tensor vs per-channel vs group-wise, zero points, weights vs activations vs KV cache, GPTQ, AWQ, SmoothQuant, NF4, GGUF, and how to evaluate a quantized model.">
+  <link rel="stylesheet" href="../../../styles.css">
+  <script src="../../../assets/mathjax.js"></script>
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Quantization</p>
+  </nav>
+  <h1>Quantization Deep Dive</h1>
+  <p>How to store a model's numbers in fewer bits so it fits on smaller GPUs and runs faster, and how to do it without breaking the model. We quantize real arrays step by step and measure the error. All numbers come from the NumPy code on this page.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Quantize at All</a></li>
+    <li><a href="#formats">Number Formats in Plain Words</a></li>
+    <li><a href="#core-idea">The Core Idea: Scale, Round, Store</a></li>
+    <li><a href="#outliers">Outliers: One Big Number Ruins the Scale</a></li>
+    <li><a href="#granularity">Granularity: Per-Tensor, Per-Channel, Per-Group</a></li>
+    <li><a href="#zero-point">Symmetric vs Asymmetric (Zero Points)</a></li>
+    <li><a href="#what-to-quantize">Weights, Activations, and the KV Cache</a></li>
+    <li><a href="#methods">Methods: PTQ, QAT, GPTQ, AWQ, SmoothQuant, NF4, GGUF</a></li>
+    <li><a href="#practice-tools">Doing It in Practice</a></li>
+    <li><a href="#speed">Does Smaller Mean Faster?</a></li>
+    <li><a href="#evaluate">Evaluating a Quantized Model</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#problems">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Quantize at All</h2>
+    <p>A model is mostly a huge list of numbers called <strong>weights</strong>. Each weight is usually stored in 16 bits (2 bytes). Memory needed for the weights is simply:</p>
+    <p>\[ \text{memory} = \text{number of weights} \times \text{bytes per weight} \]</p>
+    <table>
+      <thead><tr><th>Format</th><th>Bytes per weight</th><th>8B-parameter model</th><th>70B-parameter model</th></tr></thead>
+      <tbody>
+        <tr><td>16-bit (FP16/BF16)</td><td>2</td><td>16 GB</td><td>140 GB</td></tr>
+        <tr><td>8-bit (INT8/FP8)</td><td>1</td><td>8 GB</td><td>70 GB</td></tr>
+        <tr><td>4-bit, groups of 128 (see section 5)</td><td>0.516</td><td>4.125 GB</td><td>36.1 GB</td></tr>
+      </tbody>
+    </table>
+    <p>(Weights only. The KV cache and activations need extra memory on top.)</p>
+    <p>There is a second reason. When an LLM writes text one token at a time, the GPU must read <em>every weight</em> from memory for <em>every token</em>. That reading, not the maths, is usually the slowest part (the step is <strong>memory-bound</strong>). Half the bytes means roughly half the reading. See <a href="ai-engineering-inference-optimization.html#memory-bound">why decoding is memory-bound</a>.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> Quantization is like rounding prices to the nearest rupee instead of storing paise. You lose a little detail, the totals are almost the same, and the list gets much shorter.
+    </div>
+  </section>
+
+  <section id="formats">
+    <h2>2. Number Formats in Plain Words</h2>
+    <p>There are two families:</p>
+    <ul>
+      <li><strong>Floating point</strong> (FP): stores a number like scientific notation, 1.23 &times; 10<sup>-4</sup>. Some bits store the digits (the <strong>mantissa</strong>), some store the power (the <strong>exponent</strong>). More exponent bits means a wider range of sizes. More mantissa bits means finer detail.</li>
+      <li><strong>Integer</strong> (INT): only whole numbers in a fixed range. To store 0.37 you need a separate <strong>scale</strong> (section 3).</li>
+    </ul>
+    <table>
+      <thead><tr><th>Format</th><th>Bits</th><th>What it can hold</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td>FP32</td><td>32</td><td>Huge range, about 7 decimal digits of detail</td><td>Training master copy of weights</td></tr>
+        <tr><td>FP16</td><td>16</td><td>Largest value 65,504; can overflow</td><td>Older GPU inference</td></tr>
+        <tr><td>BF16</td><td>16</td><td>Same range as FP32, less detail</td><td>Standard for modern training and serving</td></tr>
+        <tr><td>FP8 E4M3</td><td>8</td><td>Largest value 448; more detail</td><td>Weights and activations on newer GPUs</td></tr>
+        <tr><td>FP8 E5M2</td><td>8</td><td>Largest value 57,344; less detail</td><td>Gradients in FP8 training</td></tr>
+        <tr><td>INT8</td><td>8</td><td>Whole numbers -128 to 127</td><td>Weights, activations, KV cache</td></tr>
+        <tr><td>INT4</td><td>4</td><td>Whole numbers -8 to 7 (only 16 levels)</td><td>Weights for small-GPU and laptop inference</td></tr>
+      </tbody>
+    </table>
+    <p>"E4M3" means 4 exponent bits and 3 mantissa bits (plus one sign bit). The FP8 limits above come from the FP8 format paper linked at the end.</p>
+  </section>
+
+  <section id="core-idea">
+    <h2>3. The Core Idea: Scale, Round, Store</h2>
+    <p>The most common method is <strong>absmax (symmetric) quantization</strong>. In plain words:</p>
+    <ol>
+      <li>Find the biggest absolute value in the group of numbers.</li>
+      <li>Choose a <strong>scale</strong> so that biggest value maps to the biggest integer (127 for INT8).</li>
+      <li>Divide every number by the scale and round to the nearest whole number. Store these integers plus the one scale.</li>
+      <li>To use the numbers again, multiply the integers by the scale. This is <strong>dequantization</strong>.</li>
+    </ol>
+    <p>\[ s = \frac{\max |w|}{127} \qquad q = \text{round}\!\left(\frac{w}{s}\right) \qquad \hat{w} = q \times s \]</p>
+
+    <h3>Worked example (INT8)</h3>
+    <p>Six weights: <code>[0.12, -0.50, 0.33, 0.05, -0.91, 0.70]</code>.</p>
+    <ol>
+      <li>Biggest absolute value: 0.91.</li>
+      <li>Scale: 0.91 / 127 = 0.007165.</li>
+      <li>Divide and round. For example -0.50 / 0.007165 = -69.78, which rounds to -70.</li>
+    </ol>
+    <pre><code>scale 0.007165
+q     [  17  -70   46    7 -127   98]          &lt;- stored as 1 byte each
+deq   [ 0.1218 -0.5016  0.3296  0.0502 -0.91    0.7022]
+error [ 0.0018 -0.0016 -0.0004  0.0002  0.      0.0022]   max abs error 0.0022</code></pre>
+    <p>The biggest error is never more than half a step (half of 0.007165 is about 0.0036), because rounding moves a value at most half a step.</p>
+
+    <h3>Same weights in INT4</h3>
+    <p>INT4 has only 16 levels, so the scale is 0.91 / 7 = 0.13, and each step is much coarser:</p>
+    <pre><code>int4 scale 0.13
+q4   [ 1 -4  3  0 -7  5]
+deq  [ 0.13 -0.52  0.39  0.   -0.91  0.65]     max abs error 0.06</code></pre>
+    <p>The error grew from 0.0022 to 0.06, about 27 times worse. 0.05 became exactly 0. This is why 4-bit needs the extra tricks in sections 5 and 8.</p>
+    <pre><code>import numpy as np
+w = np.array([0.12, -0.50, 0.33, 0.05, -0.91, 0.70])
+s = np.abs(w).max() / 127
+q = np.round(w / s).astype(np.int8)
+w_hat = q * s
+print(s, q, w_hat, np.abs(w_hat - w).max())</code></pre>
+  </section>
+
+  <section id="outliers">
+    <h2>4. Outliers: One Big Number Ruins the Scale</h2>
+    <p>Now replace the first weight with an outlier, 8.0. The scale becomes 8.0 / 127 = 0.063, about 9 times coarser:</p>
+    <pre><code>outlier scale 0.062992
+q    [127  -8   5   1 -14  11]
+deq  [ 8.     -0.5039  0.315   0.063  -0.8819  0.6929]</code></pre>
+    <p>All the normal weights now share only a handful of levels near zero. 0.05 became 0.063 (a 26% error), and -0.91 became -0.8819. One big number wasted most of the 256 levels on empty space.</p>
+    <div class="callout">
+      <strong>Key fact:</strong> real LLMs have outliers. Research on 8-bit inference found a few hidden "feature dimensions" in large transformers whose activation values are far larger than the rest, and that naive INT8 breaks those models (see the LLM.int8() paper below). Almost every modern method is a way of dealing with outliers.
+    </div>
+  </section>
+
+  <section id="granularity">
+    <h2>5. Granularity: Per-Tensor, Per-Channel, Per-Group</h2>
+    <p>The fix for outliers is simple: <strong>use more scales</strong>, each covering fewer numbers. Then one outlier only hurts its own small group.</p>
+<pre><code>weight matrix (rows = output channels)
+
+per-tensor:   one scale for everything
+              [ s ................................ ]
+
+per-channel:  one scale per row
+              s1 [ ................................ ]
+              s2 [ ................................ ]
+
+per-group:    one scale per block of g numbers in each row (g = 32, 64, 128)
+              [ s1 .... | s2 .... | s3 .... | s4 .... ]
+              [ s5 .... | s6 .... | s7 .... | s8 .... ]</code></pre>
+    <h3>Real experiment</h3>
+    <p>We built a 1024 &times; 1024 random weight matrix (normal values, with rows given different sizes, as real layers have), multiplied it by 64 random input vectors, and measured how far the quantized output is from the full-precision output (relative error: size of the difference divided by size of the true output):</p>
+    <table>
+      <thead><tr><th>Method</th><th>Relative output error</th></tr></thead>
+      <tbody>
+        <tr><td>INT8 per-tensor</td><td>1.722%</td></tr>
+        <tr><td>INT8 per-channel</td><td>0.789%</td></tr>
+        <tr><td>INT4 per-tensor</td><td>30.112%</td></tr>
+        <tr><td>INT4 per-channel</td><td>14.348%</td></tr>
+        <tr><td>INT4 groups of 128</td><td>11.677%</td></tr>
+        <tr><td>INT4 groups of 32</td><td>9.618%</td></tr>
+      </tbody>
+    </table>
+    <p>Then we added <strong>one outlier weight</strong> (100 times the typical size) and repeated:</p>
+    <table>
+      <thead><tr><th>Method</th><th>Error without outlier</th><th>Error with one outlier</th></tr></thead>
+      <tbody>
+        <tr><td>INT8 per-tensor</td><td>1.722%</td><td>22.229%</td></tr>
+        <tr><td>INT8 per-channel</td><td>0.789%</td><td>0.980%</td></tr>
+        <tr><td>INT4 groups of 128</td><td>11.677%</td><td>11.638%</td></tr>
+      </tbody>
+    </table>
+    <p>One weight out of a million made per-tensor INT8 13 times worse. Per-channel and per-group barely noticed.</p>
+    <div class="callout">
+      <strong>Be honest about this toy:</strong> these are random matrices with plain rounding. Real INT4 methods (GPTQ, AWQ) are much smarter than rounding, and real weights are not random, so real models lose far less quality than 10% error suggests. Use the table to compare <em>methods</em>, not to predict a real model's score.
+    </div>
+    <h3>The cost of more scales</h3>
+    <p>Each scale is stored too, usually in 16 bits. For 4-bit weights with one 16-bit scale per group of g weights:</p>
+    <table>
+      <thead><tr><th>Group size g</th><th>Bits per weight including scale</th></tr></thead>
+      <tbody>
+        <tr><td>32</td><td>4 + 16/32 = 4.5</td></tr>
+        <tr><td>64</td><td>4 + 16/64 = 4.25</td></tr>
+        <tr><td>128</td><td>4 + 16/128 = 4.125</td></tr>
+      </tbody>
+    </table>
+    <p>Group size 128 is a common default: small overhead, most of the accuracy benefit.</p>
+  </section>
+
+  <section id="zero-point">
+    <h2>6. Symmetric vs Asymmetric (Zero Points)</h2>
+    <p>Symmetric quantization puts 0 in the middle of the range. That wastes levels when the values are lopsided, for example activations after a ReLU-like function are mostly positive.</p>
+    <p><strong>Asymmetric</strong> quantization maps the real minimum to integer 0 and the real maximum to 255, using an extra number called the <strong>zero point</strong> (z):</p>
+    <p>\[ s = \frac{\max - \min}{255} \qquad q = \text{round}\!\left(\frac{x}{s}\right) + z \qquad \hat{x} = (q - z) \times s \]</p>
+    <p>Real run on <code>[-0.5, 0.4, 1.1, 2.3, 3.0, 0.7]</code>:</p>
+    <pre><code>asymmetric: scale 0.013725  zero point 36
+  q   [  0  65 116 204 255  87]
+  deq [-0.4941  0.398   1.098   2.3059  3.0059  0.7   ]   max error 0.005882
+symmetric:  scale 0.023622
+  q   [-21  17  47  97 127  30]
+  deq [-0.4961  0.4016  1.1102  2.2913  3.      0.7087]   max error 0.010236</code></pre>
+    <p>Symmetric used only the levels from -21 to 127; the levels from -128 to -22 were wasted. Asymmetric used all 256 and cut the worst error almost in half. The cost is one extra number per group and slightly more work in the matrix multiply. That is why weights (roughly centred on zero) are usually symmetric, and lopsided activations are often asymmetric.</p>
+  </section>
+
+  <section id="what-to-quantize">
+    <h2>7. Weights, Activations, and the KV Cache</h2>
+    <table>
+      <thead><tr><th>What</th><th>What it is</th><th>Notation</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Weights only</strong></td><td>The model's learned numbers. Known ahead of time.</td><td>W4A16, W8A16</td><td>Easiest. Weights are converted back to 16-bit inside the GPU kernel before the multiply. Saves memory and reading time.</td></tr>
+        <tr><td><strong>Weights and activations</strong></td><td>Activations are the numbers flowing between layers. They change with every input.</td><td>W8A8 (INT8 or FP8)</td><td>Lets the GPU do the multiply itself in 8-bit, which is faster for big batches. Harder, because activations have outliers.</td></tr>
+        <tr><td><strong>KV cache</strong></td><td>Stored keys and values for past tokens (<a href="ai-engineering-inference-optimization.html#kv-cache">explained here</a>)</td><td>FP8 or INT8 KV</td><td>Matters for long contexts and many users, where the cache can be bigger than the weights.</td></tr>
+      </tbody>
+    </table>
+    <p>"W4A16" reads as "weights in 4 bits, activations in 16 bits".</p>
+    <h3>Activation outliers, seen in a real run</h3>
+    <p>We quantized the 64 input vectors to INT8 (one scale per vector, also called per-token), then made one of the 1024 input channels 60 times larger, mimicking the outlier features found in real LLMs:</p>
+    <table>
+      <thead><tr><th>Case</th><th>Relative output error</th></tr></thead>
+      <tbody>
+        <tr><td>Normal activations, INT8 per-token</td><td>0.795%</td></tr>
+        <tr><td>One outlier channel, INT8 per-token</td><td>6.530%</td></tr>
+        <tr><td>Outlier channel kept in full precision, the rest INT8</td><td>0.381%</td></tr>
+      </tbody>
+    </table>
+    <p>The last row is the LLM.int8() idea: handle the few outlier channels in 16-bit and everything else in 8-bit. (Its error is even lower than the normal case only because the big outlier channel, now exact, makes up much of the output.)</p>
+  </section>
+
+  <section id="methods">
+    <h2>8. Methods: PTQ, QAT, GPTQ, AWQ, SmoothQuant, NF4, GGUF</h2>
+    <h3>When quantization happens</h3>
+    <ul>
+      <li><strong>Post-training quantization (PTQ):</strong> take a finished model and quantize it. Minutes to hours. Most LLM quantization is PTQ.</li>
+      <li><strong>Quantization-aware training (QAT):</strong> train or fine-tune while simulating the rounding, so the model learns to tolerate it. Better quality at very low bits, but needs training compute and data.</li>
+    </ul>
+    <p>Many PTQ methods use a small <strong>calibration set</strong>: a few hundred example inputs run through the model to see which weights and channels matter.</p>
+    <h3>The methods you will meet</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Idea in one or two sentences</th></tr></thead>
+      <tbody>
+        <tr><td><strong>LLM.int8()</strong></td><td>8-bit matrix multiply, but the few outlier feature dimensions are pulled out and computed in 16-bit (section 7).</td></tr>
+        <tr><td><strong>GPTQ</strong></td><td>Quantizes weights one column at a time. After rounding a column, it adjusts the columns not yet quantized to cancel out the error just made, using information from calibration data.</td></tr>
+        <tr><td><strong>AWQ</strong> (activation-aware weight quantization)</td><td>A small share of weights matter most: the ones multiplied by large activations. AWQ scales those channels up before quantizing so they lose less detail, and folds the inverse scale into the neighbouring operation.</td></tr>
+        <tr><td><strong>SmoothQuant</strong></td><td>Activations are hard to quantize (outliers), weights are easy. It mathematically moves part of each activation channel's size into the matching weights, so both become easy, enabling W8A8.</td></tr>
+        <tr><td><strong>NF4</strong> (from QLoRA)</td><td>A 4-bit format whose 16 levels are placed to match the bell-curve shape of typical weights, instead of evenly spaced. Used by bitsandbytes for memory-cheap fine-tuning. See <a href="../Training-Pipeline/ai-engineering-fine-tuning.html">Fine-Tuning (QLoRA)</a>.</td></tr>
+        <tr><td><strong>GGUF k-quants</strong></td><td>The file format and quantization family used by llama.cpp for CPU and laptop inference. Names like Q4_K_M or Q8_0 describe the bits and block layout.</td></tr>
+        <tr><td><strong>FP8</strong></td><td>8-bit floating point instead of integers. Its exponent handles a wide range, so it copes with outliers better than INT8. Needs GPU hardware with FP8 support for the speed benefit.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="practice-tools">
+    <h2>9. Doing It in Practice</h2>
+    <h3>Load a model in 4-bit with Hugging Face Transformers (bitsandbytes)</h3>
+    <pre><code>import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",           # the NF4 format
+    bnb_4bit_compute_dtype=torch.bfloat16 # dequantize to BF16 for the maths
+)
+model = AutoModelForCausalLM.from_pretrained("your-org/your-model", quantization_config=bnb)</code></pre>
+    <h3>Serve a pre-quantized model with vLLM</h3>
+    <pre><code># a checkpoint already quantized with AWQ or GPTQ: vLLM reads the method from its config
+vllm serve your-org/your-model-AWQ
+
+# quantize weights to FP8 on the fly at load time (needs FP8-capable GPU for speed)
+vllm serve your-org/your-model --quantization fp8</code></pre>
+    <h3>Make a GGUF file for llama.cpp</h3>
+    <pre><code># convert to a 16-bit GGUF, then quantize it
+python convert_hf_to_gguf.py ./your-model --outfile model-f16.gguf
+./llama-quantize model-f16.gguf model-Q4_K_M.gguf Q4_K_M</code></pre>
+    <p>Many popular models already have AWQ, GPTQ, FP8, and GGUF versions on Hugging Face. Check the model card for how they were made and evaluated.</p>
+  </section>
+
+  <section id="speed">
+    <h2>10. Does Smaller Mean Faster?</h2>
+    <p>Not always. It depends on what limits the GPU:</p>
+    <ul>
+      <li><strong>Small batches (few users at once):</strong> decoding is memory-bound. Weight-only INT4 or INT8 reads fewer bytes, so tokens come out faster.</li>
+      <li><strong>Large batches:</strong> the GPU becomes compute-bound (busy doing maths). Weight-only formats must convert weights back to 16-bit before each multiply, which adds work. Here W8A8 (INT8 or FP8), which multiplies directly in 8-bit, tends to help more.</li>
+      <li><strong>Kernel support:</strong> speed needs fast GPU code (kernels) for that exact format on that exact GPU. A format your hardware does not support natively may save memory but run slower.</li>
+    </ul>
+    <p>So measure tokens per second and latency on your own hardware, at your real batch sizes, before and after. See <a href="ai-engineering-metrics.html">Metrics</a> and <a href="ai-engineering-inference-optimization.html#capacity">capacity planning</a>.</p>
+  </section>
+
+  <section id="evaluate">
+    <h2>11. Evaluating a Quantized Model</h2>
+    <p>Quantization changes the model, so treat it like a new model release:</p>
+    <ol>
+      <li><strong>Keep a baseline.</strong> Run the 16-bit model on the same prompts, same settings, greedy decoding (temperature 0) where possible.</li>
+      <li><strong>Perplexity</strong> on held-out text: a quick "is anything badly broken" check. Lower is better; small rises are normal.</li>
+      <li><strong>Task evals</strong> that match your product: your golden set, plus fragile skills such as maths, code, long context, and strict JSON output. These often break before open chat does.</li>
+      <li><strong>Compare side by side</strong> and look at the examples that changed, not only the averages.</li>
+      <li><strong>Measure speed and memory</strong> at your real load (section 10).</li>
+    </ol>
+    <p>See <a href="ai-engineering-evaluation.html">Evaluation</a> for building eval sets and CI gates.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>12. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Judging only by perplexity.</strong> A model can keep perplexity and still lose maths or JSON formatting.</li>
+      <li><strong>Calibration data that does not match your traffic.</strong> Calibrating on English news, then serving code, can protect the wrong channels.</li>
+      <li><strong>Assuming a speedup.</strong> Measure. Unsupported formats can be slower.</li>
+      <li><strong>Forgetting the KV cache.</strong> At long context, weights may be small and the cache may be what runs you out of memory.</li>
+      <li><strong>Quantizing small models too hard.</strong> Smaller models often lose more quality at 4-bit than larger ones. Test, do not assume.</li>
+      <li><strong>Mixing up W4A16 and W4A4.</strong> Read what is actually quantized.</li>
+    </ul>
+  </section>
+
+  <section id="problems">
+    <h2>13. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: quantize by hand</h3>
+    <p>Quantize <code>[0.2, -0.4, 1.27]</code> to INT8 with absmax. Give the scale, the integers, and the dequantized values.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Scale = 1.27 / 127 = 0.01. Integers: 0.2 / 0.01 = 20, -0.4 / 0.01 = -40, 1.27 / 0.01 = 127. Dequantized: 0.2, -0.4, 1.27. No error here, because every value happens to be a whole number of steps.</p>
+    </details>
+    <h3>Problem 2: will it fit?</h3>
+    <p>You have one GPU with 24 GB of memory. Can a 13B-parameter model fit in 16-bit? In 4-bit with groups of 128? Ignore the KV cache for now.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>16-bit: 13 &times; 10<sup>9</sup> &times; 2 bytes = 26 GB. Does not fit. 4-bit, group 128: 4.125 bits = 0.515625 bytes per weight, so 13 &times; 10<sup>9</sup> &times; 0.515625 = 6.7 GB. Fits, leaving room for the KV cache.</p>
+    </details>
+    <h3>Problem 3: pick the granularity</h3>
+    <p>Your INT8 per-tensor model gives garbage output, and you find one row of a weight matrix has values 50 times larger than the others. What is the cheapest fix to try first?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Switch to per-channel (one scale per row) quantization. The large row then gets its own scale and stops crushing the others' precision. This costs only one extra scale per row.</p>
+    </details>
+    <h3>Problem 4: memory-bound or not?</h3>
+    <p>A chatbot serves 2 users at a time on a big GPU. A teammate proposes W8A8 to speed it up; another proposes W4A16. Which is likely to help more, and why?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>W4A16. With only 2 users, decoding is memory-bound: the time goes into reading weights. 4-bit weights are a quarter of the bytes of 16-bit. W8A8 mainly speeds up the maths, which is not the bottleneck at such a small batch. Still measure both.</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/abs/2208.07339" rel="noopener noreferrer">LLM.int8() (Dettmers et al., 2022)</a> &middot; <a href="https://arxiv.org/abs/2210.17323" rel="noopener noreferrer">GPTQ (Frantar et al., 2022)</a> &middot; <a href="https://arxiv.org/abs/2306.00978" rel="noopener noreferrer">AWQ (Lin et al., 2023)</a> &middot; <a href="https://arxiv.org/abs/2211.10438" rel="noopener noreferrer">SmoothQuant (Xiao et al., 2022)</a> &middot; <a href="https://arxiv.org/abs/2305.14314" rel="noopener noreferrer">QLoRA and NF4 (Dettmers et al., 2023)</a> &middot; <a href="https://arxiv.org/abs/2209.05433" rel="noopener noreferrer">FP8 Formats for Deep Learning (Micikevicius et al., 2022)</a> &middot; <a href="https://docs.vllm.ai/en/latest/features/quantization/" rel="noopener noreferrer">vLLM: Quantization</a> &middot; <a href="https://huggingface.co/docs/transformers/main/en/quantization/overview" rel="noopener noreferrer">Transformers: Quantization</a> &middot; <a href="https://github.com/ggml-org/llama.cpp" rel="noopener noreferrer">llama.cpp</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="ai-engineering-inference-optimization.html">Inference Optimization</a> &middot; <a href="../Training-Pipeline/ai-engineering-fine-tuning.html">Fine-Tuning (LoRA, QLoRA)</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-gpu-scheduling.html">GPU Scheduling on Kubernetes</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -192,7 +192,8 @@
       var section = h2.closest('section[id]');
       var id = section ? section.id : h2.id;
       if (!id) return;
-      var label = h2.textContent.replace(/^\d+\.\s*/, '').trim();
+      // ignore the "#" section link that site.js appends to headings
+      var label = h2.textContent.replace(/^\d+\.\s*/, '').replace(/\s*#$/, '').trim();
       items.push({ id: id, label: label, text: label });
     });
 
@@ -224,8 +225,35 @@
     (page.keywords || []).forEach(function (k) {
       score = Math.max(score, fuzzyScore(query, k, 1.2));
     });
+    // multi-word queries such as "precision recall" can match across two keywords
+    if (page.keywords && page.keywords.length > 1 && tokenize(query).length > 1) {
+      score = Math.max(score, fuzzyScore(query, page.keywords.join(' '), 1.1));
+    }
 
-    return score;
+    return score + topicBonus(page, query);
+  }
+
+  // Many pages tie at the top score because the query appears somewhere in their long
+  // body text (and "lora" is inside "exploration"). Break ties in favour of pages that are
+  // *about* the query: each query word found as a whole word in the title, description,
+  // headings or keywords adds a little.
+  function topicBonus(page, query) {
+    var tokens = tokenize(query);
+    if (!tokens.length) return 0;
+    if (!page._metaWords) {
+      var meta = [page.title, page.description]
+        .concat(page.headings || [], page.keywords || [])
+        .join(' ');
+      page._metaWords = {};
+      normalize(meta).split(' ').forEach(function (w) {
+        if (w) page._metaWords[w] = true;
+      });
+    }
+    var hits = 0;
+    tokens.forEach(function (t) {
+      if (page._metaWords[t]) hits++;
+    });
+    return 0.2 * hits / tokens.length;
   }
 
   function searchPages(query) {
