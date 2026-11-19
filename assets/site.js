@@ -251,3 +251,59 @@
     init();
   }
 })();
+
+// Long learn articles: "About N min read" under the intro, and a thin progress bar
+// at the top of the window that fills as the reader scrolls through the article.
+(function () {
+  'use strict';
+
+  var WORDS_PER_MINUTE = 200;
+
+  function addReadingTime(article) {
+    var header = document.querySelector('.learn-page > header');
+    if (!header || header.querySelector('.reading-time')) return;
+    var words = (article.innerText || article.textContent || '').trim().split(/\s+/).length;
+    var minutes = Math.max(1, Math.round(words / WORDS_PER_MINUTE));
+    var p = document.createElement('p');
+    p.className = 'reading-time';
+    p.textContent = 'About ' + minutes + ' min read';
+    header.appendChild(p);
+  }
+
+  function addProgressBar(article) {
+    var bar = document.createElement('div');
+    bar.className = 'reading-progress';
+    bar.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(bar);
+    var ticking = false;
+    function update() {
+      var rect = article.getBoundingClientRect();
+      var total = rect.height - window.innerHeight;
+      var done = total > 0 ? Math.min(1, Math.max(0, -rect.top / total)) : 1;
+      bar.style.transform = 'scaleX(' + done + ')';
+      ticking = false;
+    }
+    function request() {
+      if (!ticking) {
+        ticking = true;
+        window.requestAnimationFrame(update);
+      }
+    }
+    window.addEventListener('scroll', request, { passive: true });
+    window.addEventListener('resize', request);
+    update();
+  }
+
+  function init() {
+    var article = document.querySelector('.learn-page main.article');
+    if (!article) return;
+    addReadingTime(article);
+    addProgressBar(article);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();

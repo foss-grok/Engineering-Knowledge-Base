@@ -65,6 +65,7 @@ The `site-checks` GitHub Actions workflow runs both steps on every pull request 
 - Use plain, accurate language.
 - Cite sources for non-obvious claims.
 - Update the subject hub when adding topics.
+- If the new page belongs to a track's suggested reading order (for example CS Fundamentals), add it to `scripts/update-prev-next.py` and run `python3 scripts/update-prev-next.py`.
 - Avoid em dashes in new prose.
 
 Open an [issue](https://github.com/saqlain2204/Engineering-Knowledge-Base/issues) for questions.

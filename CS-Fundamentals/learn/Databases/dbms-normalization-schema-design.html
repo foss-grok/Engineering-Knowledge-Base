@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Normalization &amp; Schema Design | CS Fundamentals</title>
+  <meta name="description" content="Database normalization from zero: why one big table breaks, update, insert and delete anomalies, keys, functional dependencies, attribute closure and finding candidate keys by hand, 1NF, 2NF, 3NF, BCNF and 4NF with worked examples, lossless joins, turning ER diagrams into tables, when to denormalize, a runnable SQL lab, and practice problems with answers.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Normalization &amp; Schema Design</p>
+  </nav>
+  <h1>Normalization &amp; Schema Design</h1>
+  <p>How to decide which tables a database should have and which columns go where. We start from one messy spreadsheet, watch it break, and fix it step by step. By the end you can find keys by hand, name the normal form of any table, split it correctly, and know when breaking the rules on purpose is the right call.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-picture">The Big Picture: One Big Table</a></li>
+    <li><a href="#anomalies">Three Ways the Big Table Breaks</a></li>
+    <li><a href="#keys">Keys, in Plain Words</a></li>
+    <li><a href="#fds">Functional Dependencies</a></li>
+    <li><a href="#closure">Attribute Closure and Finding Keys by Hand</a></li>
+    <li><a href="#1nf">First Normal Form (1NF)</a></li>
+    <li><a href="#2nf">Second Normal Form (2NF)</a></li>
+    <li><a href="#3nf">Third Normal Form (3NF)</a></li>
+    <li><a href="#bcnf">Boyce-Codd Normal Form (BCNF)</a></li>
+    <li><a href="#lossless">Splitting Safely: Lossless Joins and Kept Rules</a></li>
+    <li><a href="#4nf">Beyond BCNF: 4NF in One Example</a></li>
+    <li><a href="#er">From an ER Diagram to Tables</a></li>
+    <li><a href="#denormalize">When to Denormalize on Purpose</a></li>
+    <li><a href="#lab">Lab: Build the Shop Schema</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-picture">
+    <h2>1. The Big Picture: One Big Table</h2>
+    <p>A small shop starts by keeping orders in one spreadsheet. Every row is "one product in one order":</p>
+    <table>
+      <thead><tr><th>order_id</th><th>order_date</th><th>customer_id</th><th>customer_name</th><th>customer_city</th><th>product_id</th><th>product_name</th><th>unit_price</th><th>qty</th></tr></thead>
+      <tbody>
+        <tr><td>101</td><td>2026-11-01</td><td>7</td><td>Asha</td><td>Pune</td><td>P1</td><td>Pen</td><td>20</td><td>3</td></tr>
+        <tr><td>101</td><td>2026-11-01</td><td>7</td><td>Asha</td><td>Pune</td><td>P2</td><td>Notebook</td><td>60</td><td>2</td></tr>
+        <tr><td>102</td><td>2026-11-02</td><td>9</td><td>Ravi</td><td>Mysuru</td><td>P1</td><td>Pen</td><td>20</td><td>1</td></tr>
+        <tr><td>102</td><td>2026-11-02</td><td>9</td><td>Ravi</td><td>Mysuru</td><td>P3</td><td>Bag</td><td>900</td><td>1</td></tr>
+        <tr><td>103</td><td>2026-11-05</td><td>7</td><td>Asha</td><td>Pune</td><td>P2</td><td>Notebook</td><td>60</td><td>5</td></tr>
+      </tbody>
+    </table>
+    <p>It is easy to read. It is also full of <strong>repetition</strong>: "Asha, Pune" appears 3 times, and "Notebook, 60" appears twice. With 10,000 orders, Asha's city might be stored hundreds of times.</p>
+    <p>Repetition by itself only wastes space. The real problem is that every copy is a chance for the copies to <strong>disagree</strong>. Once two rows say different things about the same fact, the database no longer knows the truth.</p>
+    <p><strong>Normalization</strong> is a step-by-step method for splitting a table so that <strong>each fact is stored in exactly one place</strong>. The steps are called <strong>normal forms</strong>: 1NF, 2NF, 3NF, BCNF, and so on. Each one removes one kind of repetition.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> a well-designed table is about one thing. A customers table is about customers. A products table is about products. The big table above is about four things at once, which is why it breaks.
+    </div>
+  </section>
+
+  <section id="anomalies">
+    <h2>2. Three Ways the Big Table Breaks</h2>
+    <p>An <strong>anomaly</strong> is a case where a normal change to the data causes a wrong or impossible result. The big table has all three kinds.</p>
+    <h3>Update anomaly</h3>
+    <p>Asha moves to Bengaluru. You must change <em>three</em> rows. If the app updates only the rows for her latest order, the table now says she lives in two cities at once. Which one is true? Nobody knows.</p>
+    <h3>Insert anomaly</h3>
+    <p>The shop adds a new product, P4 "Stapler", price 150. Nobody has ordered it yet. To add a row you need an <code>order_id</code>, but there is no order. You cannot store the product without inventing a fake order.</p>
+    <h3>Delete anomaly</h3>
+    <p>Ravi cancels order 102, so you delete its two rows. Order 102 was the only order with the Bag. Now the fact "P3 is a Bag that costs 900" is gone too. Deleting one fact destroyed a different fact.</p>
+    <p>All three come from the same cause: <strong>facts about customers and products are stored inside rows about order lines</strong>. Normalization fixes the cause, and the anomalies disappear with it.</p>
+  </section>
+
+  <section id="keys">
+    <h2>3. Keys, in Plain Words</h2>
+    <p>A <strong>relation</strong> is the textbook word for a table. An <strong>attribute</strong> is a column. A <strong>tuple</strong> is a row. This page mostly uses the everyday words.</p>
+    <table>
+      <thead><tr><th>Term</th><th>Plain meaning</th><th>In the big table</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Superkey</strong></td><td>Any set of columns whose values are never the same in two rows. It picks out exactly one row.</td><td>{order_id, product_id}, and also {order_id, product_id, qty}</td></tr>
+        <tr><td><strong>Candidate key</strong></td><td>A superkey with nothing extra: remove any column and it stops being unique.</td><td>{order_id, product_id}</td></tr>
+        <tr><td><strong>Primary key</strong></td><td>The one candidate key you choose to identify rows.</td><td>(order_id, product_id)</td></tr>
+        <tr><td><strong>Composite key</strong></td><td>A key made of more than one column.</td><td>(order_id, product_id) is composite</td></tr>
+        <tr><td><strong>Prime attribute</strong></td><td>A column that is part of <em>some</em> candidate key.</td><td>order_id, product_id</td></tr>
+        <tr><td><strong>Foreign key</strong></td><td>A column that points to the primary key of another table. The database checks the target exists.</td><td>(appears after we split: orders.customer_id &rarr; customers)</td></tr>
+        <tr><td><strong>Surrogate key</strong></td><td>A made-up ID with no meaning, such as an auto-increment number or a UUID.</td><td>customer_id = 7</td></tr>
+        <tr><td><strong>Natural key</strong></td><td>A key that has real-world meaning, such as an email address or a vehicle number.</td><td>none here</td></tr>
+      </tbody>
+    </table>
+    <p>Why is {order_id} alone not a key of the big table? Because order 101 has two rows (Pen and Notebook). Why is {order_id, product_id} a key? Because one order lists each product at most once. That is a business rule, and keys always come from business rules, not from looking at a few rows of sample data.</p>
+  </section>
+
+  <section id="fds">
+    <h2>4. Functional Dependencies</h2>
+    <p>A <strong>functional dependency</strong> (FD) is a rule of the form <code>X &rarr; Y</code>. Read it as "X decides Y": whenever two rows have the same X, they must have the same Y.</p>
+    <p>Example: <code>customer_id &rarr; customer_name</code>. Any two rows with customer_id 7 must both say "Asha". If one said "Asha" and another said "Asha K", the rule would be broken.</p>
+    <p>The FDs in the shop are:</p>
+    <pre><code>  F1:  order_id               -&gt;  order_date, customer_id
+  F2:  customer_id            -&gt;  customer_name, customer_city
+  F3:  product_id             -&gt;  product_name, unit_price
+  F4:  order_id, product_id   -&gt;  qty</code></pre>
+    <p>Three facts about FDs that you will use all the time:</p>
+    <ul>
+      <li><strong>They chain.</strong> If <code>order_id &rarr; customer_id</code> and <code>customer_id &rarr; customer_city</code>, then <code>order_id &rarr; customer_city</code>. This kind of chained FD is called <strong>transitive</strong>.</li>
+      <li><strong>Adding columns on the left keeps it true.</strong> If <code>product_id &rarr; unit_price</code>, then <code>product_id, qty &rarr; unit_price</code> too.</li>
+      <li><strong>A key decides every column.</strong> That is really the definition of a key: <code>key &rarr; all columns</code>.</li>
+    </ul>
+    <h3>Two special kinds</h3>
+    <ul>
+      <li>A <strong>partial dependency</strong> is when a column depends on only <em>part</em> of a composite key. <code>product_id &rarr; product_name</code> is partial, because product_id is only half of the key (order_id, product_id).</li>
+      <li>A <strong>transitive dependency</strong> is when a non-key column depends on another non-key column. In the orders data, <code>customer_id &rarr; customer_city</code> is transitive, because customer_id is not the key; it is itself decided by order_id.</li>
+    </ul>
+    <p>Most of normalization is: find the partial and transitive dependencies, and move them into their own tables.</p>
+  </section>
+
+  <section id="closure">
+    <h2>5. Attribute Closure and Finding Keys by Hand</h2>
+    <p>The <strong>closure</strong> of a set of columns X, written X<sup>+</sup>, is every column that X decides, directly or through chains. If X<sup>+</sup> contains every column, X is a superkey.</p>
+    <h3>The algorithm</h3>
+    <ol>
+      <li>Start with result = X.</li>
+      <li>Look for any FD <code>A &rarr; B</code> where all of A is already in the result. Add B to the result.</li>
+      <li>Repeat step 2 until nothing new can be added.</li>
+    </ol>
+    <h3>Worked example 1</h3>
+    <p>Table R(A, B, C, D, E) with FDs: <code>A &rarr; B</code>, <code>B &rarr; C</code>, <code>C, D &rarr; E</code>. Find {A, D}<sup>+</sup>.</p>
+    <pre><code>  start:                       {A, D}
+  A -&gt; B   (A is in)     add B  {A, B, D}
+  B -&gt; C   (B is in)     add C  {A, B, C, D}
+  C,D -&gt; E (C, D are in) add E  {A, B, C, D, E}   &lt;- every column
+  nothing more to add.  So {A, D} is a superkey.</code></pre>
+    <p>Is it a <em>candidate</em> key? Check each smaller set: {A}<sup>+</sup> = {A, B, C} (no D, no E). {D}<sup>+</sup> = {D}. Neither is a superkey, so {A, D} is minimal: it is a candidate key.</p>
+    <h3>A shortcut for finding all candidate keys</h3>
+    <p>Sort the columns into groups by where they appear in the FDs:</p>
+    <ul>
+      <li><strong>Never on any right side:</strong> nothing can decide these, so they <em>must</em> be in every key.</li>
+      <li><strong>Only on right sides:</strong> they are always decided by something else, so they are <em>never</em> in a minimal key.</li>
+      <li><strong>On both sides:</strong> try them.</li>
+    </ul>
+    <p>In example 1: A and D never appear on a right side, so every key must contain both. {A, D}<sup>+</sup> is already everything, so <strong>{A, D} is the only candidate key</strong>.</p>
+    <h3>Worked example 2: the shop</h3>
+    <p>Columns that never appear on a right side of F1&ndash;F4: <code>order_id</code> and <code>product_id</code>. So both must be in every key. Their closure:</p>
+    <pre><code>  {order_id, product_id}
+  F1 adds order_date, customer_id
+  F2 adds customer_name, customer_city   (customer_id is now in)
+  F3 adds product_name, unit_price
+  F4 adds qty
+  = every column  -&gt;  {order_id, product_id} is the only candidate key</code></pre>
+  </section>
+
+  <section id="1nf">
+    <h2>6. First Normal Form (1NF)</h2>
+    <p><strong>Rule:</strong> every cell holds one single value, and there are no repeating groups of columns. Each row can be identified by a key.</p>
+    <p>Before the shop's table above, an even earlier version looked like this:</p>
+    <table>
+      <thead><tr><th>order_id</th><th>customer</th><th>products</th></tr></thead>
+      <tbody>
+        <tr><td>101</td><td>Asha</td><td>P1 x3, P2 x2</td></tr>
+        <tr><td>102</td><td>Ravi</td><td>P1 x1, P3 x1</td></tr>
+      </tbody>
+    </table>
+    <p>The <code>products</code> cell holds a list. Questions like "how many pens did we sell?" now need text parsing. You cannot add an index on "the second product". You cannot use a foreign key to check that P3 exists.</p>
+    <p>Another version had columns <code>product1, qty1, product2, qty2, product3, qty3</code>. That is a <strong>repeating group</strong>. An order with 4 products does not fit, and most cells are empty.</p>
+    <p><strong>Fix:</strong> one row per order line. That gives the big table from section 1, which <em>is</em> in 1NF. It still has every anomaly, which shows that 1NF alone is not enough.</p>
+    <div class="callout">
+      <strong>Modern note:</strong> PostgreSQL has array and JSON columns. Storing a list of tags in a JSON column is sometimes fine, as long as you never need to join on, constrain, or update single items inside it. If you do, it should be its own table.
+    </div>
+  </section>
+
+  <section id="2nf">
+    <h2>7. Second Normal Form (2NF)</h2>
+    <p><strong>Rule:</strong> be in 1NF, and have <strong>no partial dependencies</strong>. Every non-key column must depend on the <em>whole</em> key, not just part of it.</p>
+    <p>Only tables with a composite key can break 2NF. If the key is one column, there is no "part" of it.</p>
+    <p>The shop's key is (order_id, product_id). Check each non-key column:</p>
+    <table>
+      <thead><tr><th>Column</th><th>Depends on</th><th>Whole key?</th></tr></thead>
+      <tbody>
+        <tr><td>qty</td><td>order_id + product_id</td><td>Yes</td></tr>
+        <tr><td>order_date, customer_id</td><td>order_id only</td><td><strong>No, partial</strong></td></tr>
+        <tr><td>customer_name, customer_city</td><td>order_id only (through customer_id)</td><td><strong>No, partial</strong></td></tr>
+        <tr><td>product_name, unit_price</td><td>product_id only</td><td><strong>No, partial</strong></td></tr>
+      </tbody>
+    </table>
+    <p><strong>Fix:</strong> move each group into a table keyed by the part it depends on.</p>
+    <pre><code>  order_items(order_id, product_id, qty)                         key: (order_id, product_id)
+  orders(order_id, order_date, customer_id, customer_name, customer_city)   key: order_id
+  products(product_id, product_name, unit_price)                key: product_id</code></pre>
+    <p>The product anomalies are gone: a new product can be added to <code>products</code> without an order, and deleting order 102 no longer deletes the Bag. But <code>orders</code> still repeats Asha's name and city for each of her orders.</p>
+  </section>
+
+  <section id="3nf">
+    <h2>8. Third Normal Form (3NF)</h2>
+    <p><strong>Rule:</strong> be in 2NF, and have <strong>no transitive dependencies</strong>. A non-key column must not depend on another non-key column.</p>
+    <p>A classic way to remember 2NF and 3NF together: every non-key column must depend on "the key, the whole key, and nothing but the key".</p>
+    <p>In <code>orders(order_id, order_date, customer_id, customer_name, customer_city)</code>:</p>
+    <pre><code>  order_id  -&gt;  customer_id  -&gt;  customer_name, customer_city
+   (key)        (not a key)       depend on a non-key column  =  transitive</code></pre>
+    <p><strong>Fix:</strong> move the customer facts to their own table, and keep only the customer_id in orders as a foreign key.</p>
+    <pre><code>  customers(customer_id, customer_name, customer_city)      key: customer_id
+  orders(order_id, order_date, customer_id -&gt; customers)     key: order_id
+  products(product_id, product_name, unit_price)            key: product_id
+  order_items(order_id -&gt; orders, product_id -&gt; products, qty)   key: (order_id, product_id)</code></pre>
+    <p>Now check the anomalies again:</p>
+    <ul>
+      <li>Asha moves: change <strong>one</strong> row in <code>customers</code>.</li>
+      <li>New product: insert into <code>products</code>. No order needed.</li>
+      <li>Cancel an order: delete from <code>order_items</code> and <code>orders</code>. Products and customers stay.</li>
+    </ul>
+    <p>The full formal definition is a little wider. A table is in 3NF if, for every non-trivial FD <code>X &rarr; A</code>, either X is a superkey, <em>or</em> A is a prime attribute (part of some candidate key). That "or" matters in the next section.</p>
+  </section>
+
+  <section id="bcnf">
+    <h2>9. Boyce-Codd Normal Form (BCNF)</h2>
+    <p><strong>Rule:</strong> for every non-trivial FD <code>X &rarr; Y</code>, X must be a superkey. No exceptions. (A <strong>trivial</strong> FD is one like <code>A, B &rarr; A</code>, where the right side is already part of the left. It is always true and tells you nothing.)</p>
+    <p>BCNF is 3NF without the "or A is prime" escape. The two only differ when a table has several overlapping candidate keys. That is rare, but it does happen.</p>
+    <h3>Worked example: tutoring sessions</h3>
+    <p>A college runs tutoring. The rules:</p>
+    <ul>
+      <li>Each tutor teaches exactly one subject: <code>tutor &rarr; subject</code>.</li>
+      <li>For each subject, a student has exactly one tutor: <code>student, subject &rarr; tutor</code>.</li>
+    </ul>
+    <table>
+      <thead><tr><th>student</th><th>subject</th><th>tutor</th></tr></thead>
+      <tbody>
+        <tr><td>Asha</td><td>DBMS</td><td>Meera</td></tr>
+        <tr><td>Ravi</td><td>DBMS</td><td>Meera</td></tr>
+        <tr><td>Asha</td><td>OS</td><td>Kiran</td></tr>
+        <tr><td>Zoya</td><td>DBMS</td><td>Arjun</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Candidate keys:</strong> <code>student</code> never appears on a right side, so it is in every key. {student, subject}<sup>+</sup> = all (through the second rule). {student, tutor}<sup>+</sup> = all (tutor gives subject). So there are two keys: {student, subject} and {student, tutor}. Prime attributes: all three columns.</p>
+    <p><strong>3NF?</strong> The FD <code>tutor &rarr; subject</code> has a left side that is not a superkey, but subject is prime. So 3NF allows it. <strong>Yes, 3NF.</strong></p>
+    <p><strong>BCNF?</strong> tutor is not a superkey. <strong>No.</strong> And you can see the repetition: "Meera teaches DBMS" is stored twice. If Meera switches to teaching OS and only one row is updated, the data contradicts itself.</p>
+    <p><strong>Fix:</strong> split on the bad FD. Put <code>tutor &rarr; subject</code> in its own table, and keep the rest:</p>
+    <pre><code>  tutors(tutor, subject)          key: tutor
+  sessions(student, tutor)        key: (student, tutor)</code></pre>
+    <p>Both tables are in BCNF. But there is a price: the rule "a student has one tutor per subject" now spans two tables. No single table can enforce it with a key. Asha could be booked with both Meera and Arjun, who both teach DBMS, and no key would stop it. You would need a trigger or app logic.</p>
+    <div class="callout">
+      <strong>The trade-off:</strong> 3NF can always be reached while keeping every rule enforceable inside single tables. BCNF removes all FD-based repetition, but sometimes at the cost of a rule. Most real designs aim for BCNF and fall back to 3NF when a rule like this matters more.
+    </div>
+  </section>
+
+  <section id="lossless">
+    <h2>10. Splitting Safely: Lossless Joins and Kept Rules</h2>
+    <p>Splitting a table is only correct if you can join the pieces back and get <em>exactly</em> the original rows: no rows lost and no fake rows added. This is called a <strong>lossless join</strong>.</p>
+    <h3>A bad split, with numbers</h3>
+    <p>Table grades(student, course, grade):</p>
+    <pre><code>  student | course | grade
+  Asha    | DBMS   | A
+  Ravi    | OS     | A</code></pre>
+    <p>Split it into (student, grade) and (course, grade). Then join them back on grade:</p>
+    <pre><code>  (student, grade): (Asha, A), (Ravi, A)
+  (course, grade):  (DBMS, A), (OS, A)
+
+  join on grade = A gives 2 x 2 = 4 rows:
+  Asha | DBMS | A      real
+  Asha | OS   | A      FAKE
+  Ravi | DBMS | A      FAKE
+  Ravi | OS   | A      real</code></pre>
+    <p>We got <em>more</em> rows, but we lost information: we can no longer tell who took which course. ("Lossy" means information is lost, even though rows were added.)</p>
+    <h3>The test for a split into two tables</h3>
+    <p>Split R into R1 and R2. The split is lossless if the <strong>shared columns</strong> (R1 &cap; R2) form a key of R1 or a key of R2.</p>
+    <ul>
+      <li>Bad split above: shared column is <code>grade</code>. Grade is not a key of either piece. <strong>Lossy.</strong></li>
+      <li>Our 3NF step: <code>orders</code> and <code>customers</code> share <code>customer_id</code>, which is the key of customers. <strong>Lossless.</strong></li>
+      <li>Tutoring BCNF step: shared column <code>tutor</code> is the key of tutors. <strong>Lossless.</strong></li>
+    </ul>
+    <p>The safe habit: when you split on a bad FD <code>X &rarr; Y</code>, make a new table (X, Y) with key X, and remove Y from the old table. X stays in both, and it is a key of the new table, so the split is always lossless.</p>
+    <h3>Keeping rules (dependency preservation)</h3>
+    <p>A split <strong>preserves dependencies</strong> if each original FD can still be checked inside one table. The shop split keeps all four FDs (each lives in one table). The tutoring split loses <code>student, subject &rarr; tutor</code>, as we saw.</p>
+  </section>
+
+  <section id="4nf">
+    <h2>11. Beyond BCNF: 4NF in One Example</h2>
+    <p>Some repetition is not caused by FDs at all. A teacher can teach several subjects and speak several languages, and the two lists have nothing to do with each other:</p>
+    <pre><code>  teacher | subject | language
+  Meera   | DBMS    | English
+  Meera   | DBMS    | Kannada
+  Meera   | OS      | English
+  Meera   | OS      | Kannada</code></pre>
+    <p>The only key is all three columns, and there are no FDs, so this table is in BCNF. Yet adding a third language means adding two rows (one per subject). This is a <strong>multi-valued dependency</strong>: a teacher has a <em>set</em> of subjects and, separately, a <em>set</em> of languages.</p>
+    <p><strong>4NF</strong> says: put independent lists in separate tables. <code>teacher_subjects(teacher, subject)</code> and <code>teacher_languages(teacher, language)</code>. Adding a language is now one row.</p>
+    <p>Higher forms (5NF and beyond) exist, but tables that are in BCNF and avoid independent lists like this are well designed for nearly all real work.</p>
+  </section>
+
+  <section id="er">
+    <h2>12. From an ER Diagram to Tables</h2>
+    <p>In practice, people often design a schema from an <strong>ER diagram</strong> (Entity-Relationship diagram) first. An <strong>entity</strong> is a thing you store facts about (customer, product). A <strong>relationship</strong> is how two entities are linked (a customer places orders). The <strong>cardinality</strong> says how many of each side can be linked.</p>
+    <pre><code>  CUSTOMER 1 ----&lt; places &gt;---- N ORDER N ----&lt; contains &gt;---- M PRODUCT
+                                                  |
+                                                 qty</code></pre>
+    <p>Three rules turn any diagram into tables:</p>
+    <table>
+      <thead><tr><th>Relationship</th><th>Example</th><th>Tables</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1 to N</strong> (one-to-many)</td><td>One customer, many orders</td><td>Put a foreign key on the "many" side: <code>orders.customer_id</code></td></tr>
+        <tr><td><strong>N to M</strong> (many-to-many)</td><td>An order has many products; a product is in many orders</td><td>A new <strong>junction table</strong> with both foreign keys as its key: <code>order_items(order_id, product_id, qty)</code>. Facts about the link itself (qty) live here.</td></tr>
+        <tr><td><strong>1 to 1</strong></td><td>A user and their profile settings</td><td>Foreign key on either side with a <code>UNIQUE</code> constraint, or simply merge into one table</td></tr>
+      </tbody>
+    </table>
+    <p>If you draw the ER diagram well, the tables you get are usually already in 3NF. Normalization is then a check that you did not miss anything.</p>
+  </section>
+
+  <section id="denormalize">
+    <h2>13. When to Denormalize on Purpose</h2>
+    <p><strong>Denormalization</strong> means adding repetition back on purpose, usually to make reads faster. A normalized design needs joins. Joins are fast with good indexes (see <a href="dbms-indexing-btrees-query-plans.html">Indexing &amp; Query Plans</a>), but at very large scale, or for a screen that is read millions of times, a pre-joined copy can be worth it.</p>
+    <h3>First: some "copies" are not repetition at all</h3>
+    <p>Look at <code>unit_price</code>. If it lives only in <code>products</code>, then raising the pen's price to 25 would silently change the total of every old order. That is wrong. The price <em>paid on that day</em> is a different fact from the <em>current</em> price. So <code>order_items</code> should have its own <code>unit_price</code> column. The same goes for a shipping address on an order: it is "where this order was sent", not "where the customer lives now". Ask "is this the same fact, or a snapshot of it at a moment in time?"</p>
+    <h3>Common, reasonable denormalizations</h3>
+    <ul>
+      <li><strong>Stored totals and counters:</strong> keep <code>orders.total</code> or <code>posts.comment_count</code> instead of summing every time. You must update it in the same transaction as the rows it summarises (see <a href="dbms-transactions-isolation-mvcc.html">Transactions</a>), or it will drift.</li>
+      <li><strong>Materialized views:</strong> the database stores the result of a join or summary and you refresh it on a schedule. Good for dashboards that may be a few minutes old.</li>
+      <li><strong>Read models and caches:</strong> a search index or a cache that holds a ready-made "order page" built from the normalized tables. The normalized tables stay the source of truth.</li>
+      <li><strong>Analytics tables:</strong> data warehouses often use a <strong>star schema</strong>: one big "fact" table (one row per sale) surrounded by "dimension" tables (date, product, store). It repeats on purpose because analysts scan huge amounts of data and rarely update it.</li>
+    </ul>
+    <div class="callout">
+      <strong>Rule of thumb:</strong> normalize first (to BCNF or 3NF). Denormalize only for a measured, specific slow read, and write down which table is the source of truth and how the copy is kept in sync.
+    </div>
+  </section>
+
+  <section id="lab">
+    <h2>14. Lab: Build the Shop Schema</h2>
+    <p>Save this as <code>shop.sql</code> and run it with <code>sqlite3 shop.db &lt; shop.sql</code>, or paste it into any SQLite tool. For PostgreSQL, remove the <code>PRAGMA</code> line (PostgreSQL always checks foreign keys).</p>
+    <pre><code>PRAGMA foreign_keys = ON;   -- SQLite only: turn on foreign key checks
+
+CREATE TABLE customers (
+  customer_id   INTEGER PRIMARY KEY,
+  name          TEXT NOT NULL,
+  city          TEXT NOT NULL
+);
+
+CREATE TABLE products (
+  product_id    TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  price         INTEGER NOT NULL CHECK (price &gt;= 0)   -- current price, in rupees
+);
+
+CREATE TABLE orders (
+  order_id      INTEGER PRIMARY KEY,
+  order_date    TEXT NOT NULL,
+  customer_id   INTEGER NOT NULL REFERENCES customers(customer_id)
+);
+
+CREATE TABLE order_items (
+  order_id      INTEGER NOT NULL REFERENCES orders(order_id),
+  product_id    TEXT    NOT NULL REFERENCES products(product_id),
+  qty           INTEGER NOT NULL CHECK (qty &gt; 0),
+  unit_price    INTEGER NOT NULL,          -- price paid on that day (a separate fact)
+  PRIMARY KEY (order_id, product_id)
+);
+
+INSERT INTO customers VALUES (7, 'Asha', 'Pune'), (9, 'Ravi', 'Mysuru');
+INSERT INTO products  VALUES ('P1', 'Pen', 20), ('P2', 'Notebook', 60), ('P3', 'Bag', 900);
+INSERT INTO orders    VALUES (101, '2026-11-01', 7), (102, '2026-11-02', 9), (103, '2026-11-05', 7);
+INSERT INTO order_items VALUES
+  (101, 'P1', 3, 20), (101, 'P2', 2, 60),
+  (102, 'P1', 1, 20), (102, 'P3', 1, 900),
+  (103, 'P2', 5, 60);
+
+-- Asha moves: ONE row changes, no matter how many orders she has.
+UPDATE customers SET city = 'Bengaluru' WHERE customer_id = 7;
+
+-- Rebuild the original wide view with joins.
+SELECT o.order_id, c.name, c.city, p.name AS product, i.qty, i.unit_price,
+       i.qty * i.unit_price AS line_total
+FROM order_items i
+JOIN orders    o ON o.order_id    = i.order_id
+JOIN customers c ON c.customer_id = o.customer_id
+JOIN products  p ON p.product_id  = i.product_id
+ORDER BY o.order_id, p.product_id;
+
+-- The database now refuses bad data:
+INSERT INTO orders VALUES (104, '2026-11-06', 42);   -- no customer 42</code></pre>
+    <p>Output (checked with SQLite 3.46):</p>
+    <pre><code>order_id | name | city      | product  | qty | unit_price | line_total
+101      | Asha | Bengaluru | Pen      | 3   | 20         | 60
+101      | Asha | Bengaluru | Notebook | 2   | 60         | 120
+102      | Ravi | Mysuru    | Pen      | 1   | 20         | 20
+102      | Ravi | Mysuru    | Bag      | 1   | 900        | 900
+103      | Asha | Bengaluru | Notebook | 5   | 60         | 300
+Error: FOREIGN KEY constraint failed</code></pre>
+    <p>Three things to notice:</p>
+    <ol>
+      <li>One <code>UPDATE</code> moved Asha in every order. The update anomaly is gone.</li>
+      <li>A <strong>view</strong> can give people the old wide table back without storing it twice: <code>CREATE VIEW order_lines AS SELECT ...</code> (the query above).</li>
+      <li>The foreign key stopped an order for a customer who does not exist. The big table could never do that.</li>
+    </ol>
+    <p><strong>Try next:</strong> add the product P4 "Stapler" without any order. Then delete order 102 (its <code>order_items</code> first, then the order) and check that the Bag is still in <code>products</code>.</p>
+  </section>
+
+  <section id="practice">
+    <h2>15. Practice Problems</h2>
+    <p>Work these out on paper. Answers follow each one.</p>
+
+    <h3>Problem 1: closure</h3>
+    <p>R(A, B, C, D, E, F) with FDs <code>A &rarr; B C</code>, <code>C D &rarr; E</code>, <code>B &rarr; D</code>, <code>E &rarr; A</code>. Find {A}<sup>+</sup> and {E}<sup>+</sup>. Is A a key?</p>
+    <p><em>Answer:</em> {A}<sup>+</sup>: A gives B, C &rarr; {A, B, C}; B gives D &rarr; {A, B, C, D}; C, D give E &rarr; {A, B, C, D, E}. F is never added. So A is <strong>not</strong> a key (F is missing). {E}<sup>+</sup>: E gives A, and then the same chain: {A, B, C, D, E}. Also not a key.</p>
+
+    <h3>Problem 2: all candidate keys</h3>
+    <p>Same table and FDs as Problem 1. Find every candidate key.</p>
+    <p><em>Answer:</em> F appears on no right side, so F is in every key. {F}<sup>+</sup> = {F}. Try adding one column: {A, F}<sup>+</sup> = all, {E, F}<sup>+</sup> = all (E gives A). {B, F}<sup>+</sup> = {B, D, F}, no. {C, F}<sup>+</sup> = {C, F}, no. {D, F}<sup>+</sup> = {D, F}, no. Now try three columns without A or E: {C, D, F}<sup>+</sup>: C, D give E, E gives A, A gives B &rarr; all. {B, C, F}<sup>+</sup>: B gives D, then C, D give E &rarr; all. Each is minimal (no smaller part works). Candidate keys: <strong>{A, F}, {E, F}, {B, C, F}, {C, D, F}</strong>.</p>
+
+    <h3>Problem 3: name the normal form</h3>
+    <p>R(A, B, C, D) with FDs <code>A B &rarr; C</code>, <code>C &rarr; D</code>, <code>D &rarr; A</code>. Find the candidate keys and the highest normal form (up to BCNF).</p>
+    <p><em>Answer:</em> B is on no right side, so it is in every key. {B}<sup>+</sup> = {B}. {A, B}<sup>+</sup> = {A, B, C, D}. {B, C}<sup>+</sup> = {B, C, D, A}. {B, D}<sup>+</sup> = {B, D, A, C}. Keys: <strong>{A, B}, {B, C}, {B, D}</strong>. Every column is prime. 3NF: every FD's right side (C, D, A) is prime, so <strong>3NF holds</strong>. BCNF: <code>C &rarr; D</code> has C, which is not a superkey, so <strong>not BCNF</strong>. Highest form: 3NF.</p>
+
+    <h3>Problem 4: normalize a library</h3>
+    <p>loans(member_id, member_name, book_id, title, author, loan_date, due_date). One member can borrow the same book on different days. Rules: member_id decides member_name; book_id decides title and author; (member_id, book_id, loan_date) decides due_date. Give a BCNF design.</p>
+    <p><em>Answer:</em> The key is (member_id, book_id, loan_date). member_name depends on only member_id and title, author on only book_id: partial dependencies, so it is not even 2NF. Split:</p>
+    <pre><code>  members(member_id, member_name)                         key: member_id
+  books(book_id, title, author)                           key: book_id
+  loans(member_id, book_id, loan_date, due_date)          key: (member_id, book_id, loan_date)</code></pre>
+    <p>Every FD now has a key on its left side, so all three tables are in BCNF. (In real life, <code>book_id</code> would be a physical copy, and title and author would move to a separate "titles" table, because a library has many copies of one book.)</p>
+
+    <h3>Problem 5: lossless or not?</h3>
+    <p>R(A, B, C) with FD <code>B &rarr; C</code>. Is the split R1(A, B), R2(B, C) lossless? What about R1(A, C), R2(B, C)?</p>
+    <p><em>Answer:</em> First split: shared column B is a key of R2(B, C) because B &rarr; C. <strong>Lossless.</strong> Second split: shared column C. C does not decide A or B, so it is not a key of either piece. <strong>Lossy.</strong></p>
+
+    <h3>Problem 6: denormalize or not?</h3>
+    <p>A social app shows "1,204 likes" under every post. Counting rows in a <code>likes</code> table for every post on every screen is slow. What would you do, and what must you be careful about?</p>
+    <p><em>Answer:</em> Add a <code>like_count</code> column to <code>posts</code>. Keep the <code>likes</code> table as the source of truth (it stops double likes with a key on (user_id, post_id)). Update the counter in the <em>same transaction</em> as the insert or delete into <code>likes</code>, using <code>UPDATE posts SET like_count = like_count + 1</code> so two likes at the same moment do not overwrite each other (a lost update; see <a href="dbms-transactions-isolation-mvcc.html">Transactions</a>). Run a nightly job that recounts and fixes any drift.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>16. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Guessing FDs from sample data.</strong> Five rows where every city has one pin code does not mean city decides pin code. Ask what the business rules are.</li>
+      <li><strong>Lists in a text column</strong> ("P1,P3,P7"). You lose indexes, foreign keys, and simple queries. Use a junction table.</li>
+      <li><strong>Pointing old orders at the current price.</strong> Store the price paid on the order line. The same applies to addresses, tax rates, and exchange rates.</li>
+      <li><strong>Over-splitting.</strong> Splitting a table into pieces that have no repeated facts (for example, moving <code>first_name</code> and <code>last_name</code> into separate tables) adds joins and gains nothing.</li>
+      <li><strong>Lossy splits.</strong> Always split so the shared columns are a key of one piece.</li>
+      <li><strong>Forgetting constraints.</strong> A normalized design only protects you if you declare <code>PRIMARY KEY</code>, <code>FOREIGN KEY</code>, <code>UNIQUE</code>, <code>NOT NULL</code>, and <code>CHECK</code>. Without them, the app has to get it right every time.</li>
+      <li><strong>Missing indexes on foreign keys.</strong> PostgreSQL does not index foreign key columns for you. Joins and deletes on the parent table can become slow. Add an index on <code>orders(customer_id)</code> and similar columns.</li>
+      <li><strong>Denormalizing without a sync plan.</strong> Copies drift. Decide who updates them and how drift is found and fixed.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>17. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Form</th><th>Rule</th><th>What it removes</th><th>Typical fix</th></tr></thead>
+      <tbody>
+        <tr><td>1NF</td><td>One value per cell, no repeating column groups</td><td>Lists inside cells</td><td>One row per item, or a child table</td></tr>
+        <tr><td>2NF</td><td>1NF + no non-key column depends on part of a composite key</td><td>Partial dependencies</td><td>Move those columns to a table keyed by that part</td></tr>
+        <tr><td>3NF</td><td>For each FD X &rarr; A: X is a superkey or A is prime</td><td>Transitive dependencies</td><td>Move non-key-decided columns to their own table</td></tr>
+        <tr><td>BCNF</td><td>For each FD X &rarr; Y: X is a superkey</td><td>All FD-based repetition</td><td>Split on the bad FD: (X, Y) plus the rest</td></tr>
+        <tr><td>4NF</td><td>BCNF + no independent multi-valued facts in one table</td><td>Cross-product rows</td><td>One table per independent list</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>Task</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Closure X<sup>+</sup></td><td>Start with X; add the right side of any FD whose left side is fully inside; repeat</td></tr>
+        <tr><td>Find keys</td><td>Columns on no right side are in every key; grow from there and check closure</td></tr>
+        <tr><td>Lossless split of R into R1, R2</td><td>R1 &cap; R2 must be a key of R1 or R2</td></tr>
+        <tr><td>1:N relationship</td><td>Foreign key on the N side</td></tr>
+        <tr><td>N:M relationship</td><td>Junction table with both foreign keys as the primary key</td></tr>
+        <tr><td>Snapshot vs fact</td><td>"Price paid" and "shipped to" belong on the order, not looked up live</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.postgresql.org/docs/current/ddl-constraints.html" rel="noopener noreferrer">PostgreSQL: Constraints</a> &middot; <a href="https://www.sqlite.org/foreignkeys.html" rel="noopener noreferrer">SQLite: Foreign key support</a> &middot; <a href="https://en.wikipedia.org/wiki/Database_normalization" rel="noopener noreferrer">Wikipedia: Database normalization</a> &middot; <a href="https://db-book.com/" rel="noopener noreferrer">Silberschatz, Korth, Sudarshan: Database System Concepts (chapter on relational design)</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Concurrency, Synchronization &amp; Deadlocks</span></a>
+    <a class="prev-next-next" href="dbms-transactions-isolation-mvcc.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Transactions, Isolation Levels &amp; MVCC</span></a>
+    <p class="prev-next-step">Page 5 of 12 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a> &middot; <a href="dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

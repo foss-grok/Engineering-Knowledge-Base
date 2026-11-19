@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scenario: A Service Cannot Reach Its Database | CS Fundamentals</title>
+  <meta name="description" content="A real-world walkthrough: a service moved to a new Kubernetes cluster gets 'Connection timed out' talking to PostgreSQL. Reading connection errors layer by layer, DNS, TCP, firewall and route checks, ip route get, tcpdump, an overlapping pod CIDR found with longest prefix match, a proxy workaround, TLS and connection-limit errors that appear next, a blameless postmortem, a CIDR overlap check for CI, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Scenario: Cannot Reach the Database</p>
+  </nav>
+  <h1>Scenario: A Service Cannot Reach Its Database</h1>
+  <p>A team moves its checkout service to a new Kubernetes cluster. Every pod fails to start with "Connection timed out" when it connects to PostgreSQL, even though the database is healthy and the old servers still connect fine. This page follows the investigation step by step, the way an on-call engineer would, and uses ideas from the <a href="../Computer-Networks/cn-ip-addressing-subnetting-routing.html">IP addressing</a>, <a href="../Computer-Networks/cn-dns-http.html">DNS</a>, and <a href="../Computer-Networks/cn-tcp-deep-dive.html">TCP</a> pages. The company, names, and addresses are made up, but every step and error message is real.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#situation">The Situation</a></li>
+    <li><a href="#errors">Read the Error First: What Each Message Means</a></li>
+    <li><a href="#map">Draw the Path</a></li>
+    <li><a href="#dns">Step 1: Does the Name Resolve?</a></li>
+    <li><a href="#tcp">Step 2: Can We Open a TCP Connection?</a></li>
+    <li><a href="#narrow">Step 3: Narrow It Down by Changing One Thing</a></li>
+    <li><a href="#firewall">Step 4: Firewalls and Security Groups</a></li>
+    <li><a href="#route">Step 5: Follow the Packet with ip route get and tcpdump</a></li>
+    <li><a href="#root-cause">The Root Cause: Overlapping Address Ranges</a></li>
+    <li><a href="#fix">Mitigate Now, Fix Properly Later</a></li>
+    <li><a href="#next-layers">The Next Errors: TLS and Connection Limits</a></li>
+    <li><a href="#postmortem">Blameless Postmortem</a></li>
+    <li><a href="#prevent">Preventing It: An Address Registry and a CI Check</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="situation">
+    <h2>1. The Situation</h2>
+    <p>A shop's network in the cloud looks like this:</p>
+    <ul>
+      <li><strong>Network A</strong> (the old one), range <code>10.0.0.0/16</code>. It holds the PostgreSQL database at <code>10.0.12.34</code>, port 5432, with the private DNS name <code>db.internal</code>. The old checkout servers also live here.</li>
+      <li><strong>Network B</strong> (new), range <code>10.1.0.0/16</code>. A new Kubernetes cluster runs here. Network A and Network B are joined with <strong>peering</strong>, a cloud feature that routes traffic between two private networks. Peering only works if the two ranges do not overlap, and 10.0.0.0/16 and 10.1.0.0/16 do not. So far, so good.</li>
+    </ul>
+    <p>On Tuesday at 11:05 IST, the team deploys the checkout service to the new cluster. Every pod crashes at start-up. The log says:</p>
+    <pre><code>psycopg.OperationalError: connection failed: connection to server at "10.0.12.34",
+port 5432 failed: Connection timed out
+        Is the server running on that host and accepting TCP/IP connections?</code></pre>
+    <p>Meanwhile, the old checkout servers in Network A talk to the same database with no problem. The database dashboard shows normal CPU and normal connections.</p>
+    <p>A <strong>pod</strong> is Kubernetes' smallest unit: one or more containers that share a network address. A <strong>node</strong> is a machine in the cluster that runs pods. (See <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-architecture.html">Kubernetes Architecture</a>.)</p>
+  </section>
+
+  <section id="errors">
+    <h2>2. Read the Error First: What Each Message Means</h2>
+    <p>The exact wording of a connection error tells you <em>how far</em> the attempt got. Learning this table saves hours.</p>
+    <table>
+      <thead><tr><th>Error message (typical wording)</th><th>What happened on the wire</th><th>Usual causes</th></tr></thead>
+      <tbody>
+        <tr><td>"could not translate host name", "Name or service not known", <code>NXDOMAIN</code></td><td>Never got an IP address. No packet was sent to the database.</td><td>Typo in the name, private DNS zone not visible from this network, DNS server unreachable</td></tr>
+        <tr><td>"Connection refused"</td><td>The packet <strong>reached</strong> the machine, and it answered "no" right away (a TCP reset, RST).</td><td>Nothing listening on that port, server listening only on 127.0.0.1, wrong port, a firewall set to REJECT</td></tr>
+        <tr><td>"Connection timed out"</td><td>The client sent SYN packets and <strong>nothing ever came back</strong>.</td><td>A firewall that silently DROPs, a missing or wrong route, the reply going somewhere else, host down</td></tr>
+        <tr><td>"No route to host"</td><td>The local machine has no route, or a router sent back an "unreachable" message.</td><td>Missing route, a firewall REJECT that uses ICMP, the target down on the local subnet (ARP fails)</td></tr>
+        <tr><td>"Connection reset by peer" (after working a while)</td><td>A connection existed, then something killed it.</td><td>Idle timeout on a NAT or load balancer, server restarted, proxy limits</td></tr>
+        <tr><td>"certificate verify failed", "SSL is required"</td><td>TCP works. The TLS handshake failed.</td><td>Missing CA certificate, wrong host name in the certificate, TLS turned off on one side</td></tr>
+        <tr><td>"password authentication failed", "no pg_hba.conf entry"</td><td>TCP and TLS worked. The database rejected the login.</td><td>Wrong secret, the server's access rules do not allow this source address or user</td></tr>
+        <tr><td>"sorry, too many clients already"</td><td>Everything worked, but the database is out of connection slots.</td><td>Too many pods &times; too big a pool (section 11)</td></tr>
+      </tbody>
+    </table>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> "refused" means you knocked and someone said "go away". "Timed out" means you knocked and heard nothing: the door might not exist, someone might be ignoring you, or the answer went to the wrong house. Our error is a timeout, so we are looking for packets that are dropped or lost, not for a stopped database.
+    </div>
+  </section>
+
+  <section id="map">
+    <h2>3. Draw the Path</h2>
+    <p>Before running commands, write down every hop the connection should take. Each arrow is a place it can fail.</p>
+    <pre><code>  checkout pod          node (VM)           Network B           peering          Network A
+  10.0.3.17 (?)   -&gt;   10.1.20.15     -&gt;   route table   -&gt;   connection  -&gt;   route table
+                                                                                    |
+                                                                                    v
+                                                        security group  -&gt;  PostgreSQL 10.0.12.34:5432
+
+  Layers to check, in order:
+    name   -&gt;  DNS gives 10.0.12.34?
+    route  -&gt;  does each hop send the packet the right way, and can the reply come back?
+    filter -&gt;  do firewalls allow it both ways?
+    port   -&gt;  is PostgreSQL listening?
+    TLS, login, limits  -&gt;  only after TCP works</code></pre>
+    <p>Notice the question mark on the pod's address. The pod's IP looks like <code>10.0.3.17</code>. That is odd: Network A uses 10.0.0.0/16, and this pod lives in Network B. Keep that in mind; it will matter.</p>
+  </section>
+
+  <section id="dns">
+    <h2>4. Step 1: Does the Name Resolve?</h2>
+    <p>The error already shows the IP address (10.0.12.34), so DNS probably worked. But it is cheap to check, and it rules out a whole layer. Start a temporary debug pod in the same namespace (the <code>netshoot</code> image is a common toolbox for this):</p>
+    <pre><code>$ kubectl run netdebug -it --rm --image=nicolaka/netshoot -n checkout -- bash
+
+netdebug$ getent hosts db.internal
+10.0.12.34      db.internal</code></pre>
+    <p><code>getent hosts</code> asks the same resolver the app uses (including <code>/etc/hosts</code> and the Kubernetes search list), which makes it a better test than <code>dig</code> for "what does my app see". <strong>DNS is fine.</strong></p>
+  </section>
+
+  <section id="tcp">
+    <h2>5. Step 2: Can We Open a TCP Connection?</h2>
+    <p>Take the app out of the picture. If a plain TCP connection fails, no amount of app debugging will help.</p>
+    <pre><code>netdebug$ nc -vz -w 3 10.0.12.34 5432
+nc: connect to 10.0.12.34 port 5432 (tcp) timed out: Operation now in progress</code></pre>
+    <ul>
+      <li><code>nc</code> (netcat) tries a raw TCP connection. <code>-z</code> means "just connect, send nothing". <code>-v</code> prints the result. <code>-w 3</code> gives up after 3 seconds.</li>
+    </ul>
+    <p>It times out, just like the app. The problem is below the app: somewhere in routing or filtering.</p>
+  </section>
+
+  <section id="narrow">
+    <h2>6. Step 3: Narrow It Down by Changing One Thing</h2>
+    <p>The fastest way to find a network problem is to repeat the same test from different places and see where it starts failing.</p>
+    <table>
+      <thead><tr><th>Test from</th><th>Source address</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Old checkout server, Network A</td><td>10.0.4.21</td><td>Connects</td></tr>
+        <tr><td>A plain VM in Network B (not part of the cluster)</td><td>10.1.5.10</td><td><strong>Connects</strong></td></tr>
+        <tr><td>A cluster node, Network B (logged in with SSH)</td><td>10.1.20.15</td><td><strong>Times out</strong></td></tr>
+        <tr><td>A pod on that node</td><td>10.0.3.17</td><td>Times out</td></tr>
+      </tbody>
+    </table>
+    <p>This one table rules out a lot:</p>
+    <ul>
+      <li>The database is up and listening (Network A connects).</li>
+      <li>Peering works, and the database's firewall allows Network B (the plain VM connects).</li>
+      <li>The failure starts at the <strong>cluster nodes</strong>. Something on the nodes themselves is different from a plain VM in the same network.</li>
+    </ul>
+  </section>
+
+  <section id="firewall">
+    <h2>7. Step 4: Firewalls and Security Groups</h2>
+    <p>A <strong>security group</strong> is a cloud firewall attached to a machine or database. It has rules like "allow TCP 5432 from 10.1.0.0/16". Anything not allowed is <em>silently dropped</em>, which produces exactly a timeout. So it is always worth checking, even though step 3 suggests it is fine here.</p>
+    <ul>
+      <li>The database's security group allows TCP 5432 from <code>10.0.0.0/16</code> and <code>10.1.0.0/16</code>. The node 10.1.20.15 is inside 10.1.0.0/16. Allowed.</li>
+      <li>The nodes' security group allows all outbound traffic. Allowed.</li>
+      <li>Kubernetes <strong>NetworkPolicies</strong> (firewall rules between pods, see <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a>) could block pods, but the node itself also fails, and policies do not apply to the node.</li>
+    </ul>
+    <p>Firewalls are not the cause. What else is different on a cluster node? Its <strong>routing table</strong>: the cluster's network plugin adds routes for pod traffic.</p>
+  </section>
+
+  <section id="route">
+    <h2>8. Step 5: Follow the Packet with ip route get and tcpdump</h2>
+    <p>First, ask the node's kernel where it would send a packet to the database. This runs the real longest prefix match:</p>
+    <pre><code>node$ ip route get 10.0.12.34
+10.0.12.34 via 10.0.12.0 dev flannel.1 src 10.0.3.0 uid 1000</code></pre>
+    <p>Compare with the plain VM in the same network:</p>
+    <pre><code>vm$ ip route get 10.0.12.34
+10.0.12.34 via 10.1.0.1 dev eth0 src 10.1.5.10 uid 1000</code></pre>
+    <p>The VM sends the packet to the network's gateway (10.1.0.1) on <code>eth0</code>, the real network card. The node sends it into <code>flannel.1</code>. <strong>flannel</strong> is the cluster's network plugin: it builds a private "overlay" network for pods, and <code>flannel.1</code> is its tunnel interface. The node thinks 10.0.12.34 is a <em>pod</em> on another node.</p>
+    <p>Look at the full table to see why:</p>
+    <pre><code>node$ ip route
+default via 10.1.0.1 dev eth0
+10.0.0.0/24 via 10.0.0.0 dev flannel.1 onlink
+10.0.1.0/24 via 10.0.1.0 dev flannel.1 onlink
+10.0.2.0/24 via 10.0.2.0 dev flannel.1 onlink
+10.0.3.0/24 dev cni0 proto kernel scope link src 10.0.3.1      &lt;- this node's own pods
+...
+10.0.12.0/24 via 10.0.12.0 dev flannel.1 onlink                &lt;- pods on node #13
+...
+10.1.0.0/16 dev eth0 proto kernel scope link src 10.1.20.15</code></pre>
+    <p>Apply longest prefix match by hand for the destination 10.0.12.34:</p>
+    <table>
+      <thead><tr><th>Route</th><th>Matches 10.0.12.34?</th><th>Prefix length</th></tr></thead>
+      <tbody>
+        <tr><td>default (0.0.0.0/0) via 10.1.0.1</td><td>Yes</td><td>0</td></tr>
+        <tr><td>10.1.0.0/16 dev eth0</td><td>No</td><td>&nbsp;</td></tr>
+        <tr><td>10.0.12.0/24 via flannel.1</td><td>Yes</td><td><strong>24, wins</strong></td></tr>
+      </tbody>
+    </table>
+    <p>The /24 pod route is more specific than the default route, so the packet goes into the tunnel to node #13, which has no database on it. It is dropped there. No reply ever comes: <strong>timeout</strong>.</p>
+    <h3>Confirm with tcpdump</h3>
+    <p><strong>tcpdump</strong> prints the packets crossing a network interface. Watch both interfaces while running <code>nc</code> again in another terminal:</p>
+    <pre><code>node$ sudo tcpdump -ni any host 10.0.12.34 and port 5432
+11:52:01.204 flannel.1 Out IP 10.0.3.0.40312 &gt; 10.0.12.34.5432: Flags [S], seq 1803321377, length 0
+11:52:02.230 flannel.1 Out IP 10.0.3.0.40312 &gt; 10.0.12.34.5432: Flags [S], seq 1803321377, length 0
+11:52:04.278 flannel.1 Out IP 10.0.3.0.40312 &gt; 10.0.12.34.5432: Flags [S], seq 1803321377, length 0</code></pre>
+    <p>How to read it: <code>[S]</code> is a SYN, the first packet of the TCP handshake (see <a href="../Computer-Networks/cn-tcp-deep-dive.html#handshake">TCP handshake</a>). The same SYN is resent after 1 second, then 2 seconds later: TCP's retry timer doubling. There is never a <code>[S.]</code> (SYN-ACK) coming back. And every packet leaves on <code>flannel.1</code>, never on <code>eth0</code>. That proves the routing theory.</p>
+  </section>
+
+  <section id="root-cause">
+    <h2>9. The Root Cause: Overlapping Address Ranges</h2>
+    <p>The cluster's pod range was set to <code>10.0.0.0/16</code>. That is the <strong>same range as Network A</strong>, where the database lives. Each node gets a /24 slice of it for its pods: node #1 gets 10.0.0.0/24, node #4 gets 10.0.3.0/24 (our node), and node #13 gets 10.0.12.0/24, which happens to contain the database's address.</p>
+    <pre><code>  10.0.0.0/16  as Network A sees it:    db subnet 10.0.12.0/24   (database 10.0.12.34)
+  10.0.0.0/16  as the cluster sees it:  pod slice 10.0.12.0/24   (pods on node #13)
+                                        same numbers, two different places</code></pre>
+    <p>How did it happen? The cluster's configuration was copied from a test cluster where 10.0.0.0/16 was free. The cloud did not complain, because the pod range only exists <em>inside</em> the cluster; the cloud only checks the network ranges it manages (10.1.0.0/16).</p>
+    <h3>Why it fails in both directions</h3>
+    <p>Even destinations that do not hit a pod route would break. Suppose the database were at 10.0.200.5, a slice no node owns yet. The packet would go out through the default route correctly. But pods send packets from their pod address (like 10.0.3.17). Normally the node replaces the pod address with its own node address on the way out (a form of NAT called <strong>masquerading</strong>, see <a href="../Computer-Networks/cn-ip-addressing-subnetting-routing.html#nat">NAT</a>). But the plugin does not masquerade traffic to addresses inside the pod range, because it assumes those are other pods. So the database would see a packet from 10.0.3.17 and send its reply to Network A's own local 10.0.3.0/24 subnet. The reply would never return.</p>
+    <p>And it would get worse with time: as the cluster grows, more nodes take more /24 slices, and more of Network A becomes unreachable.</p>
+    <div class="callout">
+      <strong>The lesson:</strong> a router cannot tell two places apart if they use the same numbers. Overlapping ranges do not fail loudly; they fail as timeouts that depend on exactly which address you try. This is why <a href="../Computer-Networks/cn-ip-addressing-subnetting-routing.html#cloud-k8s">address planning</a> matters.
+    </div>
+  </section>
+
+  <section id="fix">
+    <h2>10. Mitigate Now, Fix Properly Later</h2>
+    <p>On-call work has two separate goals. <strong>Mitigation</strong> stops the harm quickly, even if it is ugly. The <strong>fix</strong> removes the cause.</p>
+    <h3>Mitigation (same day)</h3>
+    <p>The plain VM at 10.1.5.10 can reach the database, and its address is not in the pod range. So the team runs <strong>PgBouncer</strong> (a small connection proxy for PostgreSQL) on that VM, and points the checkout pods at it:</p>
+    <pre><code>  pod 10.0.3.17  --&gt;  PgBouncer 10.1.5.10:6432  --&gt;  PostgreSQL 10.0.12.34:5432
+       (10.1.5.10 is in 10.1.0.0/16: normal route via eth0, and masqueraded to the node IP)</code></pre>
+    <pre><code>node$ ip route get 10.1.5.10
+10.1.5.10 dev eth0 src 10.1.20.15 uid 1000
+netdebug$ nc -vz -w 3 10.1.5.10 6432
+Connection to 10.1.5.10 6432 port [tcp/*] succeeded!</code></pre>
+    <p>It is a single extra machine in the path, so it is a temporary step, but checkout runs on the new cluster by 13:40 IST. The old servers keep running as a fallback.</p>
+    <h3>Proper fix (planned)</h3>
+    <p>The pod range of a running cluster usually cannot be changed in place. The team:</p>
+    <ol>
+      <li>Picks a new pod range that overlaps with nothing in the company's address list. They choose <code>100.64.0.0/16</code>, part of the shared range many teams use for pod networks because it is rarely used by offices or clouds (see <a href="../Computer-Networks/cn-ip-addressing-subnetting-routing.html#special">special ranges</a>).</li>
+      <li>Builds a new cluster with that range, moves the workloads over, and deletes the old cluster.</li>
+      <li>Checks from a node: <code>ip route get 10.0.12.34</code> now goes <code>via 10.1.0.1 dev eth0</code>.</li>
+      <li>Removes the PgBouncer workaround, or keeps it on purpose for the reason in the next section.</li>
+    </ol>
+  </section>
+
+  <section id="next-layers">
+    <h2>11. The Next Errors: TLS and Connection Limits</h2>
+    <p>Fixing a network problem often reveals the next problem up the stack, because now the connection gets further. Two came up during the move.</p>
+    <h3>"no pg_hba.conf entry ... no encryption"</h3>
+    <pre><code>FATAL: no pg_hba.conf entry for host "10.1.20.15", user "checkout", database "shop", no encryption</code></pre>
+    <p>This is good news: TCP works now. PostgreSQL's access file (<code>pg_hba.conf</code>) only accepts connections from Network B if they use TLS (<code>hostssl</code> lines). The new deployment had dropped <code>sslmode=require</code> from its connection string. Adding it back fixed the error. Better still is <code>sslmode=verify-full</code> with the database's CA certificate, which also checks that you are talking to the real server.</p>
+    <h3>"sorry, too many clients already"</h3>
+    <p>A day later, during a sale, the cluster scaled the checkout service to 40 pods. Each pod's connection pool was set to 20 connections:</p>
+    <pre><code>  40 pods x 20 connections = 800 connections wanted
+  PostgreSQL max_connections = 200
+  -&gt; new connections fail with "sorry, too many clients already"</code></pre>
+    <p>How many connections does the work really need? Use Little's law from the <a href="scenario-slow-api-debugging.html#littles-law">slow-API scenario</a>: busy connections = requests per second &times; time each request holds a connection. At the sale peak, 2,000 queries per second &times; 0.010 s = <strong>20 busy connections</strong> on average. 800 was 40 times more than needed.</p>
+    <p>Fix: keep PgBouncer, now as a deliberate shared pool. Pods connect to PgBouncer (cheap), and PgBouncer keeps about 40 real connections to PostgreSQL in "transaction" mode, handing a connection to a pod only for the length of one transaction. The pod pool size was also lowered to 5.</p>
+  </section>
+
+  <section id="postmortem">
+    <h2>12. Blameless Postmortem</h2>
+    <p>A <strong>postmortem</strong> is a short write-up after an incident. "Blameless" means it looks for weak points in systems and processes, not for a person to blame. People make mistakes; good systems catch them.</p>
+    <table>
+      <thead><tr><th>Time (IST)</th><th>Event</th></tr></thead>
+      <tbody>
+        <tr><td>Tue 11:05</td><td>Checkout deployed to the new cluster. All pods crash with "Connection timed out".</td></tr>
+        <tr><td>11:12</td><td>Rollback not needed: old servers still serve all traffic. Investigation starts.</td></tr>
+        <tr><td>11:20</td><td>DNS and database health confirmed fine. <code>nc</code> times out from pods.</td></tr>
+        <tr><td>11:35</td><td>Comparison table: plain VM works, nodes fail. Focus moves to the nodes.</td></tr>
+        <tr><td>11:48</td><td><code>ip route get</code> shows traffic going into <code>flannel.1</code>. tcpdump confirms SYNs with no replies.</td></tr>
+        <tr><td>12:05</td><td>Root cause found: pod range 10.0.0.0/16 overlaps Network A.</td></tr>
+        <tr><td>13:40</td><td>PgBouncer on a plain VM in place. Checkout runs on the new cluster.</td></tr>
+        <tr><td>Following week</td><td>New cluster with pod range 100.64.0.0/16. Old cluster removed.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Impact:</strong> none for customers (the old servers kept serving). About 2.5 hours of engineering time, and a one-week delay to the move.</p>
+    <p><strong>What went well:</strong> the old servers were kept running during the move; the team tested one layer at a time; the comparison table found the right area in 15 minutes.</p>
+    <p><strong>What went wrong:</strong> no central list of address ranges existed; the cluster config was copied without review of its address ranges; nothing in CI checked for overlaps.</p>
+    <p><strong>Action items:</strong></p>
+    <ol>
+      <li>Create an address registry (a shared file listing every range and its owner). Owner: platform team.</li>
+      <li>Add a CI check that fails if any new range overlaps the registry (next section).</li>
+      <li>Add the "can every node reach the database" test to the cluster's acceptance checklist.</li>
+      <li>Set connection pool sizes from measured load, and keep PgBouncer as the shared pool.</li>
+    </ol>
+  </section>
+
+  <section id="prevent">
+    <h2>13. Preventing It: An Address Registry and a CI Check</h2>
+    <p>The registry can be as simple as a text file in a repository. A short script, run in CI on every change, catches overlaps before anything is built:</p>
+    <pre><code>#!/usr/bin/env python3
+"""Fail if any two address ranges in the registry overlap."""
+import ipaddress
+import itertools
+import sys
+
+REGISTRY = {
+    "network-a (old prod)":    "10.0.0.0/16",
+    "network-b (new prod)":    "10.1.0.0/16",
+    "office vpn":              "172.20.0.0/16",
+    "docker default bridge":   "172.17.0.0/16",
+    "cluster-2 pods":          "100.64.0.0/16",
+    "cluster-2 services":      "100.65.0.0/20",
+    "cluster-1 pods (old)":    "10.0.0.0/16",     # the mistake from this incident
+}
+
+nets = {name: ipaddress.ip_network(cidr) for name, cidr in REGISTRY.items()}
+problems = [
+    (a, b) for a, b in itertools.combinations(nets, 2) if nets[a].overlaps(nets[b])
+]
+for a, b in problems:
+    print(f"OVERLAP: {a} {nets[a]}  &lt;-&gt;  {b} {nets[b]}")
+sys.exit(1 if problems else 0)</code></pre>
+    <p>Output with the old cluster still listed:</p>
+    <pre><code>OVERLAP: network-a (old prod) 10.0.0.0/16  &lt;-&gt;  cluster-1 pods (old) 10.0.0.0/16</code></pre>
+    <p>The script exits with code 1, so the CI job fails and the change cannot be merged. Remove the old cluster's line and it passes.</p>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Try each one before reading the answer.</p>
+
+    <h3>Problem 1: read the error</h3>
+    <p>An app logs "Connection refused" to 10.0.12.34:5432. The database server is running. Name two likely causes and one command to check each.</p>
+    <p><em>Answer:</em> A refusal means the packet reached the machine. (1) PostgreSQL listens only on 127.0.0.1: on the server, <code>ss -ltnp | grep 5432</code> shows <code>127.0.0.1:5432</code> instead of <code>0.0.0.0:5432</code>; fix <code>listen_addresses</code>. (2) Wrong port: check the server's real port with the same <code>ss</code> command and compare with the app's setting. (A firewall set to REJECT is a third possibility: check its rules.)</p>
+
+    <h3>Problem 2: longest prefix match</h3>
+    <p>A node has these routes: <code>default via 10.1.0.1 dev eth0</code>, <code>10.1.0.0/16 dev eth0</code>, <code>100.64.0.0/16 via ... dev flannel.1</code>, <code>100.64.7.0/24 dev cni0</code>. Where do packets to 10.0.12.34, 100.64.7.9, 100.64.9.9, and 10.1.5.10 go?</p>
+    <p><em>Answer:</em> 10.0.12.34: only the default matches &rarr; <strong>eth0 via 10.1.0.1</strong> (correct for the database now). 100.64.7.9: matches /16 and /24 &rarr; <strong>cni0</strong>, a pod on this node. 100.64.9.9: matches the /16 &rarr; <strong>flannel.1</strong>, a pod on another node. 10.1.5.10: matches 10.1.0.0/16 &rarr; <strong>eth0 directly</strong>, same network.</p>
+
+    <h3>Problem 3: which hosts break?</h3>
+    <p>A cluster uses pod range 10.0.0.0/16 and gives each node a /24, in order from 10.0.0.0/24. It has 6 nodes. Which of these Network A addresses are unreachable from the nodes because of a pod route: 10.0.2.8, 10.0.5.200, 10.0.6.1, 10.0.12.34?</p>
+    <p><em>Answer:</em> 6 nodes own 10.0.0.0/24 through 10.0.5.0/24. So <strong>10.0.2.8</strong> and <strong>10.0.5.200</strong> hit pod routes and break. 10.0.6.1 and 10.0.12.34 have no pod route <em>yet</em>, so packets leave via the default route. But pod traffic to them is still not masqueraded (they are inside the pod range), so replies go to the wrong place: they also fail from pods. And as more nodes join, more addresses hit pod routes.</p>
+
+    <h3>Problem 4: pool sizing</h3>
+    <p>A service handles 900 requests per second at peak. Each request runs two queries, each holding a connection for 4 ms. It runs on 30 pods. The database allows 300 connections, and you want to keep 50 free for admin tools and other services. What pool size per pod is safe, and how many connections are actually busy on average?</p>
+    <p><em>Answer:</em> Busy connections = 900 &times; 2 &times; 0.004 = <strong>7.2</strong> on average. Budget = 300 &minus; 50 = 250, so per pod at most 250 &divide; 30 &asymp; <strong>8</strong>. A pool of 3&ndash;5 per pod already gives 90&ndash;150 connections, far above the 7.2 needed, with room for bursts.</p>
+
+    <h3>Problem 5: what does tcpdump tell you?</h3>
+    <p>On the client you see <code>Flags [S]</code> going out on <code>eth0</code>, then <code>Flags [R.]</code> coming back from the server 0.4 ms later. What error does the app show, and what does it mean?</p>
+    <p><em>Answer:</em> <code>[R.]</code> is a reset. The app shows <strong>"Connection refused"</strong>. The path and routing are fine (the reply came back quickly), but nothing accepts connections on that port, or a firewall is set to REJECT.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Debugging the app before the network.</strong> Run <code>nc -vz</code> first. If raw TCP fails, the app is not the problem.</li>
+      <li><strong>Testing from your laptop instead of from where the app runs.</strong> Your laptop has different routes, DNS, and firewall rules. Use a debug pod on the same node.</li>
+      <li><strong>Treating "timed out" and "refused" as the same thing.</strong> They point to completely different layers.</li>
+      <li><strong>Copying cluster or network config without checking its address ranges.</strong> Defaults and copied values are the most common cause of overlaps.</li>
+      <li><strong>Assuming the cloud will stop overlaps.</strong> It only checks the ranges it manages. Pod ranges, Docker bridges, and VPNs are your responsibility.</li>
+      <li><strong>Stopping at the first fix.</strong> After the network works, expect TLS, login, and connection-limit errors next. Each one is progress.</li>
+      <li><strong>Sizing connection pools by guesswork.</strong> Pods &times; pool size must stay below the database limit at maximum scale. Use Little's law and a shared pool.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Question</th><th>Command</th></tr></thead>
+      <tbody>
+        <tr><td>Debug shell next to the app</td><td><code>kubectl run netdebug -it --rm --image=nicolaka/netshoot -- bash</code></td></tr>
+        <tr><td>What IP does the app's resolver give?</td><td><code>getent hosts db.internal</code></td></tr>
+        <tr><td>Can I open TCP to it?</td><td><code>nc -vz -w 3 HOST PORT</code></td></tr>
+        <tr><td>Which route will be used?</td><td><code>ip route get HOST</code></td></tr>
+        <tr><td>Full routing table</td><td><code>ip route</code></td></tr>
+        <tr><td>Are packets leaving, and do replies come back?</td><td><code>sudo tcpdump -ni any host HOST and port PORT</code></td></tr>
+        <tr><td>Is the server listening, and on which address?</td><td><code>ss -ltnp</code> (on the server)</td></tr>
+        <tr><td>Does TLS work?</td><td><code>openssl s_client -connect HOST:PORT -starttls postgres</code></td></tr>
+        <tr><td>Full login test</td><td><code>psql "host=HOST dbname=shop user=checkout sslmode=require"</code></td></tr>
+        <tr><td>Do two ranges overlap?</td><td><code>python3 -c "import ipaddress as i; print(i.ip_network('10.0.0.0/16').overlaps(i.ip_network('10.0.12.0/24')))"</code></td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.postgresql.org/docs/current/auth-pg-hba-conf.html" rel="noopener noreferrer">PostgreSQL: pg_hba.conf</a> &middot; <a href="https://www.postgresql.org/docs/current/libpq-ssl.html" rel="noopener noreferrer">PostgreSQL: SSL support in clients</a> &middot; <a href="https://www.pgbouncer.org/config.html" rel="noopener noreferrer">PgBouncer configuration</a> &middot; <a href="https://github.com/flannel-io/flannel" rel="noopener noreferrer">flannel</a> &middot; <a href="https://man7.org/linux/man-pages/man8/ip-route.8.html" rel="noopener noreferrer">man ip-route(8)</a> &middot; <a href="https://www.tcpdump.org/manpages/tcpdump.1.html" rel="noopener noreferrer">man tcpdump(1)</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="scenario-slow-api-debugging.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Scenario: Debugging a Slow API End to End</span></a>
+    <p class="prev-next-step">Page 12 of 12 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Computer-Networks/cn-ip-addressing-subnetting-routing.html">IP Addressing, Subnetting &amp; Routing</a> &middot; <a href="../Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="../Computer-Networks/cn-dns-http.html">DNS &amp; HTTP</a> &middot; <a href="scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

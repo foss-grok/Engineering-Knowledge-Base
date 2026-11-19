@@ -45,6 +45,7 @@
       <li>Services provide stable virtual IPs that load-balance across Pod backends.</li>
     </ol>
     <p>This flat, routable Pod network is implemented by a <strong>CNI (Container Network Interface)</strong> plugin on each node. Common choices: Calico, Cilium, Flannel, AWS VPC CNI, Azure CNI.</p>
+    <p>The Pod addresses come from a <strong>Pod CIDR</strong> range (for example <code>10.244.0.0/16</code>), usually cut into one slice per node. Pick it so it never overlaps your cloud networks, office, or VPN. See <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-ip-addressing-subnetting-routing.html#cloud-k8s">planning addresses for Kubernetes</a> for the subnet math.</p>
     <pre><code>┌─────────────────────────────────────────────────────────────────┐
 │  Node 10.0.1.5                                                  │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
@@ -426,7 +427,7 @@ kubectl describe networkpolicy -n production
     <div class="page-footer-nav">
       <p>Next topic:</p>
       <a class="interview-link" href="kubernetes-storage.html">Kubernetes Storage →</a>
-      <p>Go deeper: <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a> (handshakes, retransmission, congestion control, and debugging connection errors).</p>
+      <p>Go deeper: <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a> (handshakes, retransmission, congestion control, and debugging connection errors) &middot; <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-ip-addressing-subnetting-routing.html">IP Addressing, Subnetting &amp; Routing</a> (CIDR, routing tables, NAT, and sizing pod and Service ranges) &middot; <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-service-cannot-reach-database.html">Scenario: a pod range that overlaps the database network</a>.</p>
     </div>
   </section>
 
