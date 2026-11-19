@@ -64,9 +64,9 @@ Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`CS-Fundamentals/cs-fundamentals.html`](CS-Fundamentals/cs-fundamentals.html) | 1 |
-| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 8 |
+| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 12 |
 
-Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`.
+Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`. Pages in the suggested reading order have Previous / Next links, written by `scripts/update-prev-next.py`.
 
 ## Project structure
 
@@ -78,14 +78,15 @@ Engineering-Knowledge-Base/
 ├── styles.css
 ├── assets/
 │   ├── logo.svg
-│   ├── site.js              # Path normalization for local browsing, code copy buttons, wide-math fix, section links, back-to-top
+│   ├── site.js              # Path normalization for local browsing, code copy buttons, wide-math fix, section links, back-to-top, reading time, progress bar
 │   ├── search.js            # Fuzzy site search
 │   ├── search-index.js      # Generated index (commit with content changes)
 │   └── search-index.json
 ├── scripts/
 │   ├── build-search-index.py   # Search index builder (Python 3, no dependencies)
 │   ├── build-search-index.ps1  # Wrapper that calls the Python builder
-│   └── check-links.py          # Internal link and #anchor checker
+│   ├── check-links.py          # Internal link and #anchor checker
+│   └── update-prev-next.py     # Previous / Next links along a track's reading order
 └── AI Engineer/
     ├── ai-engineering.html
     ├── index.html           # Redirects to subject hub
@@ -112,6 +113,16 @@ python3 scripts/build-search-index.py
 ```
 
 (`powershell -File scripts/build-search-index.ps1` still works and calls the same script.) Commit the updated `assets/search-index.js` and `assets/search-index.json` with your changes.
+
+## Previous / Next links
+
+When you add a page to a track's suggested reading order, add it to the list in `scripts/update-prev-next.py` too, then run:
+
+```bash
+python3 scripts/update-prev-next.py
+```
+
+The script rewrites the block between `<!-- prev-next:start -->` and `<!-- prev-next:end -->` on every page in the order, so running it again is safe.
 
 ## Checking links
 

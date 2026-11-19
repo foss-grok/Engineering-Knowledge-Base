@@ -55,7 +55,7 @@
     <p>Steps 3 and 4, plus the speed of each step, are covered in <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> (see its <a href="cn-tcp-deep-dive.html#page-load">page-load budget</a>). This page covers the two "language" layers around them: <strong>DNS</strong>, which finds the server, and <strong>HTTP</strong>, which is what you say once you reach it.</p>
     <p>Two words first:</p>
     <ul>
-      <li>An <strong>IP address</strong> is the number that identifies a machine on the internet, like a phone number. IPv4 looks like <code>104.20.23.154</code>. IPv6 is longer, like <code>2606:4700::6810:84e5</code>.</li>
+      <li>An <strong>IP address</strong> is the number that identifies a machine on the internet, like a phone number. IPv4 looks like <code>104.20.23.154</code>. IPv6 is longer, like <code>2606:4700::6810:84e5</code>. (Full details: <a href="cn-ip-addressing-subnetting-routing.html">IP Addressing, Subnetting &amp; Routing</a>.)</li>
       <li>A <strong>port</strong> picks which program on that machine you want, like an extension number. HTTPS uses port 443, plain HTTP uses 80, and DNS uses 53.</li>
     </ul>
   </section>
@@ -480,8 +480,16 @@ HTTP/2 304</code></pre>
     <p class="refer-link"><small>Refer: <a href="https://www.rfc-editor.org/rfc/rfc1034" rel="noopener noreferrer">RFC 1034: DNS concepts</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9110" rel="noopener noreferrer">RFC 9110: HTTP Semantics</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9111" rel="noopener noreferrer">RFC 9111: HTTP Caching</a> &middot; <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP" rel="noopener noreferrer">MDN: HTTP</a> &middot; <a href="https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/make-api-requests/dns-json/" rel="noopener noreferrer">Cloudflare DoH JSON API</a></small></p>
   </section>
 
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="cn-tcp-deep-dive.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">TCP Deep Dive: From Handshake to Congestion Control</span></a>
+    <a class="prev-next-next" href="../Scenarios/scenario-slow-api-debugging.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Scenario: Debugging a Slow API End to End</span></a>
+    <p class="prev-next-step">Page 10 of 12 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
   <nav class="page-footer-nav">
-    <p>Related: <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a></p>
+    <p>Related: <a href="cn-ip-addressing-subnetting-routing.html">IP Addressing, Subnetting &amp; Routing</a> &middot; <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a></p>
     <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
   </nav>
 </main>

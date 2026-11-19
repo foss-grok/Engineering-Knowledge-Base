@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>File Systems &amp; Disk I/O | CS Fundamentals</title>
+  <meta name="description" content="File systems and disk I/O from zero: the I/O stack, HDD vs SSD latency, file descriptors, inodes and directories, hard and soft links, finding blocks with direct and indirect pointers (worked math), extents, the page cache, write vs fsync and the safe-save pattern, journaling and copy-on-write, blocking, epoll and io_uring, mmap and direct I/O, container overlay file systems, debugging disk-full and slow-disk problems, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; File Systems &amp; Disk I/O</p>
+  </nav>
+  <h1>File Systems &amp; Disk I/O</h1>
+  <p>What really happens when a program saves a file. How the operating system turns names like <code>/home/asha/notes.txt</code> into blocks on a disk, why a "saved" file can still vanish after a power cut, and how to debug a full or slow disk. The command outputs on this page come from a Linux machine running ext4 on 19 November 2026.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-picture">The Big Picture: the I/O Stack</a></li>
+    <li><a href="#disks">Disks: Blocks, HDDs, and SSDs</a></li>
+    <li><a href="#fds">File Descriptors: How Programs Talk to Files</a></li>
+    <li><a href="#inodes">Inodes and Directories</a></li>
+    <li><a href="#links">Hard Links, Soft Links, and Deleting Files</a></li>
+    <li><a href="#blocks">Finding a File's Blocks: Pointers and Extents</a></li>
+    <li><a href="#page-cache">The Page Cache</a></li>
+    <li><a href="#durability">write() Is Not Saved: fsync and the Safe-Save Pattern</a></li>
+    <li><a href="#crash">Surviving Crashes: Journaling and Copy-on-Write</a></li>
+    <li><a href="#io-models">Ways to Do I/O: Blocking, epoll, io_uring, mmap</a></li>
+    <li><a href="#containers">File Systems in Containers</a></li>
+    <li><a href="#debugging">Debugging Disk Problems</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-picture">
+    <h2>1. The Big Picture: the I/O Stack</h2>
+    <p>A <strong>disk</strong> only understands one thing: "read or write block number N". It has no idea what a file, a folder, or a name is. A <strong>file system</strong> is the part of the operating system that builds files and folders on top of those numbered blocks. Common ones are ext4 and XFS on Linux, APFS on macOS, and NTFS on Windows.</p>
+    <p><strong>I/O</strong> means input/output: moving data in or out of the program, for example to a disk or a network.</p>
+    <p>When your program calls <code>write()</code>, the data passes down through several layers:</p>
+    <pre><code>  your program          write(fd, "hello", 5)
+       |                         (a system call: a request to the kernel)
+  -----+---------------------------------------------------------- user space / kernel
+       v
+  VFS                   one common front door for every file system
+       |
+  page cache            copies of file data kept in RAM          (section 7)
+       |
+  file system (ext4)    maps "byte 5,000,000 of notes.txt" to "block 81,233"
+       |                and keeps the journal                     (sections 6, 9)
+  block layer           queues and merges requests, picks an order
+       |
+  device driver         speaks NVMe, SATA, or a cloud disk protocol
+       v
+  disk (SSD/HDD)        stores bits. Has its own small cache too.</code></pre>
+    <ul>
+      <li>A <strong>system call</strong> (syscall) is how a program asks the kernel to do something it is not allowed to do itself, such as touching hardware. See <a href="os-processes-threads-scheduling.html">Processes &amp; Threads</a> for user space and kernel space.</li>
+      <li>The <strong>VFS</strong> (Virtual File System) is a shared layer that gives every file system the same set of operations: open, read, write, close. That is why the same <code>cat</code> works on ext4, on a USB stick, and on a network share.</li>
+    </ul>
+    <p>The most important idea on this page: <strong>most layers lie a little to be fast</strong>. The page cache says "done" before the data reaches the disk. The disk may say "done" while the data is still in its own cache. Section 8 shows how to get the truth when you need it.</p>
+  </section>
+
+  <section id="disks">
+    <h2>2. Disks: Blocks, HDDs, and SSDs</h2>
+    <p>Storage is cut into fixed-size pieces:</p>
+    <ul>
+      <li>A <strong>sector</strong> is the smallest piece the hardware reads or writes. Usually 512 bytes or 4 KiB.</li>
+      <li>A <strong>block</strong> is the smallest piece the file system hands out. On ext4 it is almost always <strong>4 KiB</strong> (4,096 bytes). Even a 6-byte file uses one whole 4 KiB block.</li>
+    </ul>
+    <p>A KiB is 1,024 bytes. (KB is sometimes 1,000 bytes. With disks the difference adds up, so this page uses KiB, MiB, GiB.)</p>
+    <h3>Hard disks and solid-state drives</h3>
+    <table>
+      <thead><tr><th></th><th>HDD (spinning disk)</th><th>SSD (NVMe flash)</th><th>RAM, for comparison</th></tr></thead>
+      <tbody>
+        <tr><td>How it works</td><td>A metal plate spins. An arm moves a head to the right track and waits for the data to spin under it.</td><td>Flash memory chips. No moving parts.</td><td>Electronic memory, lost on power off</td></tr>
+        <tr><td>One random 4 KiB read</td><td>about 5&ndash;10 ms</td><td>about 0.05&ndash;0.1 ms (50&ndash;100 &micro;s)</td><td>about 0.0001 ms (100 ns)</td></tr>
+        <tr><td>Random reads per second (IOPS)</td><td>about 100&ndash;200</td><td>hundreds of thousands</td><td>&nbsp;</td></tr>
+        <tr><td>Reading in order (sequential)</td><td>about 150&ndash;250 MiB/s</td><td>about 2&ndash;7 GiB/s</td><td>tens of GiB/s</td></tr>
+      </tbody>
+    </table>
+    <p><strong>IOPS</strong> means I/O operations per second: how many separate small reads or writes a disk can do each second. <strong>Throughput</strong> is how many bytes per second it can move.</p>
+    <h3>Worked example: random versus sequential</h3>
+    <p>You must read 10,000 small 4 KiB records (40 MiB in total) from an HDD.</p>
+    <ul>
+      <li><strong>Scattered randomly:</strong> 10,000 reads &times; 8 ms = <strong>80 seconds</strong>.</li>
+      <li><strong>Stored next to each other:</strong> 40 MiB &divide; 200 MiB/s = <strong>0.2 seconds</strong>. That is 400 times faster.</li>
+    </ul>
+    <p>On an SSD the random case is about 10,000 &times; 0.08 ms = 0.8 s, so the gap is much smaller, but sequential access still wins. This is why databases log changes by appending to the end of a file (see <a href="../Databases/dbms-transactions-isolation-mvcc.html">write-ahead logging</a>), and why LSM trees exist (see <a href="../Databases/dbms-indexing-btrees-query-plans.html">Indexing</a>).</p>
+    <div class="callout">
+      <strong>Cloud disks:</strong> a cloud "disk" is usually storage on other machines reached over the network. It often has a fixed IOPS and throughput limit that you pay for. When you hit the limit, requests simply wait in a queue. A slow cloud disk is often a disk that is working perfectly but is capped.
+    </div>
+  </section>
+
+  <section id="fds">
+    <h2>3. File Descriptors: How Programs Talk to Files</h2>
+    <p>A program does not pass a file name to every read and write. It opens the file once and gets back a small number called a <strong>file descriptor</strong> (fd). After that it uses the number.</p>
+    <pre><code>int fd = open("notes.txt", O_RDONLY);  // the kernel returns, say, 3
+char buf[100];
+ssize_t n = read(fd, buf, 100);        // read up to 100 bytes; n = how many arrived
+close(fd);                             // give the number back</code></pre>
+    <p>Every process starts with three file descriptors already open:</p>
+    <table>
+      <thead><tr><th>fd</th><th>Name</th><th>Usually connected to</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>standard input (stdin)</td><td>the keyboard, or a pipe</td></tr>
+        <tr><td>1</td><td>standard output (stdout)</td><td>the terminal</td></tr>
+        <tr><td>2</td><td>standard error (stderr)</td><td>the terminal</td></tr>
+      </tbody>
+    </table>
+    <p>That is why the first file you open gets fd 3. It is also why <code>2&gt;&amp;1</code> in a shell means "send fd 2 to wherever fd 1 goes".</p>
+    <h3>What the kernel keeps for each open file</h3>
+    <pre><code>  process A's fd table          open file table (kernel)             inode
+  fd 0 -&gt; terminal              +---------------------------+
+  fd 1 -&gt; terminal              | offset: 4096              |       notes.txt
+  fd 3 ------------------------&gt;| mode: read                |-----&gt; size, owner,
+                                +---------------------------+       block list ...</code></pre>
+    <p>The <strong>offset</strong> is the current position in the file. Each <code>read</code> starts there and moves it forward. Two programs that open the same file separately each have their own offset.</p>
+    <h3>"Everything is a file"</h3>
+    <p>On Linux, many things that are not files on disk still use file descriptors: network connections (sockets), pipes between programs, the terminal, and even timers. One set of calls (<code>read</code>, <code>write</code>, <code>close</code>) works on all of them. You can see a process's open fds in <code>/proc/&lt;pid&gt;/fd</code>.</p>
+    <p>Each process has a limit on open fds (check with <code>ulimit -n</code>; 1,024 is a common default). A server that opens a connection per user and forgets to close them hits the error <strong>"Too many open files"</strong> (<code>EMFILE</code>).</p>
+  </section>
+
+  <section id="inodes">
+    <h2>4. Inodes and Directories</h2>
+    <p>Here is the surprise that explains most of this page: <strong>a file's name is not stored with the file.</strong></p>
+    <p>Each file has an <strong>inode</strong> (index node): a small record that holds everything about the file <em>except</em> its name and its data:</p>
+    <ul>
+      <li>size, owner, permissions</li>
+      <li>times: last read, last data change, last inode change</li>
+      <li>the <strong>link count</strong>: how many names point to this inode</li>
+      <li>where the data blocks are (section 6)</li>
+    </ul>
+    <p>Each inode has a number. A <strong>directory</strong> (folder) is just a special file whose content is a list of "name &rarr; inode number" pairs.</p>
+    <pre><code>  directory /home/asha            inode 553404                  data blocks
+  +-------------+--------+        +------------------------+      +-------+
+  | name        | inode  |        | size: 6 bytes          |      |hello\n|
+  | .           | 553390 |        | owner: asha, mode 0644 |-----&gt;+-------+
+  | ..          | 2048   |        | links: 1               |      block 81233
+  | notes.txt   | 553404 |-------&gt;| blocks: [81233]        |
+  +-------------+--------+        +------------------------+</code></pre>
+    <h3>Looking up a path, step by step</h3>
+    <p>To open <code>/home/asha/notes.txt</code>, the kernel does this:</p>
+    <ol>
+      <li>Start at the root directory <code>/</code>. Its inode number is fixed and known (2 on ext4).</li>
+      <li>Read the root directory's content. Find the entry <code>home</code> and its inode number.</li>
+      <li>Read that inode, then its content. Find <code>asha</code>.</li>
+      <li>Read that directory. Find <code>notes.txt</code> &rarr; inode 553404.</li>
+      <li>Read inode 553404. Check permissions. Return a file descriptor.</li>
+    </ol>
+    <p>That could be many disk reads, so the kernel keeps recent lookups in RAM in the <strong>dentry cache</strong> (directory entry cache).</p>
+    <h3>See it yourself</h3>
+    <pre><code>$ echo hello &gt; notes.txt
+$ stat notes.txt
+  File: notes.txt
+  Size: 6           Blocks: 8          IO Block: 4096   regular file
+Device: 254,16      Inode: 553404      Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/     box)   Gid: ( 1000/     box)</code></pre>
+    <p>"Size: 6" is the real content. "Blocks: 8" counts 512-byte units, so 8 &times; 512 = 4,096 bytes: one full 4 KiB block is used for 6 bytes.</p>
+    <h3>Running out of inodes</h3>
+    <p>Many file systems, ext4 included, create a fixed number of inodes when the disk is formatted. Millions of tiny files (cache files, session files, mail) can use up every inode while plenty of space is left. New files then fail with "No space left on device", even though <code>df -h</code> shows free space. Check with <code>df -i</code>:</p>
+    <pre><code>$ df -i /
+Filesystem      Inodes  IUsed   IFree IUse% Mounted on
+/dev/vdb       2048000 239234 1808766   12% /</code></pre>
+  </section>
+
+  <section id="links">
+    <h2>5. Hard Links, Soft Links, and Deleting Files</h2>
+    <p>Because names are only directory entries, one inode can have several names.</p>
+    <ul>
+      <li>A <strong>hard link</strong> is a second directory entry pointing to the <em>same</em> inode. Both names are equally real. The link count goes up by one.</li>
+      <li>A <strong>soft link</strong> (symbolic link, symlink) is a tiny separate file that contains a <em>path</em>. Opening it makes the kernel follow that path. If the target is deleted, the symlink is left "dangling" and broken.</li>
+    </ul>
+    <pre><code>$ ln notes.txt hard.txt        # hard link
+$ ln -s notes.txt soft.txt     # soft link
+$ ls -li notes.txt hard.txt soft.txt
+553404 -rw-r--r-- 2 box box 6 Nov 19 14:23 hard.txt
+553404 -rw-r--r-- 2 box box 6 Nov 19 14:23 notes.txt
+553406 lrwxrwxrwx 1 box box 9 Nov 19 14:23 soft.txt -&gt; notes.txt</code></pre>
+    <p>The first column is the inode number. <code>hard.txt</code> and <code>notes.txt</code> share inode 553404, and the link count (third column) is now 2. <code>soft.txt</code> has its own inode, and its size is 9 bytes: the length of the text "notes.txt".</p>
+    <table>
+      <thead><tr><th></th><th>Hard link</th><th>Soft link</th></tr></thead>
+      <tbody>
+        <tr><td>Points to</td><td>An inode</td><td>A path (text)</td></tr>
+        <tr><td>Works across file systems / disks</td><td>No (inode numbers are per file system)</td><td>Yes</td></tr>
+        <tr><td>Can point to a directory</td><td>No (to avoid loops)</td><td>Yes</td></tr>
+        <tr><td>Target deleted</td><td>The data stays; this name still works</td><td>The link breaks</td></tr>
+      </tbody>
+    </table>
+    <h3>Deleting is really "unlinking"</h3>
+    <p>The system call that deletes a file is called <code>unlink</code>. It removes one name and lowers the link count. The space is freed only when <strong>both</strong> are true:</p>
+    <ol>
+      <li>the link count reaches 0 (no names left), and</li>
+      <li>no process still has the file open.</li>
+    </ol>
+    <p>Rule 2 causes a classic production mystery. A log file grows to 500 MiB. Someone deletes it to free space. <code>df</code> still shows the disk as full, but <code>du</code> cannot find any big files. Here is that exact case, reproduced:</p>
+    <pre><code>$ dd if=/dev/zero of=big.log bs=1M count=500    # make a 500 MiB file
+$ df -h --output=used /                          # used: 41G
+$ sleep 600 3&lt; big.log &amp;                         # a process holds it open on fd 3
+$ rm big.log
+$ df -h --output=used /                          # used: still 41G!
+$ du -sh .                                       # 12K: du only counts names, and the name is gone
+$ ls -l /proc/$!/fd | grep deleted
+lr-x------ 1 box box 64 Nov 19 14:23 3 -&gt; /tmp/lab/big.log (deleted)
+$ kill $!                                        # the holder exits
+$ df -h --output=used /                          # used: 40G. The space is back.</code></pre>
+    <p>The fix in production is to restart (or signal) the program holding the file, or to empty the file in place with <code>truncate -s 0 big.log</code> <em>instead</em> of deleting it. <code>lsof +L1</code> lists every open-but-deleted file on the machine.</p>
+  </section>
+
+  <section id="blocks">
+    <h2>6. Finding a File's Blocks: Pointers and Extents</h2>
+    <p>A file's data is spread over many blocks, not always next to each other. The inode must record which blocks, in order. There are two classic ways.</p>
+    <h3>Way 1: direct and indirect pointers (ext2/ext3 style)</h3>
+    <p>The inode has 15 slots, each holding a 4-byte block number:</p>
+    <ul>
+      <li><strong>Slots 0&ndash;11: direct pointers.</strong> Each points straight to a data block.</li>
+      <li><strong>Slot 12: single indirect.</strong> Points to a block that is full of more block numbers.</li>
+      <li><strong>Slot 13: double indirect.</strong> Points to a block of pointers to blocks of pointers.</li>
+      <li><strong>Slot 14: triple indirect.</strong> One more level.</li>
+    </ul>
+    <pre><code>  inode
+  [0] ----------------------------&gt; data block 0
+  ...
+  [11] ---------------------------&gt; data block 11
+  [12] --&gt; [ptr block: 1024 ptrs] --&gt; data blocks 12 .. 1035
+  [13] --&gt; [1024 ptrs] --&gt; [1024 ptrs each] --&gt; data blocks 1036 .. 1,049,611
+  [14] --&gt; [1024] --&gt; [1024] --&gt; [1024] --&gt; data blocks ...</code></pre>
+    <h3>Worked example: the biggest possible file</h3>
+    <p>Block size 4 KiB, block numbers 4 bytes. One pointer block holds 4,096 &divide; 4 = <strong>1,024</strong> pointers.</p>
+    <pre><code>  direct:           12 blocks             x 4 KiB =        48 KiB
+  single indirect:  1,024 blocks          x 4 KiB =         4 MiB
+  double indirect:  1,024^2 = 1,048,576   x 4 KiB =         4 GiB
+  triple indirect:  1,024^3               x 4 KiB =         4 TiB
+                                                    total ~ 4 TiB (+ 4 GiB + 4 MiB + 48 KiB)</code></pre>
+    <p>Small files only need direct pointers, so they are fast. Huge files pay for extra pointer lookups.</p>
+    <h3>Worked example: where is byte 5,000,000?</h3>
+    <ol>
+      <li>Which block of the file? 5,000,000 &divide; 4,096 = 1,220 remainder 2,880. So it is <strong>file block 1,220</strong>, at byte 2,880 inside it.</li>
+      <li>1,220 &ge; 12, so not direct. Subtract: 1,220 &minus; 12 = 1,208.</li>
+      <li>1,208 &ge; 1,024, so not in the single indirect range. Subtract: 1,208 &minus; 1,024 = 184.</li>
+      <li>It is in the <strong>double indirect</strong> range, at position 184. First-level index = 184 &divide; 1,024 = 0. Second-level index = 184 mod 1,024 = 184.</li>
+      <li>With nothing cached, reading this byte takes <strong>4 disk reads</strong>: the inode, the double indirect block, its entry 0 (a pointer block), then the data block found at entry 184.</li>
+    </ol>
+    <h3>Way 2: extents (ext4, XFS, and most modern file systems)</h3>
+    <p>Pointer lists waste space and time for big files that sit in one long run of blocks. An <strong>extent</strong> says "starting at file block X, the next N blocks are at disk blocks Y to Y+N&minus;1". One extent can describe up to 128 MiB on ext4.</p>
+    <pre><code>  pointer style for a 1 GiB file in one run:  262,144 separate block numbers
+  extent style for the same file:             8 extents of 128 MiB
+                                              e.g. (file block 0, length 32768, disk block 500000)</code></pre>
+    <p>See a file's extents on Linux with <code>filefrag -v file</code>. Many extents for a file means it is <strong>fragmented</strong>: its pieces are scattered.</p>
+    <h3>Free space</h3>
+    <p>To know which blocks are free, ext4 keeps a <strong>bitmap</strong>: one bit per block, 1 = used, 0 = free. One 4 KiB bitmap block covers 4,096 &times; 8 = 32,768 blocks, which is 128 MiB of disk. There is another bitmap for free inodes.</p>
+  </section>
+
+  <section id="page-cache">
+    <h2>7. The Page Cache</h2>
+    <p>The <strong>page cache</strong> is RAM that the kernel uses to keep copies of file data. It uses the same 4 KiB pages as virtual memory (see <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a>).</p>
+    <ul>
+      <li><strong>Reads:</strong> the first read of a block goes to disk, and the kernel keeps a copy. The next read of the same block comes from RAM, which is about 1,000 times faster than an SSD.</li>
+      <li><strong>Read-ahead:</strong> if you read a file in order, the kernel guesses you want the next part and loads it early.</li>
+      <li><strong>Writes:</strong> <code>write()</code> copies your data into the page cache, marks those pages <strong>dirty</strong> (changed but not yet on disk), and returns at once. A kernel thread writes dirty pages to disk later, usually within about 30 seconds. This is called <strong>writeback</strong>.</li>
+    </ul>
+    <h3>Worked example</h3>
+    <p>A 1 GiB file on an SSD that reads at 2 GiB/s, on a machine with plenty of free RAM.</p>
+    <ul>
+      <li>First <code>cat big.file &gt; /dev/null</code>: about 1 &divide; 2 = <strong>0.5 s</strong>, from disk.</li>
+      <li>Second time: from the page cache at RAM speed, roughly <strong>0.1 s</strong> or less.</li>
+    </ul>
+    <p>This is why the first run of a benchmark is often slower ("cold cache") and later runs are faster ("warm cache"). Be careful which one you are measuring.</p>
+    <h3>"My server has no free memory!"</h3>
+    <pre><code>$ free -h
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       4.1Gi       0.6Gi       0.2Gi        10Gi        11Gi</code></pre>
+    <p>Only 0.6 GiB is "free", but 10 GiB is <code>buff/cache</code>. The kernel fills spare RAM with cached files because empty RAM does nothing useful. It gives that memory back as soon as programs need it. The number to watch is <strong>available</strong> (11 GiB here), not free.</p>
+    <p>In containers this matters too: page cache used by a container's files is counted towards its memory limit, but the kernel reclaims it before deciding to kill the container. The kills come from memory that cannot be reclaimed (see <a href="os-virtual-memory-paging.html#linux-practice">OOM kills</a>).</p>
+  </section>
+
+  <section id="durability">
+    <h2>8. write() Is Not Saved: fsync and the Safe-Save Pattern</h2>
+    <p>Since <code>write()</code> only reaches RAM, a power cut in the next few seconds loses the data, even though the program was told "success".</p>
+    <p><strong><code>fsync(fd)</code></strong> is the system call that says: "push all of this file's dirty data and its inode to the disk, and do not return until the disk confirms it is stored safely". The kernel also tells the disk to empty its own cache. After <code>fsync</code> returns, the data survives a power cut.</p>
+    <h3>The cost of fsync, with numbers</h3>
+    <p>An <code>fsync</code> must wait for the device. Say it takes about 2 ms on a typical SSD (enterprise SSDs with power-loss protection can be much faster; HDDs and some cloud disks are slower).</p>
+    <ul>
+      <li>An app saves 1,000 records, calling <code>fsync</code> after each one: 1,000 &times; 2 ms = <strong>2 seconds</strong>.</li>
+      <li>The same app writes all 1,000, then calls <code>fsync</code> once: about <strong>2 ms</strong> plus the write time.</li>
+    </ul>
+    <p>Databases use this idea, called <strong>group commit</strong>: transactions that finish at about the same time share one <code>fsync</code> of the log. That is how a database can commit thousands of transactions per second on a disk that can only do a few hundred flushes.</p>
+    <h3>The safe-save pattern</h3>
+    <p>How do you replace a settings file so that, after a crash, you have either the complete old version or the complete new version, never half of each?</p>
+    <p>Writing over the file directly is unsafe: a crash in the middle leaves a mix. The standard answer uses <code>rename</code>, which the file system does as one <strong>atomic</strong> step (it fully happens or does not happen at all):</p>
+    <pre><code>import os
+
+def save_atomically(path, data: bytes):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)          # 1. write the new version to a temporary file
+        f.flush()              #    move Python's own buffer into the kernel
+        os.fsync(f.fileno())   # 2. make sure the new data is on disk
+    os.replace(tmp, path)      # 3. atomically swap the name to the new file
+    dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)       # 4. make the rename itself durable (it lives in the directory)
+    finally:
+        os.close(dir_fd)</code></pre>
+    <p>Why each step:</p>
+    <ol>
+      <li>Readers keep seeing the old file while the new one is being written.</li>
+      <li>Without this <code>fsync</code>, the rename could reach the disk <em>before</em> the data. After a crash you would have the new name pointing at an empty or partial file. This really happened to many apps on early ext4.</li>
+      <li><code>os.replace</code> calls <code>rename</code>. Anyone who opens the path gets either the old file or the new file.</li>
+      <li>The rename is a change to the <em>directory</em>, so the directory must be synced too.</li>
+    </ol>
+    <div class="callout">
+      <strong>There are also several buffers before the kernel.</strong> Python's file object, C's <code>FILE*</code>, and Java's <code>BufferedWriter</code> keep data in the program's own memory first. <code>flush()</code> moves it into the kernel (the page cache). Only <code>fsync</code> moves it to the disk. Three different steps.
+    </div>
+  </section>
+
+  <section id="crash">
+    <h2>9. Surviving Crashes: Journaling and Copy-on-Write</h2>
+    <p>Even a tiny file change updates several places on disk. Appending one block to a file needs:</p>
+    <ol>
+      <li>the new data block,</li>
+      <li>the inode (new size, new block pointer),</li>
+      <li>the free-space bitmap (mark that block as used).</li>
+    </ol>
+    <p>The disk writes these one at a time. If power fails after only some of them:</p>
+    <table>
+      <thead><tr><th>What reached the disk</th><th>Result after reboot</th></tr></thead>
+      <tbody>
+        <tr><td>Only the data block</td><td>Harmless: nothing points to it. The new data is simply lost.</td></tr>
+        <tr><td>Only the inode</td><td>The file points to a block holding old garbage, and the bitmap says the block is free, so it may be given to another file too.</td></tr>
+        <tr><td>Only the bitmap</td><td>A block is marked used but nothing owns it: leaked space.</td></tr>
+      </tbody>
+    </table>
+    <p>Old file systems fixed this by scanning the whole disk after a crash with <code>fsck</code> (file system check). On a large disk that could take hours.</p>
+    <h3>Journaling</h3>
+    <p>A <strong>journal</strong> is a small area of the disk used as a diary. Before changing the real locations, the file system writes a note: "I am about to do these 3 changes". This is the same idea as a database's write-ahead log.</p>
+    <pre><code>  1. write to journal:   [BEGIN tx 52] [inode] [bitmap] [data?] [COMMIT tx 52]
+  2. wait until the journal is on disk
+  3. write the changes to their real places ("checkpoint")
+  4. mark tx 52 as done in the journal
+
+  After a crash:
+  - journal has COMMIT for tx 52  -&gt; replay it (do steps 3-4 again). Safe to repeat.
+  - journal has no COMMIT         -&gt; ignore it. The real places were never touched.</code></pre>
+    <p>Recovery now takes seconds, because only the journal is read. ext4 has three modes:</p>
+    <ul>
+      <li><strong>ordered</strong> (default): only metadata (inodes, bitmaps, directories) goes into the journal, but data blocks are written <em>before</em> the metadata that points to them is committed. So a file never points at garbage.</li>
+      <li><strong>writeback</strong>: metadata only, no ordering. Faster, but after a crash a file can contain old garbage.</li>
+      <li><strong>journal</strong>: data also goes through the journal. Safest, but every block is written twice.</li>
+    </ul>
+    <h3>Copy-on-write</h3>
+    <p>File systems such as Btrfs and ZFS never overwrite live data. They write new versions of the changed blocks to free space, then switch one top-level pointer to the new tree in a single step. A crash leaves either the old tree or the new tree, both complete. As a bonus, <strong>snapshots</strong> are almost free: keep the old top pointer and you have the old version of everything.</p>
+  </section>
+
+  <section id="io-models">
+    <h2>10. Ways to Do I/O: Blocking, epoll, io_uring, mmap</h2>
+    <p>A disk or network read takes a long time compared with the CPU. What the thread does while it waits is a big design choice.</p>
+    <table>
+      <thead><tr><th>Model</th><th>How it works</th><th>Used by</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Blocking</strong></td><td><code>read()</code> puts the thread to sleep until data arrives. Simple. To serve 10,000 users you need about 10,000 threads.</td><td>Simple scripts, thread-per-request servers</td></tr>
+        <tr><td><strong>Non-blocking + readiness (epoll)</strong></td><td>One thread asks the kernel "tell me which of these 10,000 sockets have data". <code>epoll_wait</code> returns only the ready ones, and the thread handles each without waiting.</td><td>nginx, Node.js, Redis, Python asyncio</td></tr>
+        <tr><td><strong>Completion-based (io_uring)</strong></td><td>The program puts requests in a ring shared with the kernel ("read 4 KiB at offset X"). The kernel does them and puts results in a second ring. Very few system calls.</td><td>Newer high-performance databases and storage engines</td></tr>
+      </tbody>
+    </table>
+    <p>One gap to know: classic epoll readiness works well for network sockets, but regular files always report "ready", because the kernel assumes disk reads are short. That is why event-loop systems often send file I/O to a pool of helper threads. io_uring fixes this by handling files and sockets the same way.</p>
+    <h3>Two ways to skip steps</h3>
+    <ul>
+      <li><strong><code>mmap</code></strong> maps a file into the program's memory. Reading <code>ptr[5000000]</code> reads the file; the first touch of each page causes a page fault that loads it from the page cache or disk (see <a href="os-virtual-memory-paging.html#page-faults">page faults</a>). It avoids copying data and is great for read-mostly files. It is harder to control exactly when changes are saved, and an I/O error becomes a crash signal instead of an error code.</li>
+      <li><strong>Direct I/O</strong> (<code>O_DIRECT</code>) skips the page cache and moves data straight between the program's memory and the disk. Databases that keep their own cache (for example the InnoDB buffer pool in MySQL) use it so that data is not cached twice.</li>
+    </ul>
+  </section>
+
+  <section id="containers">
+    <h2>11. File Systems in Containers</h2>
+    <p>A container image is made of read-only <strong>layers</strong>, one for each build step (see <a href="../../../Docker-Kubernetes/learn/Docker/docker-fundamentals.html">Docker Fundamentals</a>). When a container starts, Linux's <strong>overlay file system</strong> (overlayfs) stacks them and adds one thin writable layer on top:</p>
+    <pre><code>  what the container sees:   /app/server.py   /etc/config.yml   /tmp/cache.db
+                                   |                |                 |
+  writable layer (per container)   |          config.yml (edited) cache.db (new)
+  image layer 3: COPY app          server.py        |
+  image layer 2: pip install       ...              |
+  image layer 1: base OS           ...          config.yml (original, now hidden)</code></pre>
+    <ul>
+      <li><strong>Reading</strong> a file finds the top-most layer that has it.</li>
+      <li><strong>Changing</strong> a file from a lower layer first copies the <em>whole</em> file up into the writable layer. This is called <strong>copy-up</strong>. Editing one byte of a 2 GiB file in an image copies 2 GiB.</li>
+      <li><strong>Deleting</strong> a file from a lower layer adds a hidden marker (a "whiteout"). The image does not get smaller.</li>
+      <li>The writable layer is thrown away when the container is removed.</li>
+    </ul>
+    <p>So databases, uploads, and anything you want to keep belong on a <strong>volume</strong>: a normal directory or disk mounted into the container, without overlay layers. In Kubernetes that is a PersistentVolume (see <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-storage.html">Kubernetes Storage</a>). Also watch the writable layer and logs: a container that writes big logs to its own file system can fill the node's disk, and Kubernetes then starts evicting pods with the reason "DiskPressure".</p>
+  </section>
+
+  <section id="debugging">
+    <h2>12. Debugging Disk Problems</h2>
+    <h3>"No space left on device"</h3>
+    <ol>
+      <li><code>df -h</code>: which file system is full?</li>
+      <li><code>df -i</code>: is it really out of inodes, not bytes?</li>
+      <li><code>du -xh --max-depth=1 /var | sort -h</code>: which folder is big? (<code>-x</code> stays on one file system.)</li>
+      <li>If <code>du</code> adds up to much less than <code>df</code>: look for open-but-deleted files with <code>lsof +L1</code> (section 5).</li>
+      <li>Also check for space reserved for the root user: ext4 keeps 5% by default, so normal users see "full" a little earlier.</li>
+    </ol>
+    <h3>"The disk is slow"</h3>
+    <p><code>iostat -x 1</code> (from the <code>sysstat</code> package) prints one line per disk every second. The columns that matter:</p>
+    <pre><code>Device   r/s     w/s    rkB/s    wkB/s  r_await  w_await  aqu-sz  %util
+nvme0n1  850.0  2400.0  27200   96000     0.21    14.80   35.6   99.6</code></pre>
+    <ul>
+      <li><code>r/s</code>, <code>w/s</code>: IOPS for reads and writes. Compare with what the disk (or your cloud plan) allows.</li>
+      <li><code>r_await</code>, <code>w_await</code>: average milliseconds per request, <em>including time waiting in the queue</em>. Here writes take 14.8 ms on an SSD that should take well under 1 ms, so they are queuing.</li>
+      <li><code>aqu-sz</code>: average number of requests waiting. 35 means a long queue.</li>
+      <li><code>%util</code>: share of time the disk was busy. Near 100% on an HDD means saturated. On SSDs and cloud disks, which do many requests in parallel, it can show 100% while there is still room; trust <code>await</code> and the IOPS limit more.</li>
+    </ul>
+    <p>This disk is doing 2,400 writes per second. If the cloud plan allows 3,000 IOPS in total, then 850 + 2,400 = 3,250 means it is over the cap, and every request queues. Next step: find who is writing with <code>sudo iotop -o</code> or <code>pidstat -d 1</code>.</p>
+    <p>A high <code>wa</code> (I/O wait) number in <code>top</code> or <code>vmstat</code> means CPUs are idle while threads wait for the disk. The <a href="../Scenarios/scenario-slow-api-debugging.html">slow-API scenario</a> shows how to fit this into a full investigation.</p>
+  </section>
+
+  <section id="practice">
+    <h2>13. Practice Problems</h2>
+    <p>Try each on paper first. Answers follow.</p>
+
+    <h3>Problem 1: block math</h3>
+    <p>A file system has 1 KiB blocks and 4-byte block numbers, with 12 direct pointers, one single indirect, and one double indirect. What is the largest file it can hold?</p>
+    <p><em>Answer:</em> One pointer block holds 1,024 &divide; 4 = 256 pointers. Direct: 12 &times; 1 KiB = 12 KiB. Single: 256 &times; 1 KiB = 256 KiB. Double: 256<sup>2</sup> = 65,536 &times; 1 KiB = 64 MiB. Total = 64 MiB + 256 KiB + 12 KiB = <strong>about 64.3 MiB</strong>.</p>
+
+    <h3>Problem 2: which pointer?</h3>
+    <p>With 4 KiB blocks and the layout from section 6, which pointer finds byte 100,000 of a file, and how many disk reads does it take with nothing cached?</p>
+    <p><em>Answer:</em> 100,000 &divide; 4,096 = 24 remainder 1,696, so file block 24. 24 &ge; 12, and 24 &minus; 12 = 12 &lt; 1,024, so it is in the <strong>single indirect</strong> block at entry 12. Reads: inode, single indirect block, data block = <strong>3</strong>.</p>
+
+    <h3>Problem 3: link counts</h3>
+    <p>You run: <code>echo hi &gt; a</code>; <code>ln a b</code>; <code>ln -s a c</code>; <code>rm a</code>. What does <code>cat b</code> print? What about <code>cat c</code>? What is the link count of b's inode?</p>
+    <p><em>Answer:</em> <code>cat b</code> prints <strong>hi</strong>: b is a hard link to the same inode, which still has one name. <code>cat c</code> fails with <strong>"No such file or directory"</strong>: c holds the path "a", which no longer exists. The link count is <strong>1</strong>.</p>
+
+    <h3>Problem 4: fsync budget</h3>
+    <p>A logging service receives 5,000 events per second. Each <code>fsync</code> takes 3 ms. Can it fsync after every event? If it batches, what is the smallest batch that keeps up, and what is the most data it could lose in a crash?</p>
+    <p><em>Answer:</em> One thread can do at most 1 &divide; 0.003 &asymp; 333 fsyncs per second, so <strong>no</strong>: 5,000 per second is 15 times too many. A batch must hold at least 5,000 &divide; 333 = <strong>15 events</strong>. In practice you flush on a timer, for example every 10 ms (about 50 events, 100 fsyncs per second, well within budget). The most you could lose is the batch not yet synced: about <strong>10 ms of events</strong>.</p>
+
+    <h3>Problem 5: df versus du</h3>
+    <p><code>df -h /var</code> says 95% used (190 GiB of 200 GiB). <code>du -sh /var</code> says 40 GiB. Give two possible causes and a command to check each.</p>
+    <p><em>Answer:</em> (1) Deleted files still held open by a process: check with <code>lsof +L1</code>, then restart that process. (2) Files hidden under a mount point: something wrote into <code>/var/data</code> before a disk was mounted on top of it, so <code>du</code> cannot see them. Check by bind-mounting the parent somewhere else (<code>mount --bind /var /mnt/check</code>) and running <code>du</code> there. (Another possibility: a different file system is actually mounted at a sub-path, which <code>du -x</code> would show.)</p>
+
+    <h3>Problem 6: container copy-up</h3>
+    <p>An image has a 1.5 GiB SQLite file baked into a layer. At start-up, the app opens it and updates one row. What happens, and what is the fix?</p>
+    <p><em>Answer:</em> The first write triggers a <strong>copy-up</strong> of the whole 1.5 GiB file into the container's writable layer, which slows start-up and uses 1.5 GiB more disk per container. The change is also lost when the container is removed. Fix: put the database on a <strong>volume</strong>, and copy the starting file there once if it is not present.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Thinking <code>write()</code> means saved.</strong> It means "in RAM". Use <code>fsync</code> when the data matters.</li>
+      <li><strong>Overwriting important files in place.</strong> Use the temp file + fsync + rename + fsync-the-directory pattern.</li>
+      <li><strong>Deleting a log file that a program still writes to.</strong> The space is not freed. Truncate it, or tell the program to reopen its logs (most support a signal for this, and tools like logrotate do it for you).</li>
+      <li><strong>Reading "free" memory instead of "available".</strong> The page cache is supposed to fill RAM.</li>
+      <li><strong>Benchmarking with a warm cache</strong> and believing the disk is that fast. Clear caches for tests (<code>echo 3 | sudo tee /proc/sys/vm/drop_caches</code>), or use files larger than RAM.</li>
+      <li><strong>Millions of tiny files in one directory.</strong> Inodes run out and directory operations get slow. Spread files into sub-folders (for example by the first two letters of a hash), or use a database or object store.</li>
+      <li><strong>Writing app data into the container's own file system.</strong> It is slow (copy-up), it fills the node, and it disappears. Use volumes.</li>
+      <li><strong>Ignoring the cloud disk's IOPS cap.</strong> High <code>await</code> with modest load often means you hit the paid limit, not a broken disk.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Command or rule</th></tr></thead>
+      <tbody>
+        <tr><td>File details and inode number</td><td><code>stat file</code>, <code>ls -li</code></td></tr>
+        <tr><td>Space and inodes per file system</td><td><code>df -h</code>, <code>df -i</code></td></tr>
+        <tr><td>Biggest folders</td><td><code>du -xh --max-depth=1 /path | sort -h</code></td></tr>
+        <tr><td>Open but deleted files</td><td><code>lsof +L1</code>, or <code>ls -l /proc/&lt;pid&gt;/fd | grep deleted</code></td></tr>
+        <tr><td>A process's open files</td><td><code>ls -l /proc/&lt;pid&gt;/fd</code>, <code>lsof -p &lt;pid&gt;</code></td></tr>
+        <tr><td>Open file limit</td><td><code>ulimit -n</code></td></tr>
+        <tr><td>Disk load and latency</td><td><code>iostat -x 1</code> (look at await, aqu-sz, IOPS vs limit)</td></tr>
+        <tr><td>Who is using the disk</td><td><code>sudo iotop -o</code>, <code>pidstat -d 1</code></td></tr>
+        <tr><td>File fragmentation</td><td><code>filefrag -v file</code></td></tr>
+        <tr><td>Memory incl. page cache</td><td><code>free -h</code> (read "available")</td></tr>
+        <tr><td>Durable write</td><td><code>write</code> &rarr; <code>flush</code> &rarr; <code>fsync</code></td></tr>
+        <tr><td>Atomic replace</td><td>write tmp, fsync, <code>rename</code>, fsync directory</td></tr>
+        <tr><td>Max file, 4 KiB blocks, 4-byte pointers</td><td>12 direct + 1,024 + 1,024<sup>2</sup> + 1,024<sup>3</sup> blocks &asymp; 4 TiB</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/" rel="noopener noreferrer">Operating Systems: Three Easy Pieces (file system and crash-consistency chapters)</a> &middot; <a href="https://docs.kernel.org/filesystems/ext4/index.html" rel="noopener noreferrer">Linux kernel docs: ext4</a> &middot; <a href="https://man7.org/linux/man-pages/man2/fsync.2.html" rel="noopener noreferrer">man fsync(2)</a> &middot; <a href="https://man7.org/linux/man-pages/man7/io_uring.7.html" rel="noopener noreferrer">man io_uring(7)</a> &middot; <a href="https://docs.kernel.org/filesystems/overlayfs.html" rel="noopener noreferrer">Linux kernel docs: overlayfs</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="os-virtual-memory-paging.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Virtual Memory &amp; Paging</span></a>
+    <a class="prev-next-next" href="os-concurrency-synchronization-deadlocks.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Concurrency, Synchronization &amp; Deadlocks</span></a>
+    <p class="prev-next-step">Page 3 of 12 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> &middot; <a href="os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a> &middot; <a href="../Databases/dbms-transactions-isolation-mvcc.html">Transactions &amp; Write-Ahead Logging</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-storage.html">Kubernetes Storage</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>
