@@ -64,7 +64,7 @@ Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`CS-Fundamentals/cs-fundamentals.html`](CS-Fundamentals/cs-fundamentals.html) | 1 |
-| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 14 |
+| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 17 |
 
 Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`. Pages in the suggested reading order have Previous / Next links, written by `scripts/update-prev-next.py`.
 
