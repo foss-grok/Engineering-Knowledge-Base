@@ -4,6 +4,9 @@
 Verifies that every relative or root-relative (/...) href/src points to an existing file and that every
 #fragment (same-page or cross-page) matches an id on the target page.
 
+Also checks that every learn page (an .html file in a sub-folder of a track's learn/ folder) is linked
+from that track's learn hub, so no page is reachable only through search.
+
 Usage:
   python3 scripts/check-links.py                 # whole site
   python3 scripts/check-links.py Docker-Kubernetes   # one folder
@@ -52,7 +55,30 @@ for html in sorted(scan.rglob("*.html")):
         if fragment and target.suffix == ".html" and fragment not in ids_in(target):
             broken.append((html.relative_to(root).as_posix(), ref, "missing #id"))
 
+# Every learn page must be listed on its track's learn hub.
+LEARN_HUBS = [
+    "AI Engineer/learn/ai-engineering-learn.html",
+    "CS-Fundamentals/learn/cs-fundamentals-learn.html",
+    "Docker-Kubernetes/learn/docker-kubernetes-learn.html",
+    "Graph ML/learn/graph-ml-learn.html",
+]
+unlisted = []
+for hub_rel in LEARN_HUBS:
+    hub = root / hub_rel
+    if not hub.exists() or not (hub == scan or scan in hub.parents):
+        continue
+    linked = set()
+    for ref in ATTR.findall(hub.read_text(encoding="utf-8", errors="replace")):
+        path_part = ref.partition("#")[0]
+        if path_part and not path_part.startswith(("http://", "https://", "/")):
+            linked.add((hub.parent / unquote(path_part)).resolve())
+    for page in sorted(hub.parent.glob("*/*.html")):
+        if page.resolve() not in linked:
+            unlisted.append((page.relative_to(root).as_posix(), hub_rel))
+
 for src, ref, why in sorted(set(broken)):
     print(f"{src} -> {ref} ({why})")
-print(f"checked {checked} internal links, broken: {len(set(broken))}")
-sys.exit(1 if broken else 0)
+for page, hub_rel in unlisted:
+    print(f"{page} is not linked from its learn hub {hub_rel}")
+print(f"checked {checked} internal links, broken: {len(set(broken))}, learn pages missing from hubs: {len(unlisted)}")
+sys.exit(1 if broken or unlisted else 0)

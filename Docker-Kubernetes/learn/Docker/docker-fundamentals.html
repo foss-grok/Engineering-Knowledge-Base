@@ -44,6 +44,7 @@
       <li><strong>cgroups (control groups)</strong> limit what a process can <em>consume</em>: CPU, memory, block I/O, and network bandwidth.</li>
       <li><strong>Capabilities</strong> and <strong>seccomp</strong> restrict which privileged syscalls a container may invoke.</li>
     </ul>
+    <p>Want to see these pieces with your own eyes? <a href="containers-under-the-hood.html">How Containers Really Work</a> builds each one by hand with <code>unshare</code>, cgroup files, and overlayfs, then assembles a container without Docker.</p>
     <pre><code>┌─────────────────────────────────────────────────────────────────┐
 │  VM model                                                       │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐                       │

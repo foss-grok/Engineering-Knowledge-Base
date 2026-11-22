@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scenario: A Pod Keeps Getting OOMKilled | CS Fundamentals</title>
+  <meta name="description" content="A real-world walkthrough: an API's Kubernetes pods restart every 40 minutes with OOMKilled and exit code 137. Telling OOMKilled apart from eviction, node OOM and grace-period kills; RSS, working set, anon and page cache; requests, limits, QoS and oom_score_adj; leak-rate math from a memory graph; reproducing the kill under a real cgroup limit; finding the leaking line with tracemalloc; runtime traps in the JVM, Go, Node and Python; the fix, sizing math, alerts, a blameless postmortem, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Scenario: A Pod Keeps Getting OOMKilled</p>
+  </nav>
+  <h1>Scenario: A Pod Keeps Getting OOMKilled</h1>
+  <p>An API's pods restart every 40 minutes or so. Each time, Kubernetes says <code>OOMKilled</code>, exit code 137. Someone suggests doubling the memory limit. This page follows the investigation the way an on-call engineer would, and ties together <a href="../Operating-Systems/os-virtual-memory-paging.html">virtual memory</a>, <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html">cgroups</a>, and Kubernetes requests and limits. The service and numbers are made up, but every command, message, and lab output is real.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#situation">The Situation</a></li>
+    <li><a href="#evidence">Step 1: Read the Evidence</a></li>
+    <li><a href="#which-kill">Which Kind of Kill Is It?</a></li>
+    <li><a href="#memory-numbers">What "Memory" Means: RSS, Working Set, Anon, Cache</a></li>
+    <li><a href="#requests-limits">Requests, Limits, QoS, and Who Dies First</a></li>
+    <li><a href="#graph">Step 2: Read the Memory Graph</a></li>
+    <li><a href="#leak-math">Step 3: Leak-Rate Math</a></li>
+    <li><a href="#reproduce">Step 4: Reproduce It Under a Real Limit</a></li>
+    <li><a href="#find-line">Step 5: Find the Leaking Line</a></li>
+    <li><a href="#runtimes">Runtime Traps: JVM, Go, Node, Python</a></li>
+    <li><a href="#fix">The Fix and Right-Sizing the Limit</a></li>
+    <li><a href="#prevent">Preventing the Next One: Alerts and Tests</a></li>
+    <li><a href="#postmortem">Blameless Postmortem</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="situation">
+    <h2>1. The Situation</h2>
+    <p>The <code>orders-api</code> service runs as 6 pods. Last week a new feature shipped: a "download my report" button. Since then:</p>
+    <ul>
+      <li>Every pod restarts roughly every 40 minutes. Users see a burst of errors each time.</li>
+      <li>At night, when traffic is low, pods live for many hours.</li>
+      <li>Each pod has <code>requests.memory: 512Mi</code> and <code>limits.memory: 1Gi</code>.</li>
+    </ul>
+    <p>The quick idea is "give it 2Gi". That may buy time, but if the cause is a leak, the pods will just die every 80 minutes instead. We first find out <em>why</em> memory grows.</p>
+    <div class="callout callout-intuition">
+      <strong>Two words, defined.</strong> A <strong>memory leak</strong> is memory a program keeps holding even though it will never use it again, so its memory use grows with time or traffic. <strong>OOM</strong> means "out of memory". An <strong>OOM kill</strong> is the kernel ending a process to free memory.
+    </div>
+  </section>
+
+  <section id="evidence">
+    <h2>2. Step 1: Read the Evidence</h2>
+    <pre><code>$ kubectl get pods -l app=orders-api
+NAME                          READY   STATUS             RESTARTS       AGE
+orders-api-7d9f8c6b5d-4xkzq   1/1     Running            6 (12m ago)    5h
+orders-api-7d9f8c6b5d-9hb2m   0/1     OOMKilled          7 (40s ago)    5h
+orders-api-7d9f8c6b5d-kq7wd   0/1     CrashLoopBackOff   7 (2m ago)     5h
+...</code></pre>
+    <ul>
+      <li><strong>RESTARTS</strong> counts how many times the container was restarted <em>inside the same pod</em>. The pod object stays; only the container is recreated.</li>
+      <li><strong>CrashLoopBackOff</strong> is not a separate error. It means "this container keeps dying, so I wait before restarting it": 10 s, then 20 s, 40 s, and so on, up to 5 minutes. The wait resets after the container runs fine for 10 minutes.</li>
+    </ul>
+    <pre><code>$ kubectl describe pod orders-api-7d9f8c6b5d-9hb2m
+...
+    State:          Running
+      Started:      Sun, 22 Nov 2026 10:41:07 +0530
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+      Started:      Sun, 22 Nov 2026 09:58:51 +0530
+      Finished:     Sun, 22 Nov 2026 10:41:05 +0530
+    Ready:          True
+    Restart Count:  7
+    Limits:
+      cpu:     1
+      memory:  1Gi
+    Requests:
+      cpu:      250m
+      memory:   512Mi</code></pre>
+    <p>What this tells us:</p>
+    <ol>
+      <li><strong>Reason: OOMKilled</strong> means the kernel killed a process because the <em>container</em> went over its own memory limit (its cgroup's <code>memory.max</code>). The node itself was fine.</li>
+      <li><strong>Exit Code 137</strong> = 128 + 9. A process killed by signal number N exits with 128 + N, and 9 is <code>SIGKILL</code>.</li>
+      <li><strong>Started 09:58:51, Finished 10:41:05</strong>: it lived 42 minutes. If every run lasts about the same time, memory is growing at a steady pace: a strong sign of a leak.</li>
+    </ol>
+  </section>
+
+  <section id="which-kill">
+    <h2>3. Which Kind of Kill Is It?</h2>
+    <p>"My pod died because of memory" can mean four different things. They have different causes and different fixes, so tell them apart first:</p>
+    <table>
+      <thead><tr><th>What you see</th><th>Who killed it</th><th>Why</th><th>Look at</th></tr></thead>
+      <tbody>
+        <tr><td><code>Reason: OOMKilled</code>, exit 137</td><td>The kernel, inside the container's cgroup</td><td>The container went over <em>its own</em> <code>limits.memory</code></td><td>The app's memory use vs its limit</td></tr>
+        <tr><td>Pod <code>Status: Failed</code>, <code>Reason: Evicted</code>, "The node was low on resource: memory"</td><td>The kubelet</td><td>The <em>node</em> ran low; the kubelet removed pods, starting with those using the most memory above their request</td><td>Node memory, other pods, requests that are too low</td></tr>
+        <tr><td>A container dies with <code>OOMKilled</code> even though it was under its limit; the node log shows a system-wide OOM</td><td>The kernel, for the whole node</td><td>The node ran out before the kubelet could evict; the kernel picked a victim by <code>oom_score_adj</code></td><td>Node overcommit: sum of limits far above node RAM</td></tr>
+        <tr><td>Exit 137 but <code>Reason: Error</code>, often exactly 30 s after a stop</td><td>The kubelet, after the grace period</td><td>The app ignored <code>SIGTERM</code>, so it got <code>SIGKILL</code></td><td>Signal handling (see <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html#pid1">PID 1 and signals</a>)</td></tr>
+      </tbody>
+    </table>
+    <p>Ours is the first row: the container's own limit. To be sure, read the cgroup's own counter from inside the container (cgroup v2):</p>
+    <pre><code>$ kubectl exec orders-api-7d9f8c6b5d-4xkzq -- cat /sys/fs/cgroup/memory.events
+low 0
+high 0
+max 1843
+oom 0
+oom_kill 0</code></pre>
+    <p>This counter belongs to the <em>current</em> container, which has not been killed yet (<code>oom_kill 0</code>). But <code>max 1843</code> says it has already hit its limit 1843 times; each time the kernel had to free memory (mostly page cache) to make room. It is living on the edge. The kubelet and the node's kernel log (<code>journalctl -k | grep -i oom</code> on the node) record the actual kills.</p>
+  </section>
+
+  <section id="memory-numbers">
+    <h2>4. What "Memory" Means: RSS, Working Set, Anon, Cache</h2>
+    <p>Different tools report different numbers called "memory". Mixing them up is the most common mistake in this kind of incident.</p>
+    <pre><code>          virtual size (VSZ): everything the process has reserved, touched or not
+   +----------------------------------------------------------------------------+
+   |   reserved but never touched (costs nothing)    |   resident in RAM (RSS)  |
+   +----------------------------------------------------------------------------+
+
+          the container's cgroup counts (memory.current):
+   +-----------------------------------------+----------------------------------+
+   |  anon: heap, stacks, tmpfs              |  file: page cache                |
+   |  cannot be dropped (no swap)            |  active        |  inactive       |
+   +-----------------------------------------+----------------+-----------------+
+   |&lt;------------ working set = memory.current - inactive file -------&gt;|</code></pre>
+    <ul>
+      <li><strong>VSZ</strong> (virtual size): all virtual memory the process has <em>reserved</em>. Linux hands out virtual memory freely and only uses real RAM when a page is first touched (see <a href="../Operating-Systems/os-virtual-memory-paging.html#linux-practice">overcommit</a>). A big VSZ is usually harmless.</li>
+      <li><strong>RSS</strong> (resident set size): pages of this process that are in RAM right now.</li>
+      <li><strong>anon</strong> ("anonymous" memory): memory not backed by a file: heap, stacks, and files in memory-backed <code>tmpfs</code>. With no swap (the Kubernetes default), the kernel cannot free it. This is what gets you killed.</li>
+      <li><strong>file</strong> (page cache): copies of file data. Clean cache can be dropped at any time, so it rarely causes a kill.</li>
+      <li><strong>Working set</strong>: what <code>kubectl top</code> and the metric <code>container_memory_working_set_bytes</code> show. It is <code>memory.current</code> minus inactive file cache. It is the best single number to compare against the limit.</li>
+    </ul>
+    <h3>Proof that VSZ is not RSS</h3>
+    <pre><code># lazy.py
+import mmap
+m = mmap.mmap(-1, 1024*1024*1024)                # reserve 1 GiB, touch nothing
+for off in range(0, 200*1024*1024, 4096):
+    m[off] = 1                                    # touch 200 MiB, one byte per page</code></pre>
+    <pre><code>start                    VmSize:   14540 kB   VmRSS:   8532 kB
+after reserving 1 GiB    VmSize: 1063116 kB   VmRSS:   8660 kB    &lt;- 1 GiB more virtual, no RAM
+after touching 200 MiB   VmSize: 1063116 kB   VmRSS: 213460 kB    &lt;- RAM used only when touched</code></pre>
+    <h3>Proof that cache does not kill</h3>
+    <p>In a cgroup limited to 100 MiB, writing a 300 MiB file finished fine. Afterwards <code>memory.stat</code> showed <code>anon</code> = 0.2 MiB and <code>file</code> = 95 MiB, and <code>memory.current</code> sat at 99 MiB, right at the limit, with no kill. (Full lab in <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html#cgroup-lab">How Containers Really Work</a>.)</p>
+  </section>
+
+  <section id="requests-limits">
+    <h2>5. Requests, Limits, QoS, and Who Dies First</h2>
+    <ul>
+      <li><strong>requests.memory</strong> is a promise used for <em>placement</em>. The scheduler puts the pod only on a node with that much unreserved memory. It is not enforced at runtime.</li>
+      <li><strong>limits.memory</strong> is a hard cap. The kubelet writes it into the container's cgroup as <code>memory.max</code>. Going over means an OOM kill. (Memory cannot be "slowed down" like CPU, so there is no throttling, just death.)</li>
+    </ul>
+    <p>The mix of requests and limits gives each pod a <strong>QoS class</strong> (quality of service), which decides who goes first when a <em>node</em> runs short:</p>
+    <table>
+      <thead><tr><th>QoS class</th><th>Rule</th><th><code>oom_score_adj</code></th><th>Killed</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Guaranteed</strong></td><td>Every container has requests = limits for CPU and memory</td><td>-997</td><td>Last</td></tr>
+        <tr><td><strong>Burstable</strong></td><td>Some request or limit set, but not Guaranteed</td><td>2 to 999, from the formula below</td><td>Middle</td></tr>
+        <tr><td><strong>BestEffort</strong></td><td>No requests or limits at all</td><td>1000</td><td>First</td></tr>
+      </tbody>
+    </table>
+    <p>The kernel's OOM killer adds <code>oom_score_adj</code> (from -1000 to 1000) to each process's score; a higher score is killed first. For Burstable pods the kubelet uses:</p>
+    <pre><code>oom_score_adj = min( max(2, 1000 - (1000 &times; memory request) / node memory), 999 )</code></pre>
+    <p><strong>Worked example:</strong> our pod requests 512 MiB on a 16 GiB node. 1000 &times; 0.5 / 16 = 31.25, so the value is 1000 - 31.25 &asymp; <strong>968</strong>. A pod requesting 8 GiB on the same node gets 1000 - 500 = <strong>500</strong>. The smaller the request, the closer to the front of the kill line.</p>
+    <p>Our pod is Burstable: it may use up to 1Gi, but only 512Mi is reserved. If many pods on one node burst at once, the <em>node</em> runs short, and eviction or a node-level OOM picks the pods most above their requests. Setting requests = limits for memory removes that risk.</p>
+    <div class="callout">
+      <strong>Newer clusters:</strong> on cgroup v2, recent Kubernetes versions mark each container's cgroup with <code>memory.oom.group = 1</code>. If one process in the container is OOM-killed, all its processes are killed together, so you do not get a half-dead container where a helper process died and the main one kept running.
+    </div>
+  </section>
+
+  <section id="graph">
+    <h2>6. Step 2: Read the Memory Graph</h2>
+    <p>Plot <code>container_memory_working_set_bytes</code> for one pod over a few hours, with the limit as a line. The shape tells you the cause:</p>
+    <pre><code>A. LEAK: steady climb, kill, repeat     B. LIMIT TOO SMALL: flat, but above   C. SPIKE: flat, then one huge jump
+                                           the limit right after start
+1Gi ----x--------x--------x-- limit     1Gi ------x-x-x-x-x-x-x-x--- limit     1Gi ---------------x------ limit
+       /|       /|       /|                       | | | | | | | |                                  |
+      / |      / |      / |                    __/ / / / / / / /                                 |
+     /  |     /  |     /  |                   restarts every few seconds or         ____________/|_______
+    /   |    /   |    /   |                   minutes, during startup               normal      one big request
+   0   42m      84m     126m                                                                    (huge upload, a
+                                                                                                query with no LIMIT)</code></pre>
+    <ul>
+      <li><strong>A (leak):</strong> grows with time or traffic, never comes back down. The pod lives longer at night because there is less traffic. That is our case.</li>
+      <li><strong>B (limit too small):</strong> the app simply needs more than the limit, for example a JVM whose heap is set larger than the container. Raising the limit or shrinking the heap is the right fix.</li>
+      <li><strong>C (spike):</strong> one request loads too much at once. Fix the code path (stream instead of loading everything; paginate; cap upload size).</li>
+    </ul>
+    <p>A healthy service looks like a flat line, or a sawtooth that goes up and down (garbage collection) around a stable level.</p>
+  </section>
+
+  <section id="leak-math">
+    <h2>7. Step 3: Leak-Rate Math</h2>
+    <p>From the graph: just after a restart the pod uses about <strong>300 MiB</strong>. It hits the <strong>1 GiB</strong> (1024 MiB) limit after about <strong>42 minutes</strong>. Each pod serves about <strong>50 requests per second</strong>.</p>
+    <ol>
+      <li>Growth = 1024 - 300 = <strong>724 MiB</strong> in 42 minutes.</li>
+      <li>Leak rate = 724 / 42 &asymp; <strong>17.2 MiB per minute</strong>.</li>
+      <li>Requests per minute = 50 &times; 60 = <strong>3000</strong>.</li>
+      <li>Leak per request = 17.2 MiB / 3000 &asymp; 17,600 KiB / 3000 &asymp; <strong>5.9 KiB per request</strong>.</li>
+    </ol>
+    <p>That number is a clue. A few KiB per request smells like "something about each request is being saved and never removed": a cache, a list of past results, a log buffer, a map of sessions.</p>
+    <p>It also predicts what doubling the limit does: (2048 - 300) / 17.2 &asymp; <strong>102 minutes</strong> between kills. Better, but not fixed. And at night, at 5 requests per second, 1 GiB lasts about 420 minutes (7 hours), which matches the "pods live long at night" clue.</p>
+  </section>
+
+  <section id="reproduce">
+    <h2>8. Step 4: Reproduce It Under a Real Limit</h2>
+    <p>The report feature added this code. Here is a simplified, runnable copy:</p>
+    <pre><code># leaky_service.py
+import time
+
+_cache = {}                                   # BUG: never shrinks
+
+def handle_request(user_id, request_id):
+    report = f"report {user_id}/{request_id}: " + "x" * 2000
+    _cache[(user_id, request_id)] = report    # request_id is unique, so every entry is new
+    return len(report)
+
+def rss_mib():
+    for line in open("/proc/self/status"):
+        if line.startswith("VmRSS"):
+            return int(line.split()[1]) // 1024
+
+request_id = 0
+while True:
+    for _ in range(10000):
+        request_id += 1
+        handle_request(request_id % 100, request_id)
+    print(f"{request_id:7d} requests  RSS {rss_mib():4d} MiB", flush=True)
+    time.sleep(0.05)</code></pre>
+    <p>The author meant to cache reports so repeated downloads are fast. But the cache key includes <code>request_id</code>, which is different for every request. So no entry is ever reused, and none is ever removed.</p>
+    <p>Run it in a cgroup with a 150 MiB limit, exactly as a container would be:</p>
+    <pre><code>$ sudo mkdir -p /sys/fs/cgroup/demo
+$ echo 150M | sudo tee /sys/fs/cgroup/demo/memory.max
+$ echo 0    | sudo tee /sys/fs/cgroup/demo/memory.swap.max
+$ sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs; exec python3 leaky_service.py'
+  10000 requests  RSS   29 MiB
+  20000 requests  RSS   50 MiB
+  30000 requests  RSS   72 MiB
+  40000 requests  RSS   93 MiB
+  50000 requests  RSS  115 MiB
+  60000 requests  RSS  135 MiB
+Killed
+$ echo $?
+137
+$ sudo dmesg | grep "Killed process" | tail -1
+Memory cgroup out of memory: Killed process 422817 (python3) total-vm:165492kB,
+anon-rss:153100kB, file-rss:6256kB, shmem-rss:0kB, UID:0 pgtables:372kB oom_score_adj:0</code></pre>
+    <p>Same symptoms as production: steady growth of about 21.5 MiB per 10,000 requests (about 2.2 KiB per request in this small copy), then a kill with exit code 137, and the kernel log shows almost all of it is <code>anon-rss</code>, memory that cannot be dropped.</p>
+    <div class="callout">
+      <strong>Tip:</strong> you do not need a cluster to reproduce an OOM kill. <code>docker run --memory=150m</code> does the same thing, and so does <code>systemd-run --user --scope -p MemoryMax=150M python3 app.py</code> on most Linux desktops.
+    </div>
+  </section>
+
+  <section id="find-line">
+    <h2>9. Step 5: Find the Leaking Line</h2>
+    <p>Growth tells you <em>that</em> it leaks. A <strong>heap profiler</strong> tells you <em>where</em>. Python ships one: <code>tracemalloc</code>. It records which line allocated each block of memory. Take a snapshot, run traffic, take another, and compare:</p>
+    <pre><code>import tracemalloc
+tracemalloc.start()
+snap0 = tracemalloc.take_snapshot()
+# ... handle 100,000 requests ...
+snap1 = tracemalloc.take_snapshot()
+for stat in snap1.compare_to(snap0, "lineno")[:3]:
+    print(stat)</code></pre>
+    <p>Output from a test copy of the same handler (saved as <code>leak.py</code>, so lines 6 and 7 are the same two lines as above), running 100,000 requests and printing RSS every 20,000:</p>
+    <pre><code>after  20000 requests: RSS = 58 MiB, cache entries = 20000
+after  40000 requests: RSS = 106 MiB, cache entries = 40000
+after  60000 requests: RSS = 155 MiB, cache entries = 60000
+after  80000 requests: RSS = 201 MiB, cache entries = 80000
+after 100000 requests: RSS = 254 MiB, cache entries = 100000
+
+Top growth by source line:
+  leak.py:6: size=196 MiB (+196 MiB), count=100000 (+100000), average=2059 B
+  leak.py:7: size=10.3 MiB (+10.3 MiB), count=99983 (+99983), average=108 B
+  leak.py:19: size=3125 KiB (+3125 KiB), count=100000 (+100000), average=32 B</code></pre>
+    <ul>
+      <li>Line 6 builds the report string: 100,000 new strings of about 2 KB each, all still alive. Something is holding on to them.</li>
+      <li>Line 7 is the dictionary insert: the dictionary itself grows by about 100 bytes per entry. That is the "something".</li>
+      <li>The count (+100,000) equals the number of requests: one leaked object per request. That pattern almost always means a collection that only grows.</li>
+    </ul>
+    <p>(RSS here is higher than in step 4 because <code>tracemalloc</code> itself uses memory to track every allocation. Use it in a test or staging copy, not on every production pod.)</p>
+    <h3>The same idea in other languages</h3>
+    <table>
+      <thead><tr><th>Language</th><th>Heap profiler</th><th>What to compare</th></tr></thead>
+      <tbody>
+        <tr><td>Go</td><td><code>net/http/pprof</code>, then <code>go tool pprof -base old.pb.gz new.pb.gz</code></td><td><code>inuse_space</code> growth by function</td></tr>
+        <tr><td>Java / Kotlin</td><td><code>jcmd &lt;pid&gt; GC.heap_dump</code>, open in Eclipse MAT or VisualVM</td><td>"Dominator tree": which object keeps the most memory alive</td></tr>
+        <tr><td>Node.js</td><td><code>node --inspect</code> + Chrome DevTools heap snapshots</td><td>Objects allocated between two snapshots</td></tr>
+        <tr><td>Python</td><td><code>tracemalloc</code>; <code>memray</code> for native allocations too</td><td>Growth by line</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="runtimes">
+    <h2>10. Runtime Traps: JVM, Go, Node, Python</h2>
+    <p>Not every OOMKilled is a leak. Many are a mismatch between what the language runtime <em>thinks</em> it may use and what the container allows. The runtime manages its own heap and only gives memory back to the OS lazily, so it must know the limit.</p>
+    <table>
+      <thead><tr><th>Runtime</th><th>Trap</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>JVM</strong></td><td><code>-Xmx</code> set to the full limit. Total memory = heap + metaspace + thread stacks + direct buffers + JIT code, so it goes over.</td><td>Let the JVM size from the container: <code>-XX:MaxRAMPercentage=75</code> (Java 10+ reads cgroup limits). Leave 25% for non-heap.</td></tr>
+        <tr><td><strong>Go</strong></td><td>The garbage collector does not know the limit and lets the heap grow to twice the live data before collecting.</td><td>Set <code>GOMEMLIMIT</code> (Go 1.19+) to about 90% of the limit, for example <code>GOMEMLIMIT=900MiB</code> for a 1Gi limit. The GC then works harder as memory gets close.</td></tr>
+        <tr><td><strong>Node.js</strong></td><td>The V8 old-generation heap limit may not match the container.</td><td>Set <code>--max-old-space-size</code> (in MiB) to about 75% of the limit.</td></tr>
+        <tr><td><strong>Python</strong></td><td>No heap cap at all. Many threads can also cause glibc <code>malloc</code> to keep many memory "arenas" that are hard to give back.</td><td>Fix the code; try <code>MALLOC_ARENA_MAX=2</code> for heavily threaded servers; watch native memory from libraries like NumPy and PyTorch, which <code>tracemalloc</code> does not see.</td></tr>
+        <tr><td><strong>Any</strong></td><td>Writing to <code>/dev/shm</code> or an <code>emptyDir</code> with <code>medium: Memory</code>. These are <code>tmpfs</code>: RAM that counts as memory that cannot be dropped.</td><td>Use disk-backed volumes for big temp files; set <code>sizeLimit</code> on memory-backed volumes.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="fix">
+    <h2>11. The Fix and Right-Sizing the Limit</h2>
+    <h3>Fix the code</h3>
+    <p>Two bugs: the key is wrong (it should identify the <em>report</em>, not the request) and the cache has no size bound. Fix both:</p>
+    <pre><code># fixed.py
+from functools import lru_cache
+
+@lru_cache(maxsize=5000)          # FIX: bounded; least recently used entries are evicted
+def render_report(user_id, day):
+    return f"report {user_id}/{day}: " + "x" * 2000</code></pre>
+    <p>Same 100,000 requests (the load test passes distinct values for <code>day</code>, the worst case for any cache):</p>
+    <pre><code>after  20000 requests: RSS = 20 MiB, cache size = 5000
+after  40000 requests: RSS = 20 MiB, cache size = 5000
+after  60000 requests: RSS = 20 MiB, cache size = 5000
+after  80000 requests: RSS = 20 MiB, cache size = 5000
+after 100000 requests: RSS = 20 MiB, cache size = 5000</code></pre>
+    <p>Flat. Even with keys that never repeat, memory is capped at about 5000 &times; 2 KB &asymp; 10 MB of reports. Other safe patterns: a time-to-live (TTL) on entries, or an external cache like Redis with its own memory limit and eviction policy.</p>
+    <h3>Right-size the limit</h3>
+    <p>After the fix, run a load test at peak traffic for at least an hour (a <strong>soak test</strong>, long enough to see slow leaks) and record the working set.</p>
+    <ol>
+      <li>Peak working set in the soak test: say <strong>420 MiB</strong>.</li>
+      <li>Add headroom for spikes and garbage collection, about 25%: 420 &times; 1.25 = 525, so <strong>limit = 576Mi</strong> (rounded up).</li>
+      <li>Set <strong>requests.memory = limits.memory = 576Mi</strong>. Memory cannot be shared out like CPU time, so reserving what you may use avoids surprise node-level evictions (and with CPU requests equal to limits too, the pod becomes Guaranteed).</li>
+    </ol>
+    <p>The fix let us <em>lower</em> the limit from 1Gi to 576Mi. Doubling it would have hidden the bug and wasted 6 &times; 1 GiB of reserved cluster memory.</p>
+  </section>
+
+  <section id="prevent">
+    <h2>12. Preventing the Next One: Alerts and Tests</h2>
+    <p>Prometheus alerts using standard metrics from cAdvisor (built into the kubelet) and kube-state-metrics:</p>
+    <pre><code># Warn before the kill: working set above 90% of the limit for 15 minutes
+- alert: ContainerMemoryNearLimit
+  expr: |
+    max by (namespace, pod, container) (container_memory_working_set_bytes{container!=""})
+      / on (namespace, pod, container)
+    max by (namespace, pod, container) (kube_pod_container_resource_limits{resource="memory"})
+      &gt; 0.9
+  for: 15m
+
+# Page when kills actually happen
+- alert: ContainerOOMKilled
+  expr: increase(container_oom_events_total{container!=""}[30m]) &gt; 0
+
+# Catch slow leaks: at the current growth rate, the limit is hit within 2 hours
+- alert: ContainerMemoryLeakSuspected
+  expr: |
+    predict_linear(container_memory_working_set_bytes{container!=""}[1h], 2 * 3600)
+      &gt; on (namespace, pod, container) group_left
+    max by (namespace, pod, container) (kube_pod_container_resource_limits{resource="memory"})
+  for: 30m</code></pre>
+    <ul>
+      <li><strong>Soak tests in CI or staging:</strong> run steady traffic for an hour and fail the build if memory keeps rising (for example, if the last 15 minutes average is more than 10% above the first 15 after warm-up).</li>
+      <li><strong>Code review rule:</strong> every in-process cache, map, or list that grows with requests needs a bound (size or time) and a clear key. "Grows with traffic" should be a review comment.</li>
+      <li><strong>Dashboards:</strong> show working set and the limit on the same graph, per container, plus restart counts.</li>
+    </ul>
+  </section>
+
+  <section id="postmortem">
+    <h2>13. Blameless Postmortem</h2>
+    <p>A <strong>postmortem</strong> is a short write-up after an incident. "Blameless" means it looks at how the system allowed the problem, not at who made the mistake.</p>
+    <table>
+      <tbody>
+        <tr><th>Summary</th><td>For 5 days, <code>orders-api</code> pods were OOM-killed about every 42 minutes at peak, causing short bursts of 5xx errors during each restart.</td></tr>
+        <tr><th>Impact</th><td>About 0.4% of requests failed at peak. No data loss.</td></tr>
+        <tr><th>Root cause</th><td>The report cache used a key containing the request ID, so entries were never reused, and it had no size bound. Memory grew by about 6 KiB per request until the 1Gi limit.</td></tr>
+        <tr><th>Detection</th><td>Users reported errors. No alert existed for memory near the limit or for OOM kills.</td></tr>
+        <tr><th>What went well</th><td>The restart pattern and the leak-rate math pointed to a per-request leak within an hour; the bug was reproduced locally under a cgroup limit.</td></tr>
+        <tr><th>Action items</th><td>(1) Bounded LRU cache with the correct key (done). (2) Alerts: near-limit, OOM events, linear-prediction leak (done). (3) One-hour soak test in staging for every release. (4) Review checklist item for unbounded collections. (5) Set memory requests = limits from soak-test data for all services.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Try each one before reading the answer.</p>
+
+    <h3>Problem 1: name the kill</h3>
+    <p>For each case, say what happened: (a) <code>Reason: OOMKilled</code>, <code>Exit Code: 137</code>; (b) <code>Status: Failed</code>, <code>Reason: Evicted</code>, "The node was low on resource: memory"; (c) <code>Reason: Error</code>, <code>Exit Code: 137</code>, and the pod always takes 30 s to stop; (d) <code>Exit Code: 143</code>.</p>
+    <p><em>Answer:</em> (a) The container went over its own memory limit; the kernel killed it in its cgroup. (b) The node ran low on memory and the kubelet evicted the pod; look at node usage and requests. (c) The grace period ran out and the kubelet sent SIGKILL; the app ignores SIGTERM. (d) 143 = 128 + 15: the app exited because of SIGTERM, a normal, graceful stop.</p>
+
+    <h3>Problem 2: leak-rate math</h3>
+    <p>A pod starts at 250 MiB, has a 2Gi limit, and serves 120 requests per second. It is killed every 2 hours and 10 minutes. How much does it leak per request? How long would it last with a 3Gi limit?</p>
+    <p><em>Answer:</em> Growth = 2048 - 250 = 1798 MiB in 130 minutes = 13.8 MiB/min. Requests per minute = 7200. Per request = 13.8 &times; 1024 / 7200 &asymp; <strong>1.96 KiB</strong>. With 3Gi: (3072 - 250) / 13.8 &asymp; <strong>204 minutes</strong> (about 3 h 24 min). Still a leak.</p>
+
+    <h3>Problem 3: oom_score_adj</h3>
+    <p>Two Burstable pods run on a 32 GiB node: pod A requests 1 GiB, pod B requests 16 GiB. The node runs out of memory before the kubelet reacts. Compute each pod's <code>oom_score_adj</code>. Which is more likely to be killed if both use similar memory?</p>
+    <p><em>Answer:</em> A: 1000 - 1000 &times; 1/32 = 1000 - 31.25 &asymp; <strong>969</strong>. B: 1000 - 1000 &times; 16/32 = <strong>500</strong>. Higher means killed first, so <strong>pod A</strong>, the one that reserved less.</p>
+
+    <h3>Problem 4: is this a problem?</h3>
+    <p>A pod with a 1Gi limit shows <code>memory.current</code> at 990 MiB all day and has never restarted. <code>memory.stat</code> says <code>anon</code> = 310 MiB and <code>file</code> = 670 MiB. Should you raise the limit?</p>
+    <p><em>Answer:</em> No. Most of it is page cache from files the app reads, and the kernel drops cache when it needs room. Only 310 MiB cannot be dropped. Watch <code>anon</code> or the working set (which leaves out inactive cache) instead of <code>memory.current</code>.</p>
+
+    <h3>Problem 5: the JVM that dies at startup</h3>
+    <p>A Java service has <code>limits.memory: 2Gi</code> and starts with <code>-Xmx2g</code>. It is OOM-killed within a minute of starting under load. Explain and fix.</p>
+    <p><em>Answer:</em> The heap alone may grow to 2 GiB, but the JVM also needs memory for metaspace, thread stacks, the JIT compiler, and direct buffers. Heap + non-heap goes over 2Gi. This is graph B (limit too small for the settings), not a leak. Fix: drop <code>-Xmx</code> and use <code>-XX:MaxRAMPercentage=75</code> (about 1.5 GiB heap), or raise the limit to fit the heap plus non-heap memory.</p>
+
+    <h3>Problem 6: the shared-memory surprise</h3>
+    <p>A PyTorch training pod with a 16Gi limit is OOM-killed, but the Python process's heap is only 9 GiB. Data-loading worker processes pass batches through <code>/dev/shm</code>, which is mounted from an <code>emptyDir</code> with <code>medium: Memory</code>. What is using the rest?</p>
+    <p><em>Answer:</em> Files in <code>/dev/shm</code> live in <code>tmpfs</code>, which is RAM charged to the container and cannot be dropped like normal page cache. Batches waiting in shared memory, plus the memory of each worker process, push the total over 16Gi. Fix: fewer workers or a smaller prefetch, a <code>sizeLimit</code> on the volume, and count shared memory in the limit.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Raising the limit first.</strong> For a leak, it only makes kills less frequent and wastes memory. Do the leak-rate math first.</li>
+      <li><strong>Blaming every exit 137 on memory.</strong> 137 only means SIGKILL. Check the reason field and <code>memory.events</code>.</li>
+      <li><strong>Watching VSZ or <code>memory.current</code>.</strong> Use the working set or <code>anon</code>. VSZ includes memory never touched; <code>memory.current</code> includes cache that can be dropped.</li>
+      <li><strong>Memory requests far below limits.</strong> The node is overbooked, and when several pods burst together, eviction or node OOM hits pods that did nothing wrong.</li>
+      <li><strong>Language heap set to the full container limit.</strong> Leave room for non-heap memory (JVM metaspace and stacks, Go runtime, native libraries).</li>
+      <li><strong>Unbounded in-process caches.</strong> Every cache needs a size or time bound and a key that can actually repeat.</li>
+      <li><strong>Profiling only in production, or never.</strong> Reproduce under a cgroup limit locally and compare two heap snapshots.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Command or fact</th></tr></thead>
+      <tbody>
+        <tr><td>Last kill reason and exit code</td><td><code>kubectl describe pod &lt;pod&gt;</code> &rarr; Last State</td></tr>
+        <tr><td>Just the reason</td><td><code>kubectl get pod &lt;pod&gt; -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'</code></td></tr>
+        <tr><td>Working set now</td><td><code>kubectl top pod &lt;pod&gt; --containers</code></td></tr>
+        <tr><td>Limit hits and OOM kills (cgroup v2)</td><td><code>kubectl exec &lt;pod&gt; -- cat /sys/fs/cgroup/memory.events</code></td></tr>
+        <tr><td>anon vs cache</td><td><code>kubectl exec &lt;pod&gt; -- grep -E '^(anon|file) ' /sys/fs/cgroup/memory.stat</code></td></tr>
+        <tr><td>Node kernel OOM log</td><td><code>journalctl -k | grep -i "out of memory"</code> or <code>dmesg</code> on the node</td></tr>
+        <tr><td>QoS class</td><td><code>kubectl get pod &lt;pod&gt; -o jsonpath='{.status.qosClass}'</code></td></tr>
+        <tr><td>Exit codes</td><td>137 = SIGKILL (OOM or grace period ran out), 143 = SIGTERM</td></tr>
+        <tr><td>Leak rate</td><td><code>(limit - start) / time to kill</code>; divide by requests per minute for per-request leak</td></tr>
+        <tr><td>Burstable <code>oom_score_adj</code></td><td><code>min(max(2, 1000 - 1000 &times; request / node memory), 999)</code></td></tr>
+        <tr><td>Sizing</td><td>limit &asymp; peak soak-test working set &times; 1.25; memory request = limit</td></tr>
+        <tr><td>Runtime settings</td><td>JVM <code>-XX:MaxRAMPercentage=75</code>; Go <code>GOMEMLIMIT</code> &asymp; 90%; Node <code>--max-old-space-size</code> &asymp; 75%</td></tr>
+        <tr><td>Key metrics</td><td><code>container_memory_working_set_bytes</code>, <code>container_oom_events_total</code>, <code>kube_pod_container_resource_limits</code></td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" rel="noopener noreferrer">Kubernetes: resource management for pods and containers</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" rel="noopener noreferrer">Kubernetes: node-pressure eviction</a> &middot; <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" rel="noopener noreferrer">Linux cgroup v2 docs</a> &middot; <a href="https://docs.python.org/3/library/tracemalloc.html" rel="noopener noreferrer">Python tracemalloc</a> &middot; <a href="https://go.dev/doc/gc-guide" rel="noopener noreferrer">Go GC guide (GOMEMLIMIT)</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Builds on: <a href="../Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> &middot; <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html">How Containers Really Work</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html#resources">Kubernetes requests and limits</a></p>
+    <p>Other scenarios: <a href="scenario-slow-api-debugging.html">Debugging a Slow API End to End</a> &middot; <a href="scenario-service-cannot-reach-database.html">A Service Cannot Reach Its Database</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -238,6 +238,7 @@ full avg10=18.40 avg60=11.73 avg300=4.02 total=31277120</code></pre>
     <div class="callout">
       <strong>Kubernetes connection:</strong> a container killed this way shows <code>Reason: OOMKilled</code> and exit code <strong>137</strong> (128 + signal 9). Note that the page cache counts toward the cgroup too, but the kernel reclaims clean cache before killing. See <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html">Kubernetes Workloads</a> for memory requests and limits.
     </div>
+    <p>Watch a real cgroup OOM kill happen, step by step, in <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html#cgroup-lab">How Containers Really Work</a>, and follow a full production investigation in <a href="../Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a>.</p>
     <h3>RSS vs VSZ</h3>
     <p><code>ps</code> shows <strong>VSZ</strong> (virtual size: everything mapped, including never-touched reservations) and <strong>RSS</strong> (resident set size: pages actually in RAM now, counting shared libraries fully in every process). Neither is perfect. <code>PSS</code> in <code>/proc/&lt;pid&gt;/smaps_rollup</code> splits shared pages fairly among sharers.</p>
   </section>

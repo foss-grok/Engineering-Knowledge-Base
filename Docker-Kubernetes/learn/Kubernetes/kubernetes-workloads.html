@@ -504,6 +504,8 @@ kubectl top pods -n production</code></pre>
       </tbody>
     </table>
 
+    <p>What the limit becomes inside the kernel (<code>memory.max</code> and <code>cpu.max</code> in the container's cgroup), and why exceeding memory means a kill while exceeding CPU means throttling, is shown hands-on in <a href="../Docker/containers-under-the-hood.html#cgroups">How Containers Really Work</a>. For debugging a container that keeps dying with <code>OOMKilled</code>, including how QoS sets <code>oom_score_adj</code>, see <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a>.</p>
+
     <h3>LimitRange and ResourceQuota</h3>
     <pre><code># Namespace default for containers without resources
 apiVersion: v1

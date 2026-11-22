@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>CPU Caches &amp; the Memory Hierarchy | CS Fundamentals</title>
+  <meta name="description" content="CPU caches from zero with real measurements: the memory hierarchy and latency numbers, locality, 64-byte cache lines, splitting an address into tag, set and offset by hand, direct-mapped and set-associative caches, the three kinds of misses, average memory access time, write-back caches, a 10x loop-order speedup, cache coherence (MESI), a 5x false-sharing slowdown and its fix, and NUMA.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; CPU Caches &amp; the Memory Hierarchy</p>
+  </nav>
+  <h1>CPU Caches &amp; the Memory Hierarchy</h1>
+  <p>Why the same loop can run 10 times faster just by swapping two lines, and why two threads that never touch the same variable can still slow each other down 5 times. We build the ideas from zero, work the address math by hand, and measure everything on a real Linux machine. All timings on this page come from the C programs shown here.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Caches Exist: the Speed Gap</a></li>
+    <li><a href="#hierarchy">The Memory Hierarchy and Locality</a></li>
+    <li><a href="#lines">Cache Lines: Memory Moves in 64-Byte Blocks</a></li>
+    <li><a href="#measure">Measuring the Hierarchy Yourself</a></li>
+    <li><a href="#placement">Where Can a Line Go? Direct-Mapped and Set-Associative</a></li>
+    <li><a href="#address-split">Splitting an Address by Hand</a></li>
+    <li><a href="#misses">The Three Kinds of Misses and AMAT</a></li>
+    <li><a href="#writes">What Happens on a Write</a></li>
+    <li><a href="#loop-order">Loop Order: a 10x Speedup from Two Lines</a></li>
+    <li><a href="#coherence">Many Cores: Coherence and MESI</a></li>
+    <li><a href="#false-sharing">False Sharing: Slow Without Sharing Anything</a></li>
+    <li><a href="#numa">NUMA: Near and Far Memory</a></li>
+    <li><a href="#connections">How This Connects to the Rest</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Caches Exist: the Speed Gap</h2>
+    <p>A modern CPU core can do a simple step (add two numbers) in well under a nanosecond. But fetching one number from main memory (<strong>RAM</strong>) takes around 80 to 150 nanoseconds. In that time the core could have done hundreds of steps. If every read went to RAM, the CPU would spend almost all its time waiting.</p>
+    <p>The fix is a <strong>cache</strong>: a small, very fast memory that sits on the CPU chip and keeps copies of data that was used recently. When the data you need is in the cache, that is a <strong>hit</strong>, and it is fast. When it is not, that is a <strong>miss</strong>: the CPU must fetch it from a slower level, and it waits.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> Think of studying for an exam. The book you are reading is on your desk (cache). Other books are on the shelf across the room (RAM). Books you have not opened this year are in the library across town (disk). You keep the books you use most on the desk, because walking to the shelf every time would waste the whole evening.
+    </div>
+    <p>Fast memory is expensive and takes chip space, so we cannot make the cache as big as RAM. Instead, computers stack several levels, each one bigger and slower than the one before. That stack is the <strong>memory hierarchy</strong>.</p>
+  </section>
+
+  <section id="hierarchy">
+    <h2>2. The Memory Hierarchy and Locality</h2>
+    <pre><code>              faster, smaller, costlier per byte
+                          ^
+   +-----------------+    |   ~0.3 ns   a few hundred bytes   (inside the core)
+   |    Registers    |    |
+   +-----------------+    |
+   |    L1 cache     |    |   ~1 ns     32-64 KiB per core
+   +-----------------+    |
+   |    L2 cache     |    |   ~4 ns     1-2 MiB per core
+   +-----------------+    |
+   |    L3 cache     |    |   ~10-40 ns tens to hundreds of MiB, shared by all cores
+   +-----------------+    |
+   |   RAM (DRAM)    |    |   ~80-150 ns  gigabytes
+   +-----------------+    |
+   |   SSD / disk    |    |   ~20-100 us (SSD), ~5-10 ms (spinning disk)
+   +-----------------+    v
+              slower, bigger, cheaper per byte</code></pre>
+    <p>These are rough, typical numbers. Your machine will differ a bit, and section 4 shows how to measure your own.</p>
+    <p>Caches work because real programs are not random. They show <strong>locality</strong>:</p>
+    <ul>
+      <li><strong>Temporal locality</strong> (locality in time): if you used a piece of data just now, you will probably use it again soon. Example: a loop counter, or the top of the stack.</li>
+      <li><strong>Spatial locality</strong> (locality in space): if you used one address, you will probably use the addresses right next to it soon. Example: walking through an array from start to end.</li>
+    </ul>
+    <p>Caches use temporal locality by <em>keeping</em> recent data, and spatial locality by fetching data in <em>blocks</em>, not single bytes. That block is the next idea.</p>
+  </section>
+
+  <section id="lines">
+    <h2>3. Cache Lines: Memory Moves in 64-Byte Blocks</h2>
+    <p>The cache never fetches just one byte. It fetches a whole <strong>cache line</strong> (also called a cache block). On almost all current x86 and ARM CPUs a line is <strong>64 bytes</strong>. When you read one byte, the 63 bytes around it come along for free.</p>
+    <pre><code>RAM addresses (each box = 4 bytes = one int)
+
+ line 0: [a0][a1][a2][a3][a4][a5][a6][a7][a8][a9][a10][a11][a12][a13][a14][a15]   bytes 0-63
+ line 1: [a16][a17] ...                                                [a31]   bytes 64-127
+
+Read a0  -&gt; MISS, the whole line 0 (a0..a15) is copied into the cache
+Read a1  -&gt; HIT  (already there)
+...
+Read a15 -&gt; HIT
+Read a16 -&gt; MISS, line 1 is fetched</code></pre>
+    <h3>Worked example: counting misses in a sum</h3>
+    <p>You sum an array of 1,000,000 <code>int</code> values (4 bytes each, so 4,000,000 bytes) from start to end. The cache starts empty. How many misses?</p>
+    <ol>
+      <li>Ints per line = 64 / 4 = <strong>16</strong>.</li>
+      <li>Lines touched = 1,000,000 / 16 = <strong>62,500</strong>.</li>
+      <li>Each line misses once (the first time), then gives 15 hits. So 62,500 misses out of 1,000,000 reads: a miss rate of 1/16 = <strong>6.25%</strong>.</li>
+    </ol>
+    <p>In practice it is even better. The CPU has a <strong>hardware prefetcher</strong>: a circuit that notices you are walking forward through memory and starts fetching the next lines before you ask. For simple forward or backward walks, it hides most of the miss time.</p>
+    <p>Now change the element to a 64-byte struct and read only one 4-byte field from each. Every read lands on a new line, so every read is a miss: 1,000,000 misses, a miss rate of <strong>100%</strong>, while using only 4 of every 64 bytes fetched. Same number of reads, 16 times more memory traffic. This is why data layout matters.</p>
+  </section>
+
+  <section id="measure">
+    <h2>4. Measuring the Hierarchy Yourself</h2>
+    <p>We can see the levels with a <strong>pointer-chasing</strong> test. We fill a block of memory with a chain of jumps in random order: each 64-byte line stores the address of the next line to visit. The CPU cannot guess the next address (random order defeats the prefetcher), and it cannot start the next read before the current one ends (it needs the value to know where to go). So the time per step is the true latency of whatever level holds the block.</p>
+    <pre><code>// chase.c  (build: gcc -O2 chase.c -o chase)
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;time.h&gt;
+double now(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&amp;t);return t.tv_sec+t.tv_nsec*1e-9;}
+int main(){
+  size_t sizes[]={16&lt;&lt;10,32&lt;&lt;10,256&lt;&lt;10,1&lt;&lt;20,4&lt;&lt;20,16&lt;&lt;20,64&lt;&lt;20,256&lt;&lt;20,1024L&lt;&lt;20};
+  for(int k=0;k&lt;9;k++){
+    size_t n=sizes[k]/sizeof(size_t), lines=n/8;      // 8 words = 64 bytes
+    size_t *p=malloc(n*sizeof(size_t)), *perm=malloc(lines*sizeof(size_t));
+    for(size_t i=0;i&lt;lines;i++) perm[i]=i;
+    srand(1);                                            // shuffle the visit order
+    for(size_t i=lines-1;i&gt;0;i--){size_t j=((size_t)rand()*RAND_MAX+rand())%(i+1);
+      size_t t=perm[i];perm[i]=perm[j];perm[j]=t;}
+    for(size_t i=0;i&lt;lines;i++) p[perm[i]*8]=perm[(i+1)%lines]*8;   // build the chain
+    size_t idx=perm[0]*8; long steps=20000000;
+    double t0=now(); for(long s=0;s&lt;steps;s++) idx=p[idx]; double t1=now();
+    printf("%8zu KiB: %.2f ns per load (%zu)\n",sizes[k]&gt;&gt;10,(t1-t0)*1e9/steps,idx&amp;1);
+    free(p); free(perm);
+  }
+}</code></pre>
+    <p>Output on our test machine (an 8-core Intel Xeon VM with 48 KiB of L1 data cache and 2 MiB of L2 per core, and a large shared L3):</p>
+    <pre><code>      16 KiB: 1.34 ns per load
+      32 KiB: 1.38 ns per load
+     256 KiB: 4.44 ns per load
+    1024 KiB: 5.77 ns per load
+    4096 KiB: 33.06 ns per load
+   16384 KiB: 38.91 ns per load
+   65536 KiB: 125.24 ns per load
+  262144 KiB: 141.02 ns per load
+ 1048576 KiB: 210.41 ns per load</code></pre>
+    <p>Read it like stairs:</p>
+    <table>
+      <thead><tr><th>Block size</th><th>Fits in</th><th>Time per load</th></tr></thead>
+      <tbody>
+        <tr><td>16-32 KiB</td><td>L1</td><td>about 1.4 ns</td></tr>
+        <tr><td>256 KiB-1 MiB</td><td>L2</td><td>about 4-6 ns</td></tr>
+        <tr><td>4-16 MiB</td><td>L3 (bigger than one core's L2)</td><td>about 33-39 ns</td></tr>
+        <tr><td>64 MiB and up</td><td>mostly RAM</td><td>125-210 ns</td></tr>
+      </tbody>
+    </table>
+    <p>The biggest sizes are slower than "pure RAM" because they also miss in the <strong>TLB</strong>, the small cache of address translations. Each miss there adds a page-table walk on top of the data fetch. See <a href="os-virtual-memory-paging.html#tlb">the TLB section of Virtual Memory</a>.</p>
+    <div class="callout">
+      <strong>The lesson in one line:</strong> the same instruction (<code>idx = p[idx]</code>) costs 1.4 ns or 210 ns depending only on where the data lives. That is a 150x range.
+    </div>
+  </section>
+
+  <section id="placement">
+    <h2>5. Where Can a Line Go? Direct-Mapped and Set-Associative</h2>
+    <p>A cache has room for a fixed number of lines. When a new line arrives, the hardware needs a fast rule for <em>where</em> to put it and how to find it again. There are three designs:</p>
+    <ul>
+      <li><strong>Direct-mapped:</strong> each memory line can go in exactly <em>one</em> slot. Very fast to check, but two hot lines that map to the same slot keep kicking each other out.</li>
+      <li><strong>Fully associative:</strong> a line can go in <em>any</em> slot. No clashes, but checking every slot on every access is too slow and power-hungry for big caches.</li>
+      <li><strong>Set-associative</strong> (the real-world middle ground): slots are grouped into <strong>sets</strong>. A line can go only in one set, but in <em>any</em> slot (called a <strong>way</strong>) inside that set. An "8-way" cache has 8 slots per set.</li>
+    </ul>
+    <pre><code>8-way set-associative cache with 64 sets
+
+            way0  way1  way2  way3  way4  way5  way6  way7
+ set 0   [     ][     ][     ][     ][     ][     ][     ][     ]
+ set 1   [     ][     ][     ][     ][     ][     ][     ][     ]
+ ...
+ set 63  [     ][     ][     ][     ][     ][     ][     ][     ]
+
+ A memory line picks its set from a few bits of its address,
+ then may use any free way in that set. If all 8 are full,
+ the cache evicts one (usually the least recently used).</code></pre>
+    <p>Each slot also stores a <strong>tag</strong>: the leftover high bits of the address. The tag tells the cache <em>which</em> of the many possible memory lines is sitting in that slot right now.</p>
+  </section>
+
+  <section id="address-split">
+    <h2>6. Splitting an Address by Hand</h2>
+    <p>To find a byte, the cache cuts the address into three parts:</p>
+    <pre><code>  [          tag          |   set index   |  offset  ]
+     which line is it?       which set?     which byte inside the line?</code></pre>
+    <p><strong>Setup:</strong> a 32 KiB L1 cache, 8-way set-associative, with 64-byte lines.</p>
+    <ol>
+      <li><strong>Number of lines</strong> = 32 KiB / 64 B = 32,768 / 64 = <strong>512 lines</strong>.</li>
+      <li><strong>Number of sets</strong> = lines / ways = 512 / 8 = <strong>64 sets</strong>.</li>
+      <li><strong>Offset bits</strong> = log2(line size) = log2(64) = <strong>6</strong>.</li>
+      <li><strong>Index bits</strong> = log2(number of sets) = log2(64) = <strong>6</strong>.</li>
+      <li><strong>Tag bits</strong> = all the remaining high bits.</li>
+    </ol>
+    <p><strong>Problem:</strong> which set and which byte does address <code>0x7FFE12345678</code> use?</p>
+    <ol>
+      <li>Offset + index = 12 bits, so only the last 3 hex digits matter here: <code>0x678</code>.</li>
+      <li>In binary: <code>0x678</code> = <code>0110 0111 1000</code>.</li>
+      <li>The low 6 bits are the offset: <code>111000</code> = <strong>56</strong>. So it is byte 56 of its line.</li>
+      <li>The next 6 bits are the set index: <code>011001</code> = <strong>25</strong>. So it lives in set 25.</li>
+      <li>Everything above bit 12 (<code>0x7FFE12345</code>) is the tag.</li>
+    </ol>
+    <p>Check with plain arithmetic: <code>0x678</code> = 1656. 1656 mod 64 = 56 (offset). 1656 / 64 = 25, rounded down (set). Both match.</p>
+    <div class="callout">
+      <strong>A useful fact:</strong> here, 64 sets &times; 64 bytes = 4096 bytes. So the set depends only on the address mod 4096. Any two addresses exactly 4 KiB apart (or 8 KiB, 16 KiB, ...) land in the <em>same set</em>. Touch 9 such addresses over and over in an 8-way cache and they keep evicting each other, even though the other 63 sets sit empty. Section 9 shows this hurting real code.
+    </div>
+  </section>
+
+  <section id="misses">
+    <h2>7. The Three Kinds of Misses and AMAT</h2>
+    <p>Every miss has one of three causes (often called "the three C's"):</p>
+    <table>
+      <thead><tr><th>Kind</th><th>Plain meaning</th><th>How to reduce it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Compulsory</strong> (cold)</td><td>The first time you ever touch a line. It cannot already be there.</td><td>Use bigger lines well (spatial locality); prefetching.</td></tr>
+        <tr><td><strong>Capacity</strong></td><td>Your working data is bigger than the cache, so lines get evicted before you come back.</td><td>Work on smaller pieces at a time (tiling or blocking); use smaller data types.</td></tr>
+        <tr><td><strong>Conflict</strong></td><td>The cache has room, but too many hot lines map to the same set.</td><td>Change strides or add padding so addresses spread over sets; more ways.</td></tr>
+      </tbody>
+    </table>
+    <h3>Average memory access time (AMAT)</h3>
+    <p>To judge a cache with one number, we use the <strong>average memory access time</strong>:</p>
+    <pre><code>AMAT = hit time + miss rate &times; miss penalty</code></pre>
+    <p>The miss penalty of one level is the AMAT of the next level down, so the formula nests.</p>
+    <p><strong>Worked example.</strong> L1 hit time is 1 ns and 5% of accesses miss L1. L2 hit time is 4 ns and 20% of the accesses that reach L2 also miss there. RAM takes 80 ns.</p>
+    <ol>
+      <li>Time for an access that reaches L2: 4 + 0.20 &times; 80 = 4 + 16 = <strong>20 ns</strong>.</li>
+      <li>AMAT = 1 + 0.05 &times; 20 = 1 + 1 = <strong>2 ns</strong>.</li>
+    </ol>
+    <p>Now say a bad loop order pushes the L1 miss rate to 25%: AMAT = 1 + 0.25 &times; 20 = <strong>6 ns</strong>, three times slower, with the exact same hardware. A small change in miss rate has a big effect because the miss penalty is so large.</p>
+  </section>
+
+  <section id="writes">
+    <h2>8. What Happens on a Write</h2>
+    <p>Reading is simple: copy the line in. Writing raises a question: when does RAM get the new value?</p>
+    <ul>
+      <li><strong>Write-through:</strong> every write goes to the cache <em>and</em> to the next level right away. Simple and always up to date, but it creates a lot of traffic.</li>
+      <li><strong>Write-back</strong> (what CPU data caches use): the write changes only the cached copy, and the line is marked <strong>dirty</strong> (changed). The line is written down to the next level only when it is evicted. Ten writes to the same line cost one write to RAM, not ten.</li>
+    </ul>
+    <p>And if you write to a line that is not in the cache? Data caches use <strong>write-allocate</strong>: first bring the line in, then change it. This is why writing one byte can still cost a full 64-byte read.</p>
+    <div class="callout callout-intuition">
+      <strong>Same idea, other places:</strong> the OS page cache is write-back too. <code>write()</code> only changes RAM and marks the page dirty; the disk gets it later, which is why <code>fsync()</code> exists. See <a href="os-file-systems-io.html">File Systems &amp; Disk I/O</a>.
+    </div>
+  </section>
+
+  <section id="loop-order">
+    <h2>9. Loop Order: a 10x Speedup from Two Lines</h2>
+    <p>In C (and in NumPy by default) a 2D array is stored <strong>row by row</strong> ("row-major"). <code>a[0][0]</code>, <code>a[0][1]</code>, <code>a[0][2]</code> sit next to each other in memory; <code>a[1][0]</code> comes after the whole first row.</p>
+    <pre><code>// rowcol.c  (build: gcc -O1 rowcol.c -o rowcol)
+#include &lt;stdio.h&gt;
+#include &lt;time.h&gt;
+#define N 4096
+static int a[N][N];                      // 4096 x 4096 ints = 64 MiB
+double now(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&amp;t);return t.tv_sec+t.tv_nsec*1e-9;}
+int main(){
+  for(int i=0;i&lt;N;i++) for(int j=0;j&lt;N;j++) a[i][j]=1;
+  long s=0; double t0,t1;
+  t0=now(); for(int i=0;i&lt;N;i++) for(int j=0;j&lt;N;j++) s+=a[i][j]; t1=now();
+  printf("row-major    (j inner): %.1f ms\n",(t1-t0)*1e3);
+  t0=now(); for(int j=0;j&lt;N;j++) for(int i=0;i&lt;N;i++) s+=a[i][j]; t1=now();
+  printf("column-major (i inner): %.1f ms\n",(t1-t0)*1e3);
+  printf("%ld\n",s);
+}</code></pre>
+    <p>Output (a typical run; three runs gave 11.0-11.2 ms and 117-131 ms):</p>
+    <pre><code>row-major    (j inner): 11.0 ms
+column-major (i inner): 117.3 ms</code></pre>
+    <p>Same additions, same answer, <strong>more than 10 times slower</strong>. Why?</p>
+    <ul>
+      <li><strong>Row order</strong> walks memory forward 4 bytes at a time. One miss brings 16 useful ints, and the prefetcher sees the pattern.</li>
+      <li><strong>Column order</strong> jumps one full row each step: 4096 &times; 4 bytes = 16 KiB. Every read is on a new line, and only 4 of its 64 bytes are used before it is evicted.</li>
+      <li>It is worse than that. 16 KiB is a multiple of 4 KiB, so (as in section 6) <em>every</em> element of a column maps to the <em>same</em> L1 set. Only 8 to 12 of the 4096 lines in a column can stay in L1 at once: conflict misses on top of capacity misses.</li>
+    </ul>
+    <h3>Fixes</h3>
+    <ol>
+      <li><strong>Make the inner loop walk memory in order</strong> (swap the loops). This is the fix 95% of the time.</li>
+      <li><strong>Tiling</strong> (also called blocking): when you truly need both directions, as in matrix multiply or a transpose, work on small square tiles (say 64 &times; 64) that fit in cache, and finish each tile before moving on.</li>
+      <li><strong>Pick the right layout.</strong> If you always read one field of many records, store each field in its own array ("struct of arrays") instead of an array of big structs.</li>
+    </ol>
+    <div class="callout">
+      <strong>Python note:</strong> NumPy follows the same rule. For a C-ordered array, <code>a.sum(axis=1)</code> (along rows) streams memory, while a Python loop over <code>a[:, j]</code> columns jumps around. You can check the layout with <code>a.flags['C_CONTIGUOUS']</code>.
+    </div>
+  </section>
+
+  <section id="coherence">
+    <h2>10. Many Cores: Coherence and MESI</h2>
+    <p>Each core has its own L1 and L2. So two cores can each hold a copy of the same line. If core 0 writes to its copy, core 1 must never keep reading the old value. Keeping all copies in agreement is called <strong>cache coherence</strong>. The hardware does it for you, using a protocol. The classic one is <strong>MESI</strong>, named after the four states a line can be in, inside one core's cache:</p>
+    <table>
+      <thead><tr><th>State</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>M</strong>odified</td><td>Only I have it, and I changed it. RAM is out of date.</td></tr>
+        <tr><td><strong>E</strong>xclusive</td><td>Only I have it, and it matches RAM.</td></tr>
+        <tr><td><strong>S</strong>hared</td><td>Others may have it too. Read-only for now.</td></tr>
+        <tr><td><strong>I</strong>nvalid</td><td>My copy is useless. Fetch it again before use.</td></tr>
+      </tbody>
+    </table>
+    <p>The main rule: <strong>before a core may write a line, every other copy must become Invalid.</strong> The writer sends an "invalidate" message, waits for the others to drop the line, and moves to Modified.</p>
+    <pre><code>Two cores take turns writing to the same 64-byte line X
+
+time  core 0                         core 1
+ t1   write X: owns it (M)           -
+ t2   -                              write X: send invalidate
+      copy -&gt; I                      fetch line from core 0, now M
+ t3   write X: send invalidate       copy -&gt; I
+      fetch line from core 1, now M
+ t4   -                              write X: ...and so on
+
+The line "ping-pongs" between the cores. Every write is now a
+cross-core transfer (tens of ns) instead of an L1 hit (about 1 ns).</code></pre>
+    <p>This is fine and necessary when threads really share a value. The trap is when they do not, which is the next section.</p>
+  </section>
+
+  <section id="false-sharing">
+    <h2>11. False Sharing: Slow Without Sharing Anything</h2>
+    <p>Coherence works on whole <em>lines</em>, not single variables. If two threads write to two <em>different</em> variables that happen to sit in the same 64-byte line, the hardware still ping-pongs the line. This is <strong>false sharing</strong>: the program shares nothing, but the cache line is shared.</p>
+    <pre><code>// fs2.c  (build: gcc -O2 -pthread fs2.c -o fs2)
+#define _GNU_SOURCE
+#include &lt;stdio.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;time.h&gt;
+#define ITERS 50000000L
+struct same   { long a; long b; } s;                  // a and b: 8 bytes apart, same line
+struct padded { long a; char pad[120]; long b; } p;   // a and b: 128 bytes apart
+double now(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&amp;t);return t.tv_sec+t.tv_nsec*1e-9;}
+struct arg{long*c;int cpu;};
+void* inc(void* x){ struct arg*a=x; cpu_set_t m; CPU_ZERO(&amp;m); CPU_SET(a-&gt;cpu,&amp;m);
+  pthread_setaffinity_np(pthread_self(),sizeof m,&amp;m);       // pin to one core
+  for(long i=0;i&lt;ITERS;i++) __atomic_fetch_add(a-&gt;c,1,__ATOMIC_RELAXED);
+  return 0; }
+double run(long*x,long*y){ pthread_t t1,t2; struct arg A={x,0},B={y,2}; double t0=now();
+  pthread_create(&amp;t1,0,inc,&amp;A); pthread_create(&amp;t2,0,inc,&amp;B);
+  pthread_join(t1,0); pthread_join(t2,0); return now()-t0; }
+int main(){
+  printf("same cache line:          %.2f s\n",run(&amp;s.a,&amp;s.b));
+  printf("padded (different lines): %.2f s\n",run(&amp;p.a,&amp;p.b));
+  struct arg A={&amp;p.a,0}; double t0=now(); inc(&amp;A);
+  printf("one thread alone:         %.2f s\n",now()-t0);
+}</code></pre>
+    <p>Each thread adds 1 to <em>its own</em> counter 50 million times. Output (three runs were all close to this):</p>
+    <pre><code>same cache line:          1.27 s
+padded (different lines): 0.23 s
+one thread alone:         0.23 s</code></pre>
+    <p>With padding, two threads finish in the time one thread needs for its half: perfect scaling. Without padding, the same work is <strong>more than 5 times slower</strong> than with it, and slower than doing everything on one thread.</p>
+    <h3>Where it shows up and how to fix it</h3>
+    <ul>
+      <li><strong>Per-thread counters or stats in one array</strong> (<code>long hits[NUM_THREADS]</code>): neighbours share lines. Fix: pad each slot to 64 bytes, or keep counters in thread-local variables and add them up at the end.</li>
+      <li><strong>Hot fields of different threads in one struct</strong> (a queue's head written by the consumer and its tail written by the producer). Fix: put them on separate lines. In C11 use <code>_Alignas(64)</code>, in C++ <code>alignas(64)</code> or <code>std::hardware_destructive_interference_size</code>, in Java <code>@Contended</code>, in Rust <code>#[repr(align(64))]</code> or crossbeam's <code>CachePadded</code>.</li>
+      <li><strong>How to spot it:</strong> adding threads makes things slower, and a profiler (for example <code>perf c2c</code> on Linux) shows heavy contention on one cache line.</li>
+    </ul>
+    <p>Real sharing (many threads updating one counter) has the same cost, for the same reason. The fix there is to share less: give each thread its own counter and combine later. The page on <a href="os-concurrency-synchronization-deadlocks.html">Concurrency &amp; Deadlocks</a> covers locks and atomics; this section explains why even correct atomic code can be slow.</p>
+  </section>
+
+  <section id="numa">
+    <h2>12. NUMA: Near and Far Memory</h2>
+    <p>Big servers often have two or more CPU <strong>sockets</strong> (physical chips). Each socket has its own RAM attached. A core can read any RAM, but its own socket's RAM is faster than the other socket's, which must be reached over a link between the chips. This design is <strong>NUMA</strong>: non-uniform memory access. Each socket plus its RAM is a <strong>NUMA node</strong>.</p>
+    <pre><code>   +---------------- node 0 ----------------+      +---------------- node 1 ----------------+
+   |  cores 0-31   L3 cache    RAM 256 GiB  |&lt;----&gt;|  cores 32-63  L3 cache    RAM 256 GiB  |
+   +----------------------------------------+ link +----------------------------------------+
+     local access: about 80-100 ns              remote access: often 1.5-2x slower</code></pre>
+    <p>Linux places a page on the node of the core that first <em>touches</em> it ("first touch"). So if one thread fills a big array and then threads on the other socket do all the work, every access is remote.</p>
+    <ul>
+      <li>See the layout: <code>lscpu</code> (NUMA lines) or <code>numactl --hardware</code>.</li>
+      <li>Keep a process and its memory together: <code>numactl --cpunodebind=0 --membind=0 ./app</code>.</li>
+      <li>In Kubernetes, the kubelet's CPU Manager and Topology Manager can give a pod whole cores on one NUMA node. This matters for databases, low-latency services, and GPU jobs (each GPU is also attached closer to one socket).</li>
+    </ul>
+  </section>
+
+  <section id="connections">
+    <h2>13. How This Connects to the Rest</h2>
+    <table>
+      <thead><tr><th>Idea here</th><th>Same idea elsewhere</th></tr></thead>
+      <tbody>
+        <tr><td>Cache line (64 B) in a CPU cache</td><td>Page (4 KiB) in <a href="os-virtual-memory-paging.html">virtual memory</a>; the TLB is a cache of page-table entries.</td></tr>
+        <tr><td>Write-back cache, dirty lines</td><td>The OS page cache and <code>fsync</code> in <a href="os-file-systems-io.html">File Systems &amp; Disk I/O</a>; a database buffer pool.</td></tr>
+        <tr><td>Locality, block-sized reads</td><td>B+ tree nodes sized to one disk page in <a href="../Databases/dbms-indexing-btrees-query-plans.html">Indexing &amp; B+ Trees</a>.</td></tr>
+        <tr><td>Tiling to fit in fast memory</td><td>GPUs: FlashAttention splits attention into tiles that fit in the GPU's small on-chip memory, so it reads slow GPU memory (HBM) far less. See <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-inference-optimization.html">LLM Inference Optimization</a>.</td></tr>
+        <tr><td>Arrays beat linked lists</td><td>A linked list scatters nodes around memory, so each step can be a miss (pointer chasing, like section 4). An array streams.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Try each one before reading the answer.</p>
+
+    <h3>Problem 1: address split</h3>
+    <p>A 64 KiB, 4-way set-associative cache uses 64-byte lines. How many sets are there, how many offset and index bits, and which set does address <code>0x0001F7C4</code> use?</p>
+    <p><em>Answer:</em> Lines = 65,536 / 64 = 1024. Sets = 1024 / 4 = <strong>256</strong>. Offset bits = log2(64) = <strong>6</strong>; index bits = log2(256) = <strong>8</strong>. Offset + index = 14 bits. Take the low 14 bits of <code>0x1F7C4</code>: <code>0x1F7C4</code> = 128,964; 128,964 mod 16,384 = 14,276. Offset = 14,276 mod 64 = <strong>4</strong>; set = 14,276 / 64 = 223.06, so set <strong>223</strong>.</p>
+
+    <h3>Problem 2: misses in a loop</h3>
+    <p>You read every element of an array of 2,000,000 <code>double</code> values (8 bytes each) in order, with no prefetcher and a cold cache. Lines are 64 bytes. How many misses? Now you read only every 8th element. How many misses, and how does the time per element change?</p>
+    <p><em>Answer:</em> 8 doubles per line, so 2,000,000 / 8 = <strong>250,000 misses</strong> (miss rate 12.5%). Reading every 8th element still touches every line once: still <strong>250,000 misses</strong>, but for only 250,000 reads, so every read misses. You do 8 times less work but it takes about as long, because time is set by lines fetched, not by elements read.</p>
+
+    <h3>Problem 3: AMAT</h3>
+    <p>L1 hit time is 1 ns, L1 miss rate 10%. L2 hit time 5 ns, L2 local miss rate 30%. RAM is 100 ns. What is the AMAT? Which helps more: cutting the L1 miss rate to 5%, or cutting RAM time to 70 ns?</p>
+    <p><em>Answer:</em> L2 time = 5 + 0.3 &times; 100 = 35 ns. AMAT = 1 + 0.1 &times; 35 = <strong>4.5 ns</strong>. With 5% L1 misses: 1 + 0.05 &times; 35 = <strong>2.75 ns</strong>. With 70 ns RAM: L2 time = 5 + 21 = 26 ns, AMAT = 1 + 2.6 = <strong>3.6 ns</strong>. Halving L1 misses helps more.</p>
+
+    <h3>Problem 4: find the false sharing</h3>
+    <p>A web server keeps <code>struct { long requests; long errors; } stats[16];</code> and each of 16 worker threads updates only <code>stats[my_id]</code>. Adding threads beyond 4 makes it slower. Why, and what is the fix?</p>
+    <p><em>Answer:</em> Each struct is 16 bytes, so 4 workers' slots share one 64-byte line. Every update invalidates the line in the other 3 cores: false sharing. Fix: align and pad each slot to 64 bytes (for example <code>struct { _Alignas(64) long requests; long errors; }</code>, which makes the struct 64 bytes), or use thread-local counters that are added up when stats are read.</p>
+
+    <h3>Problem 5: which kind of miss?</h3>
+    <p>Name the kind of miss: (a) the first call to a function after the program starts; (b) a 50 MiB hash table looked up at random on a CPU with 2 MiB of L2; (c) two arrays, each 64 KiB long and starting exactly 64 KiB apart, read together element by element on a direct-mapped 32 KiB cache.</p>
+    <p><em>Answer:</em> (a) <strong>Compulsory</strong>: never touched before. (b) <strong>Capacity</strong>: the data is much bigger than the cache. (c) <strong>Conflict</strong>: <code>A[i]</code> and <code>B[i]</code> are 64 KiB apart, a multiple of the 32 KiB cache size, so they map to the same slot and evict each other every step, even though the cache has other free space.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Counting operations, not memory.</strong> Two loops with the same number of additions can differ 10x in speed. Ask "how many cache lines does this touch?"</li>
+      <li><strong>Benchmarking with tiny inputs.</strong> A 1 MiB test fits in L2 and looks great; the 1 GiB production input lives in RAM. Test with real sizes.</li>
+      <li><strong>Strides that are powers of two.</strong> Rows of 1024 or 4096 elements line up on the same sets. Padding a row by one cache line (for example 4096 + 16 ints) can remove conflict misses.</li>
+      <li><strong>Per-thread data packed side by side.</strong> That is false sharing waiting to happen. Pad hot per-thread data to 64 bytes.</li>
+      <li><strong>Assuming more threads means more speed.</strong> If threads fight over one line (real or false sharing), more threads make it slower.</li>
+      <li><strong>Ignoring NUMA on big servers.</strong> The thread that first touches memory decides where it lives.</li>
+      <li><strong>Confusing CPU caches with the page cache.</strong> CPU caches are hardware, tiny, and measured in nanoseconds. The page cache is the OS keeping disk data in RAM, measured in GiB.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Item</th><th>Formula or fact</th></tr></thead>
+      <tbody>
+        <tr><td>Cache line</td><td>64 bytes on almost all x86 and ARM CPUs</td></tr>
+        <tr><td>Rough latencies</td><td>L1 ~1 ns, L2 ~4 ns, L3 ~10-40 ns, RAM ~80-150 ns</td></tr>
+        <tr><td>Lines in a cache</td><td><code>cache size / line size</code></td></tr>
+        <tr><td>Sets</td><td><code>lines / ways</code></td></tr>
+        <tr><td>Offset bits</td><td><code>log2(line size)</code>; 64 B = 6</td></tr>
+        <tr><td>Index bits</td><td><code>log2(sets)</code></td></tr>
+        <tr><td>Same-set addresses</td><td>Addresses that differ by a multiple of <code>sets &times; line size</code></td></tr>
+        <tr><td>AMAT</td><td><code>hit time + miss rate &times; miss penalty</code> (nest it per level)</td></tr>
+        <tr><td>Misses</td><td>Compulsory, capacity, conflict</td></tr>
+        <tr><td>Write policy</td><td>CPU data caches: write-back + write-allocate</td></tr>
+        <tr><td>Coherence</td><td>MESI; a write invalidates all other copies of the line</td></tr>
+        <tr><td>False sharing fix</td><td>Pad or align hot per-thread data to 64 bytes</td></tr>
+        <tr><td>Linux tools</td><td><code>lscpu</code>, <code>getconf -a | grep CACHE</code>, <code>perf stat -e cache-misses</code>, <code>perf c2c</code>, <code>numactl --hardware</code></td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://people.freebsd.org/~lstewart/articles/cpumemory.pdf" rel="noopener noreferrer">Ulrich Drepper, What Every Programmer Should Know About Memory</a> &middot; <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/" rel="noopener noreferrer">OSTEP</a> &middot; <a href="https://man7.org/linux/man-pages/man1/perf-c2c.1.html" rel="noopener noreferrer">perf c2c manual</a> &middot; <a href="https://man7.org/linux/man-pages/man8/numactl.8.html" rel="noopener noreferrer">numactl manual</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Read first: <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> (pages and the TLB)</p>
+    <p>Related: <a href="os-concurrency-synchronization-deadlocks.html">Concurrency, Synchronization &amp; Deadlocks</a> &middot; <a href="os-file-systems-io.html">File Systems &amp; Disk I/O</a> &middot; <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-inference-optimization.html">LLM Inference Optimization</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

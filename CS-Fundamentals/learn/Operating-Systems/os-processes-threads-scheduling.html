@@ -423,6 +423,7 @@ $ taskset -c 0,1 ./app        # pin a process to cores 0 and 1</code></pre>
   <section id="containers">
     <h2>10. Scenario: Why Is My Container Slow at 30% CPU?</h2>
     <p><strong>Situation.</strong> A Java API runs in Kubernetes with <code>resources.limits.cpu: 500m</code> (half a core). Dashboards show average CPU around 30% of the limit. Yet p99 latency is terrible: some requests take an extra 80 to 90 ms for no visible reason.</p>
+    <p>(New to cgroups? <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html#cgroups">How Containers Really Work</a> builds one by hand and measures throttling in <code>cpu.stat</code>.)</p>
     <h3>Step 1: understand how a CPU limit works</h3>
     <p>A CPU limit is enforced by the <strong>CFS bandwidth controller</strong> in cgroups. It is not "half a core at all times". It is a budget: <em>quota</em> per <em>period</em>. The default period is 100 ms. A limit of <code>500m</code> becomes:</p>
     <pre><code>$ cat /sys/fs/cgroup/cpu.max        # cgroup v2, inside the container

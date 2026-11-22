@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>How Containers Really Work | Docker &amp; Kubernetes</title>
+  <meta name="description" content="Containers from zero, proven with real commands: a container is a normal Linux process plus namespaces (what it can see), cgroups (what it can use), and a layered root filesystem (overlayfs). Hands-on labs with unshare, network namespaces and veth pairs, cgroup v2 memory, CPU and pids limits with a real OOM kill, an overlayfs copy-up and whiteout, an image pulled apart by hand, PID 1 and signals, the runtime stack from docker to runc, security layers, and a container built from scratch in a few lines of shell.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; How Containers Really Work</p>
+  </nav>
+  <h1>How Containers Really Work</h1>
+  <p>There is no "container" object inside the Linux kernel. A container is an ordinary process with three things added: a limited view of the system, limited resources, and its own files. This page builds each piece by hand with real commands, then puts them together into a working container without Docker. Every output shown was produced on a real Linux machine (kernel 6.12, cgroup v2).</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-idea">The Big Idea in One Picture</a></li>
+    <li><a href="#namespaces">Namespaces: What a Process Can See</a></li>
+    <li><a href="#ns-lab">Lab: Your First Namespaces with unshare</a></li>
+    <li><a href="#netns">Network Namespaces, veth Pairs, and Bridges</a></li>
+    <li><a href="#pid1">PID 1 and Signals: Why Containers Ignore Ctrl+C</a></li>
+    <li><a href="#cgroups">cgroups: What a Process Can Use</a></li>
+    <li><a href="#cgroup-lab">Lab: Memory, CPU, and Process Limits</a></li>
+    <li><a href="#rootfs">The Root Filesystem: Layers and overlayfs</a></li>
+    <li><a href="#images">An Image, Pulled Apart by Hand</a></li>
+    <li><a href="#runtime-stack">Who Does What: docker, containerd, runc, kubelet</a></li>
+    <li><a href="#security">Security Layers and Their Limits</a></li>
+    <li><a href="#from-scratch">Capstone: A Container from Scratch</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-idea">
+    <h2>1. The Big Idea in One Picture</h2>
+    <p>When you run <code>docker run nginx</code>, the kernel starts a normal process, just like when you type <code>nginx</code> in a terminal. The difference is that the process is started inside a box made of three kernel features:</p>
+    <pre><code>                       +-----------------------------------------------+
+                       |              one ordinary process             |
+                       |                  (e.g. nginx)                 |
+                       +-----------------------------------------------+
+                          |                    |                    |
+              NAMESPACES  |        CGROUPS     |      ROOT FILESYSTEM
+          "what can I see?"   "how much can I use?"   "which files are mine?"
+           own PIDs, own        memory.max = 512M      image layers stacked
+           network, own         cpu.max = 1 CPU        with overlayfs, plus a
+           hostname, own        pids.max = 100         thin writable layer
+           mounts, users
+
+        + security filters: capabilities, seccomp, AppArmor/SELinux, user namespaces</code></pre>
+    <ul>
+      <li>A <strong>namespace</strong> gives a process its own private copy of one kind of system resource (process IDs, network, hostname, mounts...). Other processes outside it see their own copy.</li>
+      <li>A <strong>cgroup</strong> (control group) is a group of processes that the kernel counts and limits together: memory, CPU time, number of processes, disk I/O.</li>
+      <li>The <strong>root filesystem</strong> is the set of files the process sees at <code>/</code>. For a container, it comes from the image, stacked with <strong>overlayfs</strong>.</li>
+    </ul>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> a virtual machine is a separate house with its own foundation (its own kernel). A container is a room in a shared house: it has its own door, its own furniture, and a meter on its power use, but it shares the foundation, the pipes, and the wiring (the host kernel) with every other room.
+    </div>
+    <p>Because a container is just a process, you can see it from the host. On a Docker host, <code>ps aux | grep nginx</code> shows the container's nginx with a normal host PID. That one fact explains a lot: containers start in milliseconds (no OS to boot), they are as fast as normal processes, and a kernel bug can affect all of them at once.</p>
+  </section>
+
+  <section id="namespaces">
+    <h2>2. Namespaces: What a Process Can See</h2>
+    <p>Linux has eight kinds of namespaces. A container usually gets a new one of each kind except, sometimes, user and time.</p>
+    <table>
+      <thead><tr><th>Namespace</th><th>Isolates</th><th>What the container sees</th></tr></thead>
+      <tbody>
+        <tr><td><strong>mnt</strong> (mount)</td><td>The list of mounted filesystems</td><td>Its own <code>/</code>, its own <code>/proc</code>, its volumes</td></tr>
+        <tr><td><strong>pid</strong></td><td>Process ID numbers</td><td>Its first process is PID 1; host processes are invisible</td></tr>
+        <tr><td><strong>net</strong></td><td>Network interfaces, IPs, routes, ports, firewall rules</td><td>Its own <code>eth0</code> and <code>lo</code>; port 80 is free even if the host uses it</td></tr>
+        <tr><td><strong>uts</strong></td><td>Hostname</td><td>Its own hostname (Docker uses the container ID)</td></tr>
+        <tr><td><strong>ipc</strong></td><td>Shared memory and message queues</td><td>Its own <code>/dev/shm</code> segments</td></tr>
+        <tr><td><strong>user</strong></td><td>User and group IDs</td><td>Can be "root" (UID 0) inside while being an unprivileged UID like 100000 on the host</td></tr>
+        <tr><td><strong>cgroup</strong></td><td>The view of the cgroup tree</td><td>Its own cgroup looks like the root</td></tr>
+        <tr><td><strong>time</strong></td><td>Boot and monotonic clocks</td><td>Can have its own uptime (rarely used)</td></tr>
+      </tbody>
+    </table>
+    <p>Every process points at one namespace of each kind. You can see them as links in <code>/proc</code>:</p>
+    <pre><code>$ ls -l /proc/self/ns
+lrwxrwxrwx 1 box box 0 Nov 22 14:20 cgroup -&gt; cgroup:[4026531835]
+lrwxrwxrwx 1 box box 0 Nov 22 14:20 ipc -&gt; ipc:[4026532324]
+lrwxrwxrwx 1 box box 0 Nov 22 14:20 mnt -&gt; mnt:[4026532292]
+lrwxrwxrwx 1 box box 0 Nov 22 14:20 net -&gt; net:[4026531840]
+lrwxrwxrwx 1 box box 0 Nov 22 14:20 pid -&gt; pid:[4026532325]
+lrwxrwxrwx 1 box box 0 Nov 22 14:20 uts -&gt; uts:[4026532323]
+...</code></pre>
+    <p>The number in brackets is the namespace's ID. Two processes with the same number for <code>net</code> share one network stack. This is exactly how a Kubernetes <strong>pod</strong> works: all containers in a pod join the <em>same</em> network namespace (so they talk over <code>localhost</code>), while each keeps its own mount namespace (its own files).</p>
+    <p>Three system calls do all the work:</p>
+    <ul>
+      <li><code>clone()</code> with flags like <code>CLONE_NEWPID</code> starts a new process in new namespaces.</li>
+      <li><code>unshare()</code> moves the calling process into new namespaces.</li>
+      <li><code>setns()</code> joins an existing namespace. This is what <code>docker exec</code> and <code>nsenter</code> use to put a new shell inside a running container.</li>
+    </ul>
+  </section>
+
+  <section id="ns-lab">
+    <h2>3. Lab: Your First Namespaces with unshare</h2>
+    <p>The <code>unshare</code> command (part of util-linux, present on almost every Linux system) runs a program in new namespaces. You need root (or a user namespace) for most of these.</p>
+    <h3>A private hostname (uts namespace)</h3>
+    <pre><code>$ hostname
+grok-bot-vm-187681928
+$ sudo unshare --uts bash -c 'hostname box-in-a-box; hostname'
+box-in-a-box
+$ hostname
+grok-bot-vm-187681928          # the host did not change</code></pre>
+    <h3>Private process IDs (pid namespace)</h3>
+    <pre><code>$ sudo unshare --uts --pid --fork --mount-proc bash -c \
+    'hostname box-in-a-box; sleep 100 &amp; ps -e -o pid,comm; true'
+    PID COMMAND
+      1 bash
+      3 sleep
+      4 ps</code></pre>
+    <p>Inside, <code>bash</code> believes it is PID 1, the first process on the machine, and sees only 3 processes. The host still sees all of them, with normal large PIDs.</p>
+    <ul>
+      <li><code>--fork</code> is needed because a process cannot change its own PID; the new namespace applies to its <em>children</em>.</li>
+      <li><code>--mount-proc</code> creates a mount namespace and mounts a fresh <code>/proc</code>. Without it, <code>ps</code> would read the host's <code>/proc</code> and still show every host process. Tools like <code>ps</code> and <code>top</code> just read files in <code>/proc</code>.</li>
+    </ul>
+    <h3>A process has two PIDs</h3>
+    <p>From the host, the kernel file <code>/proc/&lt;pid&gt;/status</code> shows both numbers:</p>
+    <pre><code>$ grep NSpid /proc/416988/status
+NSpid:	416988	1          # 416988 on the host, 1 inside its namespace</code></pre>
+    <p>This is why <code>kill</code> on the host needs the host PID, and why a container's process shows up in the host's <code>top</code>.</p>
+    <h3>An empty network (net namespace)</h3>
+    <pre><code>$ sudo unshare --net bash -c 'ip -brief addr'
+lo               DOWN</code></pre>
+    <p>A brand-new network namespace has only a loopback device, and it is even switched off. No <code>eth0</code>, no routes, no internet. The next section shows how a container runtime wires it up.</p>
+  </section>
+
+  <section id="netns">
+    <h2>4. Network Namespaces, veth Pairs, and Bridges</h2>
+    <p>To connect a network namespace to the outside, runtimes use a <strong>veth pair</strong>: two virtual network cards joined by a virtual cable. A packet sent into one end comes out of the other. One end goes inside the container (and is renamed <code>eth0</code>); the other end stays on the host and is plugged into a <strong>bridge</strong>, a virtual network switch (Docker's is called <code>docker0</code>).</p>
+    <pre><code>   container A netns          container B netns
+   +--------------+           +--------------+
+   | eth0         |           | eth0         |
+   | 172.17.0.2   |           | 172.17.0.3   |
+   +------|-------+           +------|-------+
+          | veth pair                | veth pair
+   -------|--------------------------|----------- host netns
+       vethA1                     vethB1
+          \__________ docker0 _______/        bridge, 172.17.0.1
+                         |
+                    host eth0  --- NAT (iptables/nftables MASQUERADE) ---&gt; internet</code></pre>
+    <ul>
+      <li>Containers on the same bridge talk directly through the bridge.</li>
+      <li>To reach the internet, the host rewrites the container's private source address to its own (<strong>NAT</strong>, see <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-ip-addressing-subnetting-routing.html">IP Addressing &amp; Routing</a>).</li>
+      <li><code>docker run -p 8080:80</code> adds a rule: "packets arriving at host port 8080 go to this container's IP, port 80."</li>
+    </ul>
+    <h3>Lab: build it by hand</h3>
+    <pre><code># 1. create a named network namespace and a veth pair
+sudo ip netns add red
+sudo ip link add veth-host type veth peer name veth-red
+# 2. push one end into the namespace
+sudo ip link set veth-red netns red
+# 3. give both ends addresses on a small private network and switch them on
+sudo ip addr add 10.200.0.1/24 dev veth-host
+sudo ip link set veth-host up
+sudo ip netns exec red ip addr add 10.200.0.2/24 dev veth-red
+sudo ip netns exec red ip link set veth-red up
+sudo ip netns exec red ip link set lo up
+# 4. run a web server inside "red"
+sudo ip netns exec red python3 -m http.server 8000 --bind 10.200.0.2 &amp;</code></pre>
+    <pre><code>$ sudo ip netns exec red ip -brief addr
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+veth-red@if5     UP             10.200.0.2/24 fe80::a097:c3ff:fe68:b59d/64
+
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://10.200.0.2:8000/
+HTTP 200                         # reached through the veth cable
+
+$ curl http://127.0.0.1:8000/
+curl: (7) Failed to connect to 127.0.0.1 port 8000 after 0 ms: Could not connect to server
+                                 # the host's own port 8000 is empty: the server
+                                 # lives in a different network namespace</code></pre>
+    <p>Clean up with <code>sudo ip netns del red</code> (deleting the namespace also deletes the veth pair). This is, in small, what Docker's bridge network and a Kubernetes CNI plugin do for every container and pod.</p>
+  </section>
+
+  <section id="pid1">
+    <h2>5. PID 1 and Signals: Why Containers Ignore Ctrl+C</h2>
+    <p>The first process in a PID namespace is special. On a normal Linux machine, PID 1 is the init system (<code>systemd</code>). The kernel protects it: <strong>a signal sent to PID 1 from outside is ignored unless the process has installed a handler for it</strong>. The only exceptions are <code>SIGKILL</code> and <code>SIGSTOP</code>, which cannot be blocked.</p>
+    <p>Inside a container, <em>your app</em> is PID 1. Most programs never install a handler for <code>SIGTERM</code>; they rely on the default action ("exit"). As PID 1, that default does not apply. We can prove it:</p>
+    <pre><code>$ sudo unshare --pid --fork --mount-proc sleep 300 &amp;
+$ grep -E "NSpid|SigCgt" /proc/416988/status
+NSpid:	416988	1
+SigCgt:	0000000000000000          # no signal handlers installed
+$ sudo kill -TERM 416988; sleep 1; ps -p 416988 -o pid,cmd
+    PID CMD
+ 416988 sleep 300                 # still running: SIGTERM was ignored
+$ sudo kill -KILL 416988          # SIGKILL always works
+$ ps -p 416988 -o pid,cmd
+    PID CMD                       # gone</code></pre>
+    <p>And with a handler:</p>
+    <pre><code>$ sudo unshare --pid --fork --mount-proc sh -c \
+    'trap "echo got SIGTERM, cleaning up; exit 0" TERM; while :; do sleep 0.2; done' &amp;
+$ sudo kill -TERM &lt;its host pid&gt;
+got SIGTERM, cleaning up</code></pre>
+    <p><strong>Why it matters:</strong> <code>docker stop</code> and Kubernetes both send <code>SIGTERM</code>, wait a grace period (10 s for Docker, 30 s by default in Kubernetes), then send <code>SIGKILL</code>. An app that ignores <code>SIGTERM</code> as PID 1 always waits the full grace period and then dies abruptly, dropping in-flight requests. The exit code is then <strong>137</strong> (128 + 9 for SIGKILL), which people often mistake for an out-of-memory kill.</p>
+    <p>A second duty of PID 1 is <strong>reaping zombies</strong>. When any process exits, its parent must collect its exit status. If the parent died, the orphan is handed to PID 1. A real init system collects these; a typical app does not, so finished processes pile up as zombies.</p>
+    <p><strong>Fixes:</strong></p>
+    <ul>
+      <li>Handle <code>SIGTERM</code> in your app (stop accepting work, finish what is in flight, exit).</li>
+      <li>Use the exec form <code>CMD ["node", "server.js"]</code>, not <code>CMD node server.js</code>. The shell form starts <code>/bin/sh -c</code> as PID 1, which does not pass signals on to your app.</li>
+      <li>Or run a tiny init as PID 1: <code>docker run --init</code>, or <code>tini</code> as the entrypoint. It forwards signals and reaps zombies. See <a href="docker-fundamentals.html#best-practices">Docker Fundamentals: best practices</a>.</li>
+    </ul>
+  </section>
+
+  <section id="cgroups">
+    <h2>6. cgroups: What a Process Can Use</h2>
+    <p>Namespaces hide things. They do not stop a process from eating all the memory or CPU. That is the job of <strong>cgroups</strong>. Modern systems use <strong>cgroup v2</strong>: a single tree of folders mounted at <code>/sys/fs/cgroup</code>. Each folder is a group. You put a process in a group by writing its PID into the group's <code>cgroup.procs</code> file, and you set limits by writing to other files in the folder. Children of a process stay in its group.</p>
+    <pre><code>/sys/fs/cgroup/                        root of the tree
+├── system.slice/                      system services (systemd)
+└── kubepods.slice/                    everything Kubernetes runs
+    ├── kubepods-burstable.slice/
+    │   └── kubepods-burstable-pod&lt;uid&gt;.slice/       one folder per pod
+    │       ├── cri-containerd-&lt;id&gt;.scope/          one folder per container
+    │       │     memory.max   memory.current   memory.events
+    │       │     cpu.max      cpu.weight       cpu.stat
+    │       │     pids.max     cgroup.procs
+    │       └── ...
+    └── kubepods-besteffort.slice/ ...</code></pre>
+    <p>The files you will meet most:</p>
+    <table>
+      <thead><tr><th>File</th><th>Meaning</th><th>Set by</th></tr></thead>
+      <tbody>
+        <tr><td><code>memory.max</code></td><td>Hard memory limit. Above it, the kernel reclaims what it can, then OOM-kills a process in the group.</td><td><code>docker run --memory</code>, Kubernetes <code>limits.memory</code></td></tr>
+        <tr><td><code>memory.current</code></td><td>Memory used right now by the group, <em>including</em> page cache from files it read or wrote</td><td>(read only)</td></tr>
+        <tr><td><code>memory.events</code></td><td>Counters: how often the limit was hit (<code>max</code>) and how many OOM kills happened (<code>oom_kill</code>)</td><td>(read only)</td></tr>
+        <tr><td><code>memory.stat</code></td><td>Breakdown: <code>anon</code> (heap, stack), <code>file</code> (page cache), and more</td><td>(read only)</td></tr>
+        <tr><td><code>cpu.max</code></td><td>"quota period": may use <em>quota</em> microseconds of CPU every <em>period</em> microseconds. <code>50000 100000</code> = half a CPU.</td><td><code>docker run --cpus</code>, Kubernetes <code>limits.cpu</code></td></tr>
+        <tr><td><code>cpu.weight</code></td><td>Relative share when CPUs are busy (1-10000, default 100). Not a cap.</td><td>Kubernetes <code>requests.cpu</code></td></tr>
+        <tr><td><code>pids.max</code></td><td>Most processes and threads the group may have. Stops fork bombs.</td><td><code>docker run --pids-limit</code></td></tr>
+      </tbody>
+    </table>
+    <p><strong>CPU math.</strong> <code>--cpus=1.5</code> becomes <code>cpu.max = "150000 100000"</code>: 150 ms of CPU time per 100 ms window, spread across any number of cores. A program with 4 busy threads uses that 150 ms in just 37.5 ms of wall time, then is <strong>throttled</strong> (frozen) for the remaining 62.5 ms of each window. That is why a container can be slow while showing low average CPU. The full story with numbers is in <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-processes-threads-scheduling.html#containers">Processes &amp; CPU Scheduling</a>.</p>
+  </section>
+
+  <section id="cgroup-lab">
+    <h2>7. Lab: Memory, CPU, and Process Limits</h2>
+    <h3>A real OOM kill</h3>
+    <p>This Python program allocates 10 MiB at a time and fills it, so the memory is really used:</p>
+    <pre><code># hog.py
+import time
+chunks = []
+for i in range(1, 1000):
+    chunks.append(bytearray(10 * 1024 * 1024))   # 10 MiB, zero-filled
+    print(f"allocated {i*10} MiB", flush=True)
+    time.sleep(0.02)</code></pre>
+    <p>Make a cgroup with a 100 MiB limit (and no swap), move a shell into it, and run the program:</p>
+    <pre><code>$ sudo mkdir /sys/fs/cgroup/demo
+$ echo 100M | sudo tee /sys/fs/cgroup/demo/memory.max
+$ echo 0    | sudo tee /sys/fs/cgroup/demo/memory.swap.max
+$ sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs; exec python3 hog.py'
+...
+allocated 80 MiB
+allocated 90 MiB
+Killed
+$ echo $?
+137
+
+$ cat /sys/fs/cgroup/demo/memory.events
+low 0
+high 0
+max 37
+oom 1
+oom_kill 1
+
+$ sudo dmesg | tail -1
+Memory cgroup out of memory: Killed process 416702 (python3) total-vm:116940kB,
+anon-rss:102016kB, file-rss:5764kB, shmem-rss:0kB, UID:0 pgtables:260kB oom_score_adj:0</code></pre>
+    <p>Read the evidence: the limit was hit 37 times (<code>max 37</code>; each time the kernel tried to free memory), then it gave up and killed the process (<code>oom_kill 1</code>). The kernel log names the group (<code>oom_memcg=/demo</code> in the full message) and shows the process held about 100 MiB of anonymous memory. The rest of the machine was not affected at all. This is exactly what happens when a Kubernetes container shows <code>OOMKilled</code>; the <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-pod-oomkilled-memory-leak.html">OOMKilled scenario</a> walks through debugging one.</p>
+    <h3>Page cache counts, but does not kill</h3>
+    <p>In the same 100 MiB group, write a 300 MiB file:</p>
+    <pre><code>$ sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/demo/cgroup.procs
+    dd if=/dev/zero of=big.bin bs=1M count=300 status=none; echo dd-exit=$?
+    grep -E "^(anon|file) " /sys/fs/cgroup/demo/memory.stat
+    cat /sys/fs/cgroup/demo/memory.current'
+dd-exit=0
+anon 237568                  # 0.2 MiB of real program memory
+file 100003840               # 95 MiB of cached file data
+104026112                    # memory.current: 99 MiB, right at the limit</code></pre>
+    <p>The group sat at its limit, yet nothing was killed. File cache is "clean" (a copy of data already on disk), so the kernel simply drops old cache pages to make room. Only memory that cannot be dropped, like a program's heap, leads to an OOM kill. <strong>Lesson:</strong> <code>memory.current</code> near the limit does not mean danger by itself; look at <code>anon</code>.</p>
+    <h3>CPU throttling, measured</h3>
+    <pre><code>$ echo "50000 100000" | sudo tee /sys/fs/cgroup/mini/cpu.max     # half a CPU
+$ sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/mini/cgroup.procs
+    exec timeout 3 sh -c "while :; do :; done"'                   # spin for 3 s
+$ grep -E "usage_usec|nr_periods|nr_throttled|throttled_usec" /sys/fs/cgroup/mini/cpu.stat
+usage_usec 1582407           # about 1.5 s of CPU used in 3 s: half a CPU
+nr_periods 38
+nr_throttled 30              # throttled in 30 of 38 windows
+throttled_usec 1465648       # about 1.5 s spent frozen</code></pre>
+    <h3>A process limit</h3>
+    <pre><code>$ echo 20 | sudo tee /sys/fs/cgroup/mini/pids.max
+# inside the group, try to start 30 background sleeps:
+/bin/sh: can't fork: Resource temporarily unavailable
+$ cat /sys/fs/cgroup/mini/pids.events
+max 1</code></pre>
+    <p>Clean up with <code>sudo rmdir /sys/fs/cgroup/demo</code> once no process is left in it.</p>
+  </section>
+
+  <section id="rootfs">
+    <h2>8. The Root Filesystem: Layers and overlayfs</h2>
+    <p>An image is made of <strong>layers</strong>. Each layer is a set of file changes: files added, changed, or deleted, usually from one Dockerfile step. Layers are read-only and shared: ten containers from the same image use one copy on disk.</p>
+    <p>To give a container one normal-looking <code>/</code>, the runtime stacks the layers with <strong>overlayfs</strong>, a filesystem built into Linux that merges several folders into one view:</p>
+    <pre><code>  what the container sees  -&gt;  merged/      (one combined view)
+                                  ^
+  container layer (writable) -&gt; upperdir/    changes made by this container
+  image layer N   (read-only)  \
+  ...                           &gt; lowerdir/  stacked; upper ones win
+  image layer 1   (read-only)  /
+
+  read a file   : take it from the highest layer that has it
+  change a file : "copy-up" - copy the whole file into upperdir, then change it
+  delete a file : put a "whiteout" marker in upperdir that hides the lower copy</code></pre>
+    <h3>Lab: overlayfs by hand</h3>
+    <pre><code>$ mkdir -p ovl/{lower,upper,work,merged} &amp;&amp; cd ovl
+$ echo "v1 from image" &gt; lower/app.conf
+$ echo "keep me"       &gt; lower/readme.txt
+$ sudo mount -t overlay overlay -o lowerdir=lower,upperdir=upper,workdir=work merged
+
+$ echo "changed in container" | sudo tee merged/app.conf   # change a file
+$ sudo rm merged/readme.txt                                 # delete a file
+$ echo "new" | sudo tee merged/new.txt                      # add a file
+
+$ ls -l merged
+-rw-r--r-- 1 box  box  21 Nov 22 14:21 app.conf
+-rw-r--r-- 1 root root  4 Nov 22 14:21 new.txt
+
+$ ls -l lower; cat lower/app.conf          # the "image" is untouched
+-rw-r--r-- 1 box box 14 Nov 22 14:21 app.conf
+-rw-r--r-- 1 box box  8 Nov 22 14:21 readme.txt
+v1 from image
+
+$ ls -l upper                              # all changes live here
+-rw-r--r-- 1 box  box    21 Nov 22 14:21 app.conf
+-rw-r--r-- 1 root root    4 Nov 22 14:21 new.txt
+c--------- 2 root root 0, 0 Nov 22 14:21 readme.txt</code></pre>
+    <p>Look at the last line: the deleted file became a <strong>character device with number 0, 0</strong>. That is the whiteout marker. It hides <code>lower/readme.txt</code> from the merged view without touching the lower layer.</p>
+    <p>Three practical results:</p>
+    <ul>
+      <li><strong>Deleting in a later layer does not shrink an image.</strong> <code>RUN rm big.tar</code> in a new Dockerfile step only adds a whiteout; the bytes are still in the earlier layer. Delete in the same <code>RUN</code> step that created the file, or use a multi-stage build (<a href="docker-advanced.html">Advanced Docker</a>).</li>
+      <li><strong>Copy-up copies the whole file.</strong> Changing one byte of a 2 GiB file in a lower layer first copies all 2 GiB into the container layer. Databases and other heavy writers should write to a <strong>volume</strong>, which bypasses overlayfs.</li>
+      <li><strong>The container layer dies with the container.</strong> <code>docker rm</code> deletes <code>upperdir</code>. Anything worth keeping must be in a volume.</li>
+    </ul>
+  </section>
+
+  <section id="images">
+    <h2>9. An Image, Pulled Apart by Hand</h2>
+    <p>An image is not magic either. Under the <strong>OCI image specification</strong> (the open standard Docker and others follow), it is three kinds of plain files, each named by the SHA-256 hash of its contents (its <strong>digest</strong>):</p>
+    <ol>
+      <li>A <strong>manifest</strong> (JSON): lists the config and the layers by digest.</li>
+      <li>A <strong>config</strong> (JSON): the default command, environment variables, working directory, and the history of build steps.</li>
+      <li><strong>Layers</strong>: compressed tar archives of files.</li>
+    </ol>
+    <p>We can download Alpine Linux 3.20 from Docker Hub with just <code>curl</code>:</p>
+    <pre><code>$ TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:library/alpine:pull" | jq -r .token)
+$ R=https://registry-1.docker.io/v2/library/alpine
+# the tag "3.20" points to an index with one manifest per CPU type; we pick the amd64 one
+$ curl -s -H "Authorization: Bearer $TOKEN" \
+       -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+       $R/manifests/sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e | jq .
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+    "size": 612
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:25f1d6b1951ac8eb3740558fe94cb83d377bdadf95fd9f98b50d2e1b96130471",
+      "size": 3630321
+    }
+  ],
+  ...
+}</code></pre>
+    <p>The config (trimmed):</p>
+    <pre><code>{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "Cmd": ["/bin/sh"]
+  },
+  "rootfs": { "type": "layers", "diff_ids": ["sha256:08bc4e53...a4a2"] },
+  "history": [
+    "ADD alpine-minirootfs-3.20.10-x86_64.tar.gz / # buildkit",
+    "CMD [\"/bin/sh\"]"
+  ]
+}</code></pre>
+    <p>And the single layer is a normal tar file whose hash matches its name:</p>
+    <pre><code>$ curl -sL -H "Authorization: Bearer $TOKEN" $R/blobs/sha256:25f1d6b1...0471 -o layer.tgz
+$ sha256sum layer.tgz
+25f1d6b1951ac8eb3740558fe94cb83d377bdadf95fd9f98b50d2e1b96130471  layer.tgz
+$ tar tzf layer.tgz | head -4
+bin/
+bin/arch
+bin/ash
+bin/base64
+$ tar tzf layer.tgz | wc -l
+517</code></pre>
+    <ul>
+      <li>Because names are hashes, a layer can be checked after download (a changed byte changes the hash), and two images that share a base layer download and store it only once.</li>
+      <li>A tag like <code>3.20</code> is a movable label; a digest is fixed forever. Pin by digest (<code>alpine@sha256:...</code>) when you need the exact same bits every time.</li>
+      <li><code>Cmd</code> in the config is what <code>CMD</code> in a Dockerfile writes. When you run the image, the runtime reads it to know which program to start.</li>
+    </ul>
+  </section>
+
+  <section id="runtime-stack">
+    <h2>10. Who Does What: docker, containerd, runc, kubelet</h2>
+    <pre><code>   You                      Kubernetes
+   docker run ...           kubelet (on every node)
+        |                        |  CRI (Container Runtime Interface, gRPC)
+        v                        v
+     dockerd  ------------&gt;  containerd   (or CRI-O)     pulls images, unpacks layers,
+                                 |                         sets up overlayfs snapshots
+                                 v
+                          containerd-shim                  one per container; keeps it
+                                 |                         running if containerd restarts
+                                 v
+                               runc                        OCI runtime: reads config.json,
+                                 |                         then exits once the app starts
+                                 v
+   clone(new namespaces) -&gt; join cgroup -&gt; mount rootfs (pivot_root)
+   -&gt; drop capabilities, apply seccomp -&gt; exec your program (it becomes PID 1)</code></pre>
+    <ul>
+      <li><strong>runc</strong> does the real kernel work from this page. It reads an OCI runtime <code>config.json</code> (namespaces to create, cgroup limits, mounts, the command) and makes the system calls.</li>
+      <li><strong>containerd</strong> manages images and containers' lifecycles. Docker uses it under the hood, and so do most Kubernetes clusters (Kubernetes removed its built-in Docker support, "dockershim", in version 1.24; images built with Docker still run fine because they follow the same OCI format).</li>
+      <li>Other OCI runtimes can replace runc: <strong>crun</strong> (faster, written in C), <strong>gVisor</strong> (runsc, a user-space kernel for stronger isolation), and <strong>Kata Containers</strong> (each container in a tiny VM).</li>
+    </ul>
+  </section>
+
+  <section id="security">
+    <h2>11. Security Layers and Their Limits</h2>
+    <p>Namespaces and cgroups are about <em>visibility</em> and <em>fair use</em>. They are not a strong security wall on their own, because every container talks to the same kernel. Runtimes add more layers:</p>
+    <table>
+      <thead><tr><th>Layer</th><th>What it does</th><th>Default in Docker</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Capabilities</strong></td><td>Root's powers are split into about 40 pieces (for example <code>CAP_NET_ADMIN</code>, <code>CAP_SYS_ADMIN</code>). A container gets only a small set.</td><td>About 14 kept; dangerous ones like <code>CAP_SYS_ADMIN</code> dropped</td></tr>
+        <tr><td><strong>seccomp</strong></td><td>A filter on system calls. Calls the app should never need (like loading kernel modules) are refused.</td><td>A default profile blocks dozens of risky calls</td></tr>
+        <tr><td><strong>AppArmor / SELinux</strong></td><td>Rules on which files and resources a process may touch.</td><td>On if the host supports it</td></tr>
+        <tr><td><strong>User namespaces</strong></td><td>"root" inside maps to an unprivileged user outside, so an escape lands as nobody.</td><td>Off by default; on in rootless Docker and Podman</td></tr>
+        <tr><td><strong>Read-only root filesystem</strong></td><td>The container cannot change its own files.</td><td>Off; use <code>--read-only</code> or <code>readOnlyRootFilesystem: true</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Big warning:</strong> <code>--privileged</code> turns almost all of this off: all capabilities, no seccomp, access to host devices. A process that is root in a privileged container is effectively root on the host. Mounting the Docker socket (<code>/var/run/docker.sock</code>) into a container is just as powerful, because it can ask Docker to start a privileged container.
+    </div>
+    <p>When you run code you do not trust (for example, code written by users or by an AI agent), add a stronger boundary: gVisor, Kata Containers, or a micro-VM like Firecracker.</p>
+  </section>
+
+  <section id="from-scratch">
+    <h2>12. Capstone: A Container from Scratch</h2>
+    <p>Now put every piece together: the Alpine layer from section 9 as the root filesystem, a cgroup with limits from section 6, and namespaces from section 2. No Docker involved.</p>
+    <pre><code># 1. root filesystem: unpack the image layer
+mkdir rootfs &amp;&amp; tar xzf layer.tgz -C rootfs
+
+# 2. cgroup: 50 MiB of memory, 20 processes, half a CPU
+sudo mkdir /sys/fs/cgroup/mini
+echo 50M            | sudo tee /sys/fs/cgroup/mini/memory.max
+echo 20             | sudo tee /sys/fs/cgroup/mini/pids.max
+echo "50000 100000" | sudo tee /sys/fs/cgroup/mini/cpu.max
+
+# 3. join the cgroup, create namespaces, switch root, start a shell
+sudo bash -c "echo \$\$ &gt; /sys/fs/cgroup/mini/cgroup.procs
+  exec unshare --mount --uts --ipc --net --pid --fork \
+       --mount-proc=$PWD/rootfs/proc \
+       chroot $PWD/rootfs /bin/sh -c 'hostname mini; hostname; head -2 /etc/os-release; ps; true'"</code></pre>
+    <p>Output:</p>
+    <pre><code>mini
+NAME="Alpine Linux"
+ID=alpine
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c hostname mini; hostname; head -2 /etc/os-release; ps; true
+    5 root      0:00 ps</code></pre>
+    <p>(The trailing <code>; true</code> keeps <code>sh</code> alive as PID 1; without it, <code>sh</code> would replace itself with <code>ps</code>.) The host runs some other Linux, but this shell sees Alpine's files, its own hostname, only its own processes (it is PID 1), an empty network with just <code>lo</code>, and it is capped at 50 MiB, 20 processes, and half a CPU (the <code>pids.max</code> and <code>cpu.max</code> tests in section 7 ran in this exact cgroup). That is a container.</p>
+    <p>What real runtimes add on top: <code>pivot_root</code> instead of <code>chroot</code> (so the old root can be fully unmounted and escaped from less easily), a populated <code>/dev</code>, a veth network, overlayfs instead of a plain folder, dropped capabilities and seccomp, user namespaces, and logging.</p>
+  </section>
+
+  <section id="practice">
+    <h2>13. Practice Problems</h2>
+    <p>Try each one before reading the answer.</p>
+
+    <h3>Problem 1: what is shared?</h3>
+    <p>A Kubernetes pod has two containers: <code>app</code> listens on port 8080 and <code>sidecar</code> wants to call it. Which namespaces do they share, and what URL should the sidecar use? Can the sidecar read <code>/app/config.yaml</code> from the app's image?</p>
+    <p><em>Answer:</em> Containers in a pod share the <strong>network</strong> namespace (and the IPC namespace; the PID namespace only if <code>shareProcessNamespace: true</code>). So the sidecar calls <code>http://localhost:8080</code>. Each container has its own <strong>mount</strong> namespace and root filesystem, so the sidecar cannot see the app's image files. To share files, mount the same volume (for example an <code>emptyDir</code>) into both.</p>
+
+    <h3>Problem 2: CPU quota</h3>
+    <p>A container has <code>limits.cpu: 2</code> and runs a program with 8 busy threads on a 16-core node. The period is 100 ms. What is in <code>cpu.max</code>? How long does the program run in each period before it is throttled?</p>
+    <p><em>Answer:</em> <code>cpu.max = "200000 100000"</code>: 200 ms of CPU time per 100 ms. Eight threads burn 8 ms of CPU per 1 ms of wall time, so the quota is gone after 200 / 8 = <strong>25 ms</strong>. The program is frozen for the other <strong>75 ms</strong> of every period. Any request that arrives then waits.</p>
+
+    <h3>Problem 3: why is the image still big?</h3>
+    <p>A Dockerfile has <code>RUN curl -o /tmp/data.tar big-file-url</code> (800 MB), then <code>RUN tar xf /tmp/data.tar -C /opt</code>, then <code>RUN rm /tmp/data.tar</code>. The image is still about 1.6 GB. Why, and how do you fix it?</p>
+    <p><em>Answer:</em> Each <code>RUN</code> makes a layer. Layer 1 holds the 800 MB tar, layer 2 the unpacked files, and layer 3 only a whiteout that hides the tar. The bytes stay in layer 1. Fix: download, unpack, and delete in <strong>one</strong> <code>RUN</code> step (<code>RUN curl ... &amp;&amp; tar ... &amp;&amp; rm ...</code>), or do it in a build stage and <code>COPY --from</code> only <code>/opt</code> into the final stage.</p>
+
+    <h3>Problem 4: read the exit code</h3>
+    <p>A pod is stopped during a deploy. It always takes exactly 30 seconds to go away and ends with exit code 137. <code>kubectl describe</code> says <code>Reason: Error</code>, not <code>OOMKilled</code>. What is going on?</p>
+    <p><em>Answer:</em> 137 = 128 + 9: it was killed with <code>SIGKILL</code>. Since the reason is not OOMKilled, the kubelet sent it after the 30-second grace period. The app ignored <code>SIGTERM</code>, most likely because it runs as PID 1 with no handler, or behind a shell started with <code>CMD</code> in shell form. Fix: handle <code>SIGTERM</code>, use exec form, or add <code>tini</code>/<code>--init</code>.</p>
+
+    <h3>Problem 5: will it be killed?</h3>
+    <p>A container has <code>memory.max</code> = 512 MiB. <code>memory.stat</code> shows <code>anon</code> = 180 MiB and <code>file</code> = 320 MiB, and the app now copies a 2 GiB file. Will it be OOM-killed?</p>
+    <p><em>Answer:</em> Very likely <strong>not</strong>. The 320 MiB is page cache that the kernel can drop, and copying a file mostly adds more clean cache, which gets reclaimed as needed. Only 180 MiB is memory that cannot be reclaimed. The risk comes if <code>anon</code> grows toward 512 MiB (or if files are written to a memory-backed <code>tmpfs</code>, which counts as memory that cannot be dropped).</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Thinking a container is a small VM.</strong> It shares the host kernel. A kernel bug or a privileged container affects the whole host.</li>
+      <li><strong>Reading <code>/proc/meminfo</code> or <code>nproc</code> inside a container to size things.</strong> These often show the <em>host's</em> memory and CPUs, not the cgroup limits. Read <code>/sys/fs/cgroup/memory.max</code> and <code>cpu.max</code>, or use runtimes that are cgroup-aware (recent JVMs, Go 1.25+ for CPU limits, <code>GOMEMLIMIT</code> for memory).</li>
+      <li><strong>Shell-form <code>CMD</code>.</strong> <code>/bin/sh</code> becomes PID 1 and swallows <code>SIGTERM</code>, so every stop waits the full grace period.</li>
+      <li><strong>Writing heavy data inside the container layer.</strong> Copy-up and overlayfs make it slow, and it disappears with the container. Use volumes.</li>
+      <li><strong>Deleting files in a later Dockerfile step to save space.</strong> It only adds a whiteout.</li>
+      <li><strong>Blaming every exit code 137 on memory.</strong> 137 only means SIGKILL. Check the reason and <code>memory.events</code>.</li>
+      <li><strong>Mounting the Docker socket or using <code>--privileged</code> "just to make it work".</strong> Both give away the host.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Command or fact</th></tr></thead>
+      <tbody>
+        <tr><td>A container is</td><td>a process + namespaces + cgroups + a layered root filesystem + security filters</td></tr>
+        <tr><td>See a process's namespaces</td><td><code>ls -l /proc/&lt;pid&gt;/ns</code>; <code>lsns</code></td></tr>
+        <tr><td>Host PID vs container PID</td><td><code>grep NSpid /proc/&lt;pid&gt;/status</code></td></tr>
+        <tr><td>Run in new namespaces</td><td><code>unshare --uts --pid --net --mount --fork --mount-proc &lt;cmd&gt;</code></td></tr>
+        <tr><td>Enter a container's namespaces</td><td><code>nsenter -t &lt;host-pid&gt; -n -m -p &lt;cmd&gt;</code> (what <code>docker exec</code> does)</td></tr>
+        <tr><td>Find a container's cgroup</td><td><code>cat /proc/&lt;pid&gt;/cgroup</code>, then look under <code>/sys/fs/cgroup</code></td></tr>
+        <tr><td>Memory limit and OOM count</td><td><code>memory.max</code>, <code>memory.events</code> (<code>oom_kill</code>)</td></tr>
+        <tr><td>What is using memory</td><td><code>memory.stat</code>: <code>anon</code> (cannot drop) vs <code>file</code> (cache, can drop)</td></tr>
+        <tr><td>CPU limit and throttling</td><td><code>cpu.max</code> ("quota period"), <code>cpu.stat</code> (<code>nr_throttled</code>)</td></tr>
+        <tr><td>Kubernetes mapping</td><td><code>limits.memory</code> &rarr; <code>memory.max</code>; <code>limits.cpu</code> &rarr; <code>cpu.max</code>; <code>requests.cpu</code> &rarr; <code>cpu.weight</code></td></tr>
+        <tr><td>overlayfs parts</td><td><code>lowerdir</code> (image, read-only), <code>upperdir</code> (container changes), <code>merged</code> (the view)</td></tr>
+        <tr><td>Whiteout</td><td>a character device 0,0 in <code>upperdir</code> that hides a deleted file</td></tr>
+        <tr><td>Image parts</td><td>manifest + config + layers, each named by its SHA-256 digest</td></tr>
+        <tr><td>Runtime chain</td><td>docker/kubelet &rarr; containerd &rarr; shim &rarr; runc &rarr; your process</td></tr>
+        <tr><td>Exit 137</td><td>SIGKILL: OOM kill <em>or</em> a grace period that ran out</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html" rel="noopener noreferrer">namespaces(7)</a> &middot; <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" rel="noopener noreferrer">Linux cgroup v2 docs</a> &middot; <a href="https://docs.kernel.org/filesystems/overlayfs.html" rel="noopener noreferrer">overlayfs docs</a> &middot; <a href="https://github.com/opencontainers/image-spec" rel="noopener noreferrer">OCI image spec</a> &middot; <a href="https://github.com/opencontainers/runtime-spec" rel="noopener noreferrer">OCI runtime spec</a> &middot; <a href="https://docs.docker.com/engine/security/" rel="noopener noreferrer">Docker security docs</a></small></p>
+
+    <div class="page-footer-nav">
+      <p>Read first: <a href="docker-fundamentals.html">Docker Fundamentals</a></p>
+      <p>Go deeper: <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-virtual-memory-paging.html#linux-practice">virtual memory and the OOM killer</a> &middot; <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-processes-threads-scheduling.html#containers">CPU limits and throttling</a> &middot; <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-file-systems-io.html">File systems and overlay layers</a> &middot; <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: a pod keeps getting OOMKilled</a></p>
+      <p>Next: <a href="docker-advanced.html">Advanced Docker</a> (smaller, safer, faster builds)</p>
+      <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p><small><a href="../docker-kubernetes-learn.html">Back to Learn</a> &middot; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -182,6 +182,7 @@ do {
     <div class="callout">
       <strong>Rule of thumb:</strong> for one number (a counter, a flag), use an atomic type. For anything bigger (two fields that must change together, a list, a map), use a lock. Hand-written lock-free code is very hard to get right.
     </div>
+    <p>Correct is not the same as fast: when many cores update one atomic counter, or even <em>different</em> variables that share a 64-byte cache line, the hardware bounces that line between cores. <a href="os-cpu-caches-memory-hierarchy.html#false-sharing">CPU Caches: False Sharing</a> measures a 5x slowdown from this and shows the fix.</p>
   </section>
 
   <section id="mutex">
