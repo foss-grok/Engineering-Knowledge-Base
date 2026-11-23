@@ -26,6 +26,7 @@ TRACKS = {
     "CS-Fundamentals/learn": ("cs-fundamentals-learn.html", [
         "Operating-Systems/os-processes-threads-scheduling.html",
         "Operating-Systems/os-virtual-memory-paging.html",
+        "Operating-Systems/os-cpu-caches-memory-hierarchy.html",
         "Operating-Systems/os-file-systems-io.html",
         "Operating-Systems/os-concurrency-synchronization-deadlocks.html",
         "Databases/dbms-normalization-schema-design.html",
@@ -39,9 +40,11 @@ TRACKS = {
         "Scenarios/scenario-slow-api-debugging.html",
         "Scenarios/scenario-service-cannot-reach-database.html",
         "Scenarios/scenario-errors-during-deploys.html",
+        "Scenarios/scenario-pod-oomkilled-memory-leak.html",
     ]),
     "Docker-Kubernetes/learn": ("docker-kubernetes-learn.html", [
         "Docker/docker-fundamentals.html",
+        "Docker/containers-under-the-hood.html",
         "Docker/docker-compose.html",
         "Docker/docker-advanced.html",
         "Kubernetes/kubernetes-architecture.html",

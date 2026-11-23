@@ -89,7 +89,7 @@ Time to read all weights once = 16 GB / 3.35 TB/s = ~4.8 ms
 
 Arithmetic intensity at batch 1: ~2 FLOPs per 2 bytes = ~1 FLOP/byte
 GPU "ridge point":               989e12 / 3.35e12  = ~295 FLOP/byte</code></pre>
-    <p>The GPU could do about 295 operations per byte it loads, but decode at batch 1 only does about 1. So the compute units sit idle more than 99% of the time, waiting for memory. This is what <strong>memory-bound</strong> means.</p>
+    <p>The GPU could do about 295 operations per byte it loads, but decode at batch 1 only does about 1. So the compute units sit idle more than 99% of the time, waiting for memory. This is what <strong>memory-bound</strong> means. (CPUs have the same gap between compute speed and memory speed; <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-cpu-caches-memory-hierarchy.html">CPU Caches &amp; the Memory Hierarchy</a> measures it.)</p>
     <p><strong>The key insight:</strong> if we decode for 64 users in the same step, we read the weights once and use them 64 times. The step takes only a little longer, but we get 64 tokens instead of 1. <strong>Batching is the single biggest lever in LLM serving.</strong></p>
     <p>Prefill is different: a 2,000-token prompt reuses each weight 2,000 times, so prefill is <strong>compute-bound</strong>. Rough cost: <code>2 * params * prompt_tokens = 2 * 8e9 * 2000 = 32 TFLOP</code>, about 65 ms at 50% of peak compute.</p>
   </section>
@@ -265,7 +265,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
       <li>Put stable content (system prompt, tool definitions) at the <em>start</em> of the prompt so prefix caching can reuse it; put changing content at the end</li>
       <li>Truncate, summarize, or <a href="../Prompting-and-Retrieval/ai-engineering-prompt-compression.html">compress context</a> before the model call</li>
       <li>Stream tokens to improve perceived latency</li>
-      <li>Set <code>max_tokens</code> per use case</li>
+      <li>Set <code>max_tokens</code> per use case, and for reasoning models a low thinking effort or budget on easy requests (<a href="ai-engineering-reasoning-test-time-compute.html#cost">reasoning cost math</a>)</li>
       <li>Batch offline jobs separately from interactive traffic</li>
     </ul>
     <p>Profile end to end: embedding, retrieval, and reranking often dominate before the LLM is even called. Optimizing only the model server leaves money on the table.</p>

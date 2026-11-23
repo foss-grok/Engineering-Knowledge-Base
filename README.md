@@ -53,7 +53,7 @@ Open [http://localhost:8080](http://localhost:8080).
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`AI Engineer/ai-engineering.html`](AI%20Engineer/ai-engineering.html) | 1 |
-| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 30 |
+| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 31 |
 | Interview | [`AI Engineer/interview/`](AI%20Engineer/interview/) | 23 |
 | Research | [`AI Engineer/research/`](AI%20Engineer/research/) | 2 |
 
@@ -64,7 +64,7 @@ Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`CS-Fundamentals/cs-fundamentals.html`](CS-Fundamentals/cs-fundamentals.html) | 1 |
-| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 12 |
+| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 17 |
 
 Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`. Pages in the suggested reading order have Previous / Next links, written by `scripts/update-prev-next.py`.
 
@@ -85,7 +85,7 @@ Engineering-Knowledge-Base/
 ├── scripts/
 │   ├── build-search-index.py   # Search index builder (Python 3, no dependencies)
 │   ├── build-search-index.ps1  # Wrapper that calls the Python builder
-│   ├── check-links.py          # Internal link and #anchor checker
+│   ├── check-links.py          # Internal link and #anchor checker; also fails if a learn page is missing from its learn hub
 │   └── update-prev-next.py     # Previous / Next links along a track's reading order
 └── AI Engineer/
     ├── ai-engineering.html
@@ -127,7 +127,8 @@ The script rewrites the block between `<!-- prev-next:start -->` and `<!-- prev-
 ## Checking links
 
 ```bash
-python3 scripts/check-links.py            # whole site; exits 1 if any internal link or #anchor is broken
+python3 scripts/check-links.py            # whole site; exits 1 if any internal link or #anchor is broken,
+                                          # or if a learn page is not linked from its track's learn hub
 python3 scripts/check-links.py AI\ Engineer   # one folder
 ```
 

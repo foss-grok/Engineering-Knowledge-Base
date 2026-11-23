@@ -50,6 +50,7 @@ response = client.chat.completions.create(
     <p>Break complex tasks into stages: plan, retrieve, draft, verify. Each stage can be a separate LLM call with a narrower prompt, reducing error compounding in one shot.</p>
     <h3>Self-consistency</h3>
     <p>Sample multiple reasoning paths at higher temperature and majority-vote the final answer. Trades compute for reliability on hard problems.</p>
+    <p>When voting helps, when it makes things worse, and how it compares with best-of-N, verifiers, and trained reasoning models is worked out with simulations in <a href="../Inference-Deployment-Operations/ai-engineering-reasoning-test-time-compute.html#self-consistency">Reasoning Models &amp; Test-Time Compute</a>.</p>
   </section>
 
   <section>

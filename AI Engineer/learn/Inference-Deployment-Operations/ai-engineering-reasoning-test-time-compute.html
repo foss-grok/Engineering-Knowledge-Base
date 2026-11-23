@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Reasoning Models &amp; Test-Time Compute | AI Engineering</title>
+  <meta name="description" content="Reasoning models and test-time compute from zero, with real simulations: why thinking tokens add compute, chain of thought, self-consistency (majority voting) and when it fails, best-of-N with perfect and noisy verifiers, pass@k and its unbiased estimator worked by hand, process reward models and step-level beam search, how reasoning models are trained with RL on verifiable rewards (a GRPO advantage worked example), budget control and budget forcing, cost and latency math, and when to use a reasoning model.">
+  <link rel="stylesheet" href="../../../styles.css">
+  <script src="../../../assets/mathjax.js"></script>
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Reasoning Models &amp; Test-Time Compute</p>
+  </nav>
+  <h1>Reasoning Models &amp; Test-Time Compute</h1>
+  <p>For years, the way to get a smarter model was to train a bigger one. Reasoning models add a second dial: let the model spend more compute <em>while answering</em>, by thinking longer, trying several times, or checking its own work. This page builds the idea from zero, works the math by hand, and measures each method with small simulations you can run. All numbers in the tables come from the Python code on this page.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-idea">The Big Idea: Two Ways to Spend Compute</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#why-tokens">Why Thinking Out Loud Helps</a></li>
+    <li><a href="#three-ways">Three Ways to Spend Test-Time Compute</a></li>
+    <li><a href="#self-consistency">Self-Consistency: Majority Voting, Measured</a></li>
+    <li><a href="#best-of-n">Best-of-N and Verifiers</a></li>
+    <li><a href="#pass-at-k">pass@k: Measuring "Right in k Tries"</a></li>
+    <li><a href="#step-search">Step-Level Search with Process Reward Models</a></li>
+    <li><a href="#training">How Reasoning Models Are Trained</a></li>
+    <li><a href="#budget">Controlling the Thinking Budget</a></li>
+    <li><a href="#cost">Cost and Latency Math</a></li>
+    <li><a href="#when">When to Use a Reasoning Model</a></li>
+    <li><a href="#engineering">Engineering Tips</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-idea">
+    <h2>1. The Big Idea: Two Ways to Spend Compute</h2>
+    <p>Think about a student in an exam. Two things decide how well they do:</p>
+    <ul>
+      <li>How much they <strong>studied before</strong> the exam. For a model, this is <strong>training compute</strong>: more data, more parameters, longer training.</li>
+      <li>How much <strong>time and scratch paper they use during</strong> the exam. For a model, this is <strong>test-time compute</strong> (also called inference-time compute): the work done each time it answers a question.</li>
+    </ul>
+    <p>A normal chat model answers a hard math question the way a student blurts out the first number that comes to mind. A <strong>reasoning model</strong> first writes a long private scratchpad: it breaks the problem into steps, tries an approach, notices a mistake, backs up, checks the result, and only then writes the final answer.</p>
+    <div class="callout callout-intuition">
+      <strong>Intuition:</strong> some questions are hard to answer in one go but easy to check, like "what is 4,913 divided by 17?" or "does this code pass the tests?". For such questions, spending more effort at answer time pays off a lot, and checking lets you pick the good attempts.
+    </div>
+    <p>Since 2024, this has become a main direction in AI: reasoning models (from many labs, including open-weight ones such as DeepSeek-R1 and Qwen's QwQ and Qwen3 "thinking" modes) score far higher on math, coding, and science tests than models of similar size that answer directly.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Token</strong></td><td>A small piece of text (a word or part of a word). Models read and write one token at a time. See <a href="../Foundations-and-Architecture/ai-engineering-tokenization.html">Tokenization</a>.</td></tr>
+        <tr><td><strong>Inference</strong></td><td>Using a trained model to produce an answer.</td></tr>
+        <tr><td><strong>Chain of thought (CoT)</strong></td><td>The step-by-step reasoning text a model writes before its final answer.</td></tr>
+        <tr><td><strong>Thinking tokens</strong></td><td>Tokens spent on that reasoning. Many products hide them or show only a summary, but you still pay for them.</td></tr>
+        <tr><td><strong>Sample</strong></td><td>One complete answer from the model. With temperature above 0, each sample can differ.</td></tr>
+        <tr><td><strong>Verifier</strong></td><td>Anything that judges an answer: unit tests, a math checker, or another model trained to score answers.</td></tr>
+        <tr><td><strong>Reward model</strong></td><td>A model that outputs a score for how good an answer is. An <strong>outcome reward model</strong> (ORM) scores only the final answer; a <strong>process reward model</strong> (PRM) scores each step.</td></tr>
+        <tr><td><strong>Test-time compute</strong></td><td>Total work done to answer one question: more tokens, more samples, or more checking all add to it.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="why-tokens">
+    <h2>3. Why Thinking Out Loud Helps</h2>
+    <p>A transformer does a <strong>fixed amount of work per token</strong>: one pass through all its layers. A rough rule is about $2 \times N$ floating-point operations per token for a model with $N$ parameters. For a 7-billion-parameter model:</p>
+    <ul>
+      <li>Answer in 1 token: about $2 \times 7 \times 10^9 = 1.4 \times 10^{10}$ operations. That is all the "thinking" the model can do.</li>
+      <li>Think for 1,000 tokens first: about $1.4 \times 10^{13}$ operations, a thousand times more work on the same question.</li>
+    </ul>
+    <p>The written tokens also act as <strong>memory</strong>. Each new token can look back at everything already written, so the model can store partial results and build on them, the way you write down carries in long multiplication.</p>
+    <h3>Worked example: 47 &times; 38</h3>
+    <p>Asked to answer in one token, a model must produce "1786" from pattern-matching alone. Asked to think first, it can write:</p>
+    <pre><code>47 x 38 = 47 x 40 - 47 x 2
+        = 1880 - 94
+        = 1786
+Check: 1786 / 38 = 47. Correct.</code></pre>
+    <p>Each line is an easy step the model is very likely to get right, and the last line catches mistakes. This is why the classic prompt "Let's think step by step" (zero-shot chain of thought) helped older models on math and logic. Reasoning models are trained so that this behavior is built in, longer, and better. The basic prompting tricks are in <a href="../Prompting-and-Retrieval/ai-engineering-prompt-engineering.html">Prompt Engineering</a>.</p>
+  </section>
+
+  <section id="three-ways">
+    <h2>4. Three Ways to Spend Test-Time Compute</h2>
+    <pre><code>1. SEQUENTIAL: think longer in one chain
+   question -&gt; [step][step][check][oops, back up][step][check] -&gt; answer
+
+2. PARALLEL: many independent tries, then pick one
+                 /-&gt; try 1 -&gt; answer 42 \
+   question ----+--&gt; try 2 -&gt; answer 41 --+-&gt; pick: majority vote, or best verifier score
+                 \-&gt; try 3 -&gt; answer 42 /
+
+3. SEARCH: grow partial solutions step by step, keep only the promising ones
+   question -&gt; step 1 options (a)(b)(c) -&gt; score each -&gt; keep best 2
+            -&gt; step 2 options from each -&gt; score -&gt; keep best 2 -&gt; ... -&gt; answer</code></pre>
+    <ul>
+      <li><strong>Sequential</strong> is what a reasoning model does inside one response. It is good when later steps depend on earlier ones and the model can notice its own errors.</li>
+      <li><strong>Parallel</strong> works with any model. It is easy to run at the same time on many GPUs, so it adds cost but little extra waiting time.</li>
+      <li><strong>Search</strong> needs a way to score partial work (a process reward model). It can be the most compute-efficient, but it is the most complex to build.</li>
+    </ul>
+    <p>Research on scaling test-time compute (Snell et al., 2024) found that the best mix depends on difficulty: for easier questions, letting the model revise its own answer works well; for harder ones, broader search helps more. Choosing the method per question used about 4 times less compute than plain best-of-N for the same accuracy.</p>
+  </section>
+
+  <section id="self-consistency">
+    <h2>5. Self-Consistency: Majority Voting, Measured</h2>
+    <p><strong>Self-consistency</strong> (Wang et al., 2022): sample $N$ chains of thought at a temperature above 0, take the final answer from each, and return the answer that appears most often. No verifier is needed, only a way to compare final answers (easy for a number, hard for an essay).</p>
+    <p>Why should voting help? If the right answer is the <em>single most likely</em> answer, then with more samples its share in the vote gets closer to its true probability, and it wins more and more often. Wrong answers usually differ from each other, so they split the vote.</p>
+    <h3>Simulation</h3>
+    <p>We model a question as a list of possible answers with probabilities, draw $N$ samples, take the plurality (ties broken at random), and repeat 20,000 times:</p>
+    <pre><code>import random
+from collections import Counter
+random.seed(0)
+
+def sample(dist):
+    r, acc = random.random(), 0
+    for ans, p in dist:
+        acc += p
+        if r &lt; acc:
+            return ans
+    return dist[-1][0]
+
+def vote_acc(dist, n, trials=20000):
+    ok = 0
+    for _ in range(trials):
+        c = Counter(sample(dist) for _ in range(n))
+        top = max(c.values())
+        winners = [a for a, v in c.items() if v == top]
+        ok += random.choice(winners) == "right"
+    return ok / trials
+
+A = [("right", 0.4)] + [(f"wrong{i}", 0.1) for i in range(6)]          # errors are scattered
+B = [("right", 0.3), ("trap", 0.45)] + [(f"wrong{i}", 0.05) for i in range(5)]  # one common mistake</code></pre>
+    <table>
+      <thead><tr><th>Samples N</th><th>Case A: right 40%, six wrong answers 10% each</th><th>Case B: right 30%, one "trap" answer 45%</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0.400</td><td>0.297</td></tr>
+        <tr><td>3</td><td>0.476</td><td>0.300</td></tr>
+        <tr><td>5</td><td>0.601</td><td>0.313</td></tr>
+        <tr><td>9</td><td>0.736</td><td>0.287</td></tr>
+        <tr><td>17</td><td>0.890</td><td>0.234</td></tr>
+        <tr><td>33</td><td><strong>0.981</strong></td><td><strong>0.157</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Two lessons:</p>
+    <ul>
+      <li><strong>Case A:</strong> the model is right only 40% of the time, yet with 33 votes it is right 98% of the time. Its errors are scattered, so they never agree with each other.</li>
+      <li><strong>Case B:</strong> the model makes one <em>common</em> mistake more often than it is right. Voting makes things <strong>worse</strong>: from 30% down to 16%. More samples just make the trap win more reliably.</li>
+    </ul>
+    <div class="callout">
+      <strong>Rule:</strong> voting fixes <em>random</em> errors, not <em>systematic</em> ones. If a model has a consistent misconception (a classic trick question, a wrong fact it learned), no number of votes helps. You need a better model, more information (for example retrieval), or a real verifier.
+    </div>
+  </section>
+
+  <section id="best-of-n">
+    <h2>6. Best-of-N and Verifiers</h2>
+    <p><strong>Best-of-N</strong>: sample $N$ answers, score each with a verifier, return the highest-scoring one. How good this is depends almost entirely on the verifier.</p>
+    <h3>Perfect verifier</h3>
+    <p>For code with good unit tests, or math with a known answer, the check is (almost) perfect. Then best-of-N succeeds if <em>any</em> of the $N$ samples is right. If each sample is right with probability $p$, independently:</p>
+    $$P(\text{at least one right}) = 1 - (1-p)^N$$
+    <p>With $p = 0.4$: $N=1$ gives 0.40, $N=2$ gives $1 - 0.6^2 = 0.64$, $N=4$ gives $1 - 0.6^4 = 0.87$, $N=8$ gives $1 - 0.6^8 = 0.983$.</p>
+    <h3>Noisy verifier</h3>
+    <p>A learned reward model makes mistakes. We simulate that: a right answer gets score $1 + \text{noise}$, a wrong one $0 + \text{noise}$, where the noise is Gaussian with spread $\sigma$, and we keep the sample with the top score.</p>
+    <pre><code>def best_of_n(p, n, sigma, trials=20000):
+    ok = 0
+    for _ in range(trials):
+        best = None
+        for _ in range(n):
+            good = random.random() &lt; p
+            score = random.gauss(1 if good else 0, sigma)
+            if best is None or score &gt; best[0]:
+                best = (score, good)
+        ok += best[1]
+    return ok / trials</code></pre>
+    <table>
+      <thead><tr><th>N</th><th>Perfect checker</th><th>Good verifier (&sigma; = 0.3)</th><th>Weak verifier (&sigma; = 1.0)</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0.400</td><td>0.400</td><td>0.396</td></tr>
+        <tr><td>4</td><td>0.870</td><td>0.858</td><td>0.636</td></tr>
+        <tr><td>16</td><td>&asymp;1.000</td><td>0.999</td><td>0.797</td></tr>
+        <tr><td>64</td><td>&asymp;1.000</td><td>1.000</td><td>0.886</td></tr>
+      </tbody>
+    </table>
+    <p>A good verifier gets almost all the benefit. A weak one still helps, but slowly: with 64 samples it is still wrong 11% of the time, because among many wrong answers, one will get a lucky high score.</p>
+    <div class="callout">
+      <strong>Watch out at large N:</strong> a learned reward model has blind spots. The more samples you draw, the more likely one of them exploits a blind spot (for example, a confident tone or a long answer that "looks" correct). This is <strong>reward hacking</strong> at inference time. With weak verifiers, accuracy can even go <em>down</em> after some N. Keep a held-out check with a trustworthy grader.
+    </div>
+  </section>
+
+  <section id="pass-at-k">
+    <h2>7. pass@k: Measuring "Right in k Tries"</h2>
+    <p>Benchmarks for code and math often report <strong>pass@k</strong>: the chance that at least one of $k$ samples is correct. pass@1 is plain accuracy. pass@k with large $k$ tells you what best-of-N with a perfect checker could reach.</p>
+    <p>The naive way (draw exactly $k$ samples, check, repeat) is noisy. The standard <strong>unbiased estimator</strong> (from the Codex paper, Chen et al., 2021) draws $n \ge k$ samples per problem, counts the $c$ correct ones, and computes:</p>
+    $$\text{pass@}k = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}$$
+    <p>In words: the chance that a random group of $k$ out of the $n$ samples contains <em>no</em> correct one is (ways to choose $k$ from the $n-c$ wrong ones) / (ways to choose $k$ from all $n$). One minus that is the chance of at least one correct.</p>
+    <h3>Worked example</h3>
+    <p>You draw $n = 10$ samples for a problem and $c = 3$ pass the tests.</p>
+    <ul>
+      <li>pass@1 = $1 - \binom{7}{1} / \binom{10}{1} = 1 - 7/10 = \mathbf{0.30}$. (Same as 3/10.)</li>
+      <li>pass@3 = $1 - \binom{7}{3} / \binom{10}{3} = 1 - 35/120 = \mathbf{0.708}$.</li>
+      <li>pass@5 = $1 - \binom{7}{5} / \binom{10}{5} = 1 - 21/252 = \mathbf{0.917}$.</li>
+    </ul>
+    <p>Average this over all problems in the benchmark. When comparing two reasoning models, compare pass@1 averaged over several samples per problem; a single sample per problem gives noisy numbers.</p>
+  </section>
+
+  <section id="step-search">
+    <h2>8. Step-Level Search with Process Reward Models</h2>
+    <p>An outcome verifier can only judge a finished answer. A <strong>process reward model (PRM)</strong> scores each step of a partial solution: "is this step correct and useful so far?" OpenAI's "Let's Verify Step by Step" (Lightman et al., 2023) trained one on 800,000 human step labels and found that step-level scores picked correct solutions more reliably than final-answer scores.</p>
+    <p>With a PRM you can do <strong>beam search</strong> over reasoning steps: keep the best few partial solutions at each step and extend only those. Here is a tiny walkthrough with beam width 2 (scores are made up for illustration; a real PRM outputs a number between 0 and 1 per step):</p>
+    <pre><code>Problem: "A shirt costs $40 after a 20% discount. What was the original price?"
+
+Step 1 candidates                        PRM score
+  (a) "Original x, 0.8x = 40"              0.92   keep
+  (b) "40 + 20% of 40 = 48"                0.15   drop  (common trap)
+  (c) "Discount is 20%, so pay 80%"        0.85   keep
+
+Step 2 (extend a and c)
+  (a1) "x = 40 / 0.8 = 50"                 0.95   keep
+  (a2) "x = 40 x 0.8 = 32"                 0.05   drop
+  (c1) "80% of x is 40, so x = 50"         0.93   keep
+  (c2) "80% of 40 is 32"                   0.10   drop
+
+Final: both kept paths say 50. Answer: $50.</code></pre>
+    <p>The trap answer ($48) was cut at step 1, before any compute was spent finishing it. That is the efficiency win of search: bad paths die early. The costs are a PRM to train and serve, and many short model calls instead of one long one.</p>
+  </section>
+
+  <section id="training">
+    <h2>9. How Reasoning Models Are Trained</h2>
+    <p>Prompting a normal model to "think step by step" helps a little. Reasoning models are <em>trained</em> to think well and long. The common recipe, in plain steps:</p>
+    <ol>
+      <li><strong>Start from a strong pretrained model</strong> (see <a href="../Training-Pipeline/ai-engineering-pretraining.html">Pretraining</a>).</li>
+      <li><strong>Optional warm-up with supervised fine-tuning (SFT)</strong> on a small set of long, high-quality reasoning examples, so the model learns the format (think, then answer).</li>
+      <li><strong>Reinforcement learning with verifiable rewards (RLVR):</strong> give the model many problems with checkable answers (math with known results, code with tests). Sample several answers per problem, give reward 1 if correct and 0 if not (plus small rewards for following the format), and update the model to make rewarded answers more likely. No human labels each answer; the checker does.</li>
+      <li><strong>Distill</strong> the result into smaller models by fine-tuning them on the big model's reasoning traces.</li>
+    </ol>
+    <p>DeepSeek-R1 (2025) showed this openly: its "R1-Zero" version, trained with RL on rule-checked rewards and no SFT warm-up, learned by itself to write longer and longer chains of thought, re-check its work, and change approach mid-answer. Its distilled small models (for example 7B and 32B versions) beat much larger normal models on math tests.</p>
+    <h3>The GRPO advantage, worked by hand</h3>
+    <p>A popular RL algorithm here is <strong>GRPO</strong> (Group Relative Policy Optimization). For each problem it samples a group of $G$ answers and scores each one relative to the group:</p>
+    $$\hat{A}_i = \frac{r_i - \text{mean}(r_1, \dots, r_G)}{\text{std}(r_1, \dots, r_G)}$$
+    <p>The <strong>advantage</strong> $\hat{A}_i$ says how much better than average answer $i$ was. Positive means "do more of this", negative means "do less".</p>
+    <ul>
+      <li>Rewards $[1, 0, 0, 1]$: mean 0.5, standard deviation 0.5. Advantages $[+1, -1, -1, +1]$. The two correct answers are pushed up, the two wrong ones down, equally.</li>
+      <li>Rewards $[1, 0, 0, 0]$: mean 0.25, standard deviation 0.433. Advantages $[+1.73, -0.58, -0.58, -0.58]$. A rare success gets a <em>big</em> push: the model learns most from problems it can only sometimes solve.</li>
+      <li>Rewards $[0, 0, 0, 0]$ or $[1, 1, 1, 1]$: every answer equals the mean, so all advantages are 0 (in practice a tiny number is added to the standard deviation to avoid dividing by zero). <strong>No learning signal.</strong> Problems that are always failed or always solved are wasted compute, so training sets are filtered to problems of the right difficulty.</li>
+    </ul>
+    <p>The full derivation of GRPO, PPO, RLOO, PRMs, and RLVR is in <a href="../Training-Pipeline/ai-engineering-reinforcement-learning.html#rl-llms">Reinforcement Learning: RL for LLMs</a>, and the bigger picture of alignment training is in <a href="../Training-Pipeline/ai-engineering-post-training.html">Post-Training</a>.</p>
+  </section>
+
+  <section id="budget">
+    <h2>10. Controlling the Thinking Budget</h2>
+    <p>More thinking costs more money and time, so you need a dial. Common ways to set it:</p>
+    <ul>
+      <li><strong>Effort levels:</strong> many APIs accept a setting like low, medium, or high reasoning effort.</li>
+      <li><strong>Token budgets:</strong> some APIs let you set a maximum number of thinking tokens.</li>
+      <li><strong>Hybrid models</strong> can switch thinking on or off per request (for example a "thinking mode" flag), so one model serves both quick chat and hard problems.</li>
+    </ul>
+    <h3>Budget forcing</h3>
+    <p>The "s1: Simple test-time scaling" paper (Muennighoff et al., 2025) showed a simple trick with open models, where you control the raw text:</p>
+    <ul>
+      <li><strong>To cut thinking short:</strong> once the budget is reached, insert the end-of-thinking marker and force the model to write its answer.</li>
+      <li><strong>To make it think longer:</strong> when the model tries to stop, remove the end marker and append the word "Wait". The model often re-checks its work and fixes mistakes.</li>
+    </ul>
+    <p>They fine-tuned a 32B model on just 1,000 carefully chosen reasoning examples and showed that accuracy on competition math rose as budget forcing let it think longer.</p>
+    <div class="callout">
+      <strong>Overthinking is real:</strong> reasoning models often spend hundreds or thousands of tokens on trivial questions ("what is 2 + 3?"), re-checking an answer that was right the first time. Studies of this "overthinking" show much of that compute adds nothing. Use low effort or no thinking for easy requests.
+    </div>
+  </section>
+
+  <section id="cost">
+    <h2>11. Cost and Latency Math</h2>
+    <p>Use simple, made-up but realistic numbers: output costs <strong>$10 per million tokens</strong>, and the model writes <strong>80 tokens per second</strong> for one request. A direct answer is 300 tokens. With reasoning, the model writes 6,000 thinking tokens and then the same 300-token answer.</p>
+    <table>
+      <thead><tr><th>Setup</th><th>Output tokens</th><th>Cost per request</th><th>Time to finish</th></tr></thead>
+      <tbody>
+        <tr><td>Direct answer</td><td>300</td><td>300 &times; $10 / 1,000,000 = <strong>$0.003</strong></td><td>300 / 80 &asymp; <strong>3.8 s</strong></td></tr>
+        <tr><td>Reasoning</td><td>6,300</td><td><strong>$0.063</strong> (21x)</td><td>6,300 / 80 &asymp; <strong>79 s</strong></td></tr>
+        <tr><td>Reasoning, 8 samples in parallel + vote</td><td>8 &times; 6,300 = 50,400</td><td><strong>$0.504</strong> (168x)</td><td>still about <strong>79 s</strong> (samples run at the same time)</td></tr>
+      </tbody>
+    </table>
+    <p>At 100,000 requests per day, the direct version costs $300 per day; plain reasoning costs $6,300 per day; reasoning with 8-way voting costs $50,400 per day. That is why the right question is not "is reasoning better?" but "which requests are worth it?"</p>
+    <ul>
+      <li><strong>Latency:</strong> users wait for every thinking token before the answer starts (time to first <em>answer</em> token can be tens of seconds). Stream a progress indicator or a reasoning summary so the app does not look frozen.</li>
+      <li><strong>Serving:</strong> long outputs keep a large KV cache in GPU memory for a long time, which lowers how many requests a GPU can serve at once. See <a href="ai-engineering-inference-optimization.html">Inference Optimization</a> for KV cache math.</li>
+    </ul>
+  </section>
+
+  <section id="when">
+    <h2>12. When to Use a Reasoning Model</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Reasoning helps?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Multi-step math, logic puzzles, planning</td><td>Yes, a lot</td><td>Many dependent steps; errors can be caught by re-checking</td></tr>
+        <tr><td>Hard coding tasks, debugging, code with tests</td><td>Yes</td><td>Needs planning; tests make best-of-N very strong</td></tr>
+        <tr><td>Agents that choose tools over many turns</td><td>Often</td><td>Better plans and fewer wasted tool calls, at higher cost per turn (see <a href="../Agents-and-Protocols/ai-engineering-agents.html">Agents</a>)</td></tr>
+        <tr><td>Simple facts, extraction, classification, short rewrites</td><td>Rarely</td><td>One step; extra thinking adds cost and delay, not accuracy</td></tr>
+        <tr><td>Questions needing knowledge the model lacks</td><td>No</td><td>Thinking cannot invent facts; use <a href="../Prompting-and-Retrieval/ai-engineering-rag.html">retrieval (RAG)</a></td></tr>
+        <tr><td>Real-time chat or voice with tight latency</td><td>Usually no</td><td>Tens of seconds of thinking breaks the experience; use a fast model, maybe route hard turns</td></tr>
+      </tbody>
+    </table>
+    <p>A common production pattern is a <strong>router</strong>: a cheap, fast step guesses how hard each request is and sends only the hard ones to a reasoning model (or a high effort setting). The same idea appears in <a href="../Foundations-and-Architecture/ai-engineering-slms.html">SLMs</a> as model routing.</p>
+  </section>
+
+  <section id="engineering">
+    <h2>13. Engineering Tips</h2>
+    <ul>
+      <li><strong>Do not micromanage the thinking.</strong> Reasoning models already think step by step. Long "think like this" instructions often help less than with older models. Give a clear goal, the constraints, and what a good answer looks like.</li>
+      <li><strong>Make answers easy to compare and check.</strong> Ask for the final answer in a fixed format (for example, a JSON field or a last line "ANSWER: ..."). This makes voting, verifiers, and evaluation simple.</li>
+      <li><strong>Use the cheapest check that works.</strong> Unit tests, schema validation, a calculator, or a SQL dry run are cheaper and more trustworthy than a second LLM judge.</li>
+      <li><strong>Evaluate with several samples.</strong> Report pass@1 averaged over multiple samples per question, plus token use and latency percentiles (see <a href="ai-engineering-evaluation.html">Evaluation</a>).</li>
+      <li><strong>Treat the chain of thought as a hint, not a proof.</strong> Studies in 2025 found that models do not always mention in their reasoning the real reason for their answer. Use the reasoning to debug, but judge the final answer.</li>
+      <li><strong>Watch the token bill per feature.</strong> Log thinking tokens separately from answer tokens; a prompt change can double thinking length without changing the answer.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Try each one before reading the answer.</p>
+
+    <h3>Problem 1: perfect checker</h3>
+    <p>A coding model passes the hidden tests 25% of the time per sample. You can run the tests on each sample. How many samples do you need to reach at least 90% success?</p>
+    <p><em>Answer:</em> Need $1 - 0.75^N \ge 0.9$, so $0.75^N \le 0.1$. $N \ge \ln 0.1 / \ln 0.75 = 2.303 / 0.288 \approx 8.0$. Check: $0.75^8 = 0.1001$, just above 0.1 (success 89.99%, a hair short), so you need <strong>N = 9</strong> ($0.75^9 = 0.075$, success 92.5%).</p>
+
+    <h3>Problem 2: pass@k by hand</h3>
+    <p>For one problem you drew $n = 8$ samples and $c = 2$ were correct. Compute pass@1 and pass@4.</p>
+    <p><em>Answer:</em> pass@1 = 2/8 = <strong>0.25</strong>. pass@4 = $1 - \binom{6}{4}/\binom{8}{4} = 1 - 15/70 = 1 - 0.214 = \mathbf{0.786}$.</p>
+
+    <h3>Problem 3: will voting help?</h3>
+    <p>For a question, a model gives answer X 35% of the time, Y 40% of the time, and scattered other answers 25% of the time. X is correct. What happens to accuracy as you add more votes?</p>
+    <p><em>Answer:</em> Y is more common than the correct X, so with many votes Y wins almost always and accuracy goes <strong>toward 0</strong>, below the 35% of a single sample. Voting only helps when the correct answer is the most likely single answer. You need a verifier or a better model.</p>
+
+    <h3>Problem 4: GRPO advantages</h3>
+    <p>A group of 4 samples gets rewards $[1, 1, 1, 0]$. Compute the advantages. Which sample gets the biggest push, and in which direction?</p>
+    <p><em>Answer:</em> Mean = 0.75. Population standard deviation = $\sqrt{(3 \times 0.0625 + 0.5625)/4} = \sqrt{0.1875} = 0.433$. Advantages: correct ones $(1 - 0.75)/0.433 = +0.58$ each; the wrong one $(0 - 0.75)/0.433 = \mathbf{-1.73}$. The single failure gets the biggest push, <em>down</em>: on a mostly-solved problem, the model learns most from the rare mistake.</p>
+
+    <h3>Problem 5: budget the feature</h3>
+    <p>A support assistant gets 50,000 questions a day. 10% are hard. Reasoning uses 4,000 thinking tokens plus a 250-token answer; a direct answer is 250 tokens. Output costs $10 per million tokens. Compare (a) reasoning for everything, (b) a router that sends only the hard 10% to reasoning, assuming the router is free.</p>
+    <p><em>Answer:</em> (a) 50,000 &times; 4,250 = 212.5 M tokens = <strong>$2,125 per day</strong>. (b) Hard: 5,000 &times; 4,250 = 21.25 M; easy: 45,000 &times; 250 = 11.25 M; total 32.5 M tokens = <strong>$325 per day</strong>, about 6.5 times cheaper, and easy questions get answered faster too.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Using a reasoning model for everything.</strong> Easy requests get slower and more expensive with no gain. Route or lower the effort.</li>
+      <li><strong>Voting on answers that are not comparable.</strong> "42", "42.0" and "The answer is 42" must be normalized first; essays cannot be majority-voted at all.</li>
+      <li><strong>Trusting a weak verifier at large N.</strong> More samples give more chances to fool it. Measure accuracy vs N on a held-out set.</li>
+      <li><strong>Expecting thinking to add knowledge.</strong> If the fact is not in the model or the prompt, longer thinking only produces longer guesses.</li>
+      <li><strong>Comparing models on one sample per question.</strong> Reasoning outputs vary a lot between samples; average several.</li>
+      <li><strong>Ignoring hidden token costs.</strong> Thinking tokens are billed even when not shown. Track them.</li>
+      <li><strong>Reading the chain of thought as the true explanation.</strong> It is useful for debugging, but it may leave out what actually drove the answer.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Item</th><th>Formula or fact</th></tr></thead>
+      <tbody>
+        <tr><td>Compute per token</td><td>about $2N$ operations for an $N$-parameter model</td></tr>
+        <tr><td>Three ways to spend it</td><td>Sequential (think longer), parallel (sample and pick), search (step-level with a PRM)</td></tr>
+        <tr><td>Self-consistency</td><td>Majority vote over $N$ samples; fixes random errors, not systematic ones</td></tr>
+        <tr><td>Best-of-N, perfect checker</td><td>$1 - (1-p)^N$</td></tr>
+        <tr><td>pass@k (unbiased)</td><td>$1 - \binom{n-c}{k} / \binom{n}{k}$</td></tr>
+        <tr><td>ORM vs PRM</td><td>Scores the final answer vs scores each step</td></tr>
+        <tr><td>GRPO advantage</td><td>$(r_i - \text{mean}) / \text{std}$ within a group; all-same rewards give no signal</td></tr>
+        <tr><td>Training recipe</td><td>Pretrained model &rarr; optional SFT warm-up &rarr; RL with verifiable rewards &rarr; distill</td></tr>
+        <tr><td>Budget forcing</td><td>Force the end marker to stop early; append "Wait" to think longer</td></tr>
+        <tr><td>Cost</td><td>(thinking + answer tokens) &times; price &times; samples</td></tr>
+        <tr><td>Latency</td><td>(thinking + answer tokens) / tokens per second; parallel samples add cost, not much time</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/abs/2201.11903" rel="noopener noreferrer">Chain-of-Thought Prompting (Wei et al., 2022)</a> &middot; <a href="https://arxiv.org/abs/2203.11171" rel="noopener noreferrer">Self-Consistency (Wang et al., 2022)</a> &middot; <a href="https://arxiv.org/abs/2107.03374" rel="noopener noreferrer">Codex and pass@k (Chen et al., 2021)</a> &middot; <a href="https://arxiv.org/abs/2305.20050" rel="noopener noreferrer">Let's Verify Step by Step (Lightman et al., 2023)</a> &middot; <a href="https://arxiv.org/abs/2408.03314" rel="noopener noreferrer">Scaling LLM Test-Time Compute Optimally (Snell et al., 2024)</a> &middot; <a href="https://arxiv.org/abs/2501.12948" rel="noopener noreferrer">DeepSeek-R1 (2025)</a> &middot; <a href="https://arxiv.org/abs/2501.19393" rel="noopener noreferrer">s1: Simple test-time scaling (2025)</a> &middot; <a href="https://arxiv.org/abs/2412.21187" rel="noopener noreferrer">On the Overthinking of o1-like LLMs (2024)</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Training-Pipeline/ai-engineering-reinforcement-learning.html#rl-llms">RL for LLMs (GRPO, PRMs, RLVR)</a> &middot; <a href="../Training-Pipeline/ai-engineering-post-training.html">Post-Training</a> &middot; <a href="ai-engineering-inference-optimization.html">Inference Optimization</a> &middot; <a href="ai-engineering-evaluation.html">Evaluation</a> &middot; <a href="../Prompting-and-Retrieval/ai-engineering-prompt-engineering.html">Prompt Engineering</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

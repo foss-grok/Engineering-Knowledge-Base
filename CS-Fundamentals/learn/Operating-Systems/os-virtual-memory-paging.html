@@ -238,6 +238,7 @@ full avg10=18.40 avg60=11.73 avg300=4.02 total=31277120</code></pre>
     <div class="callout">
       <strong>Kubernetes connection:</strong> a container killed this way shows <code>Reason: OOMKilled</code> and exit code <strong>137</strong> (128 + signal 9). Note that the page cache counts toward the cgroup too, but the kernel reclaims clean cache before killing. See <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html">Kubernetes Workloads</a> for memory requests and limits.
     </div>
+    <p>Watch a real cgroup OOM kill happen, step by step, in <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html#cgroup-lab">How Containers Really Work</a>, and follow a full production investigation in <a href="../Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a>.</p>
     <h3>RSS vs VSZ</h3>
     <p><code>ps</code> shows <strong>VSZ</strong> (virtual size: everything mapped, including never-touched reservations) and <strong>RSS</strong> (resident set size: pages actually in RAM now, counting shared libraries fully in every process). Neither is perfect. <code>PSS</code> in <code>/proc/&lt;pid&gt;/smaps_rollup</code> splits shared pages fairly among sharers.</p>
   </section>
@@ -294,8 +295,8 @@ full avg10=18.40 avg60=11.73 avg300=4.02 total=31277120</code></pre>
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="os-processes-threads-scheduling.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Processes, Threads &amp; CPU Scheduling</span></a>
-    <a class="prev-next-next" href="os-file-systems-io.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">File Systems &amp; Disk I/O</span></a>
-    <p class="prev-next-step">Page 2 of 15 in the suggested reading order</p>
+    <a class="prev-next-next" href="os-cpu-caches-memory-hierarchy.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">CPU Caches &amp; the Memory Hierarchy</span></a>
+    <p class="prev-next-step">Page 2 of 17 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 
