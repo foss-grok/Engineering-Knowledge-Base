@@ -216,7 +216,7 @@ $ ss -ti dst example.com                            # per connection: cwnd, rtt,
     </ol>
     <p><strong>RST</strong> is the abrupt alternative: "this connection does not exist / abort now". You get one when connecting to a port nobody listens on, or when a program exits with unread data.</p>
     <div class="callout">
-      <strong>Practical note:</strong> a busy client opening thousands of short connections to the same server can run out of ephemeral ports because of TIME_WAIT. Fixes: reuse connections (pooling, keep-alive), and on Linux <code>net.ipv4.tcp_tw_reuse</code> for outgoing connections. Never use the long-removed <code>tcp_tw_recycle</code> advice you may find online.
+      <strong>Practical note:</strong> a busy client opening thousands of short connections to the same server can run out of ephemeral ports because of TIME_WAIT. Fixes: reuse connections (pooling, keep-alive), and on Linux <code>net.ipv4.tcp_tw_reuse</code> for outgoing connections. Never use the long-removed <code>tcp_tw_recycle</code> advice you may find online. Proxies hit this most often; see <a href="cn-load-balancing-reverse-proxies.html#nginx">keep-alive to backends</a>.
     </div>
   </section>
 

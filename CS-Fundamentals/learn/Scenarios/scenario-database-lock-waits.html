@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scenario: Requests Stuck on Database Locks | CS Fundamentals</title>
+  <meta name="description" content="A real-world walkthrough of database lock trouble in PostgreSQL: requests that hang, a one-second migration that freezes every read, and deadlock errors. How lock queues work, finding the blocker with pg_stat_activity and pg_blocking_pids, reading lock-wait and deadlock logs, a runnable lab with measured results (10 s waits cut to 3 s by idle_in_transaction_session_timeout, reads blocked 7.5 s behind ALTER TABLE vs 1.5 s with lock_timeout, 105 of 200 transfers deadlocked vs 0 with ordered locking), safe migrations, retries, MySQL equivalents, alerts, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Scenario: Requests Stuck on Database Locks</p>
+  </nav>
+  <h1>Scenario: Requests Stuck on Database Locks</h1>
+  <p>The database is not slow. CPU is at 15%, disks are quiet, and every query is fast when you run it by hand. Yet requests hang for 10, 20, 30 seconds and then time out. This page follows three real kinds of lock trouble the way an on-call engineer meets them, shows the exact queries that find the cause in under a minute, and <strong>reproduces all three in a lab you can run</strong> against PostgreSQL 17, with measured results for each fix. It uses ideas from <a href="../Databases/dbms-transactions-isolation-mvcc.html">Transactions, Isolation &amp; MVCC</a> and <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html">Concurrency &amp; Deadlocks</a>. The company is made up; the code, the logs and the numbers are real.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#situation">The Situation</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#queues">How Lock Queues Work</a></li>
+    <li><a href="#toolkit">The Toolkit: Find the Blocker</a></li>
+    <li><a href="#lab">The Lab</a></li>
+    <li><a href="#idle">Incident 1: The Transaction That Never Ended</a></li>
+    <li><a href="#migration">Incident 2: The One-Second Migration That Froze Reads</a></li>
+    <li><a href="#deadlocks">Incident 3: "deadlock detected"</a></li>
+    <li><a href="#retries">Retrying Safely</a></li>
+    <li><a href="#mysql">The Same Problems in MySQL</a></li>
+    <li><a href="#prevent">Prevention: Settings, Alerts, Reviews</a></li>
+    <li><a href="#postmortem">Blameless Postmortem</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="situation">
+    <h2>1. The Situation</h2>
+    <p>A shop's checkout API runs on 8 pods and talks to one PostgreSQL database. Over one week, on-call sees three strange problems:</p>
+    <ol>
+      <li><strong>Monday 19:20 IST.</strong> Orders for one popular product hang for many seconds, then time out. Other products are fine.</li>
+      <li><strong>Wednesday 11:05 IST.</strong> A developer runs a migration that adds one column to the <code>accounts</code> table. It "should take a millisecond". For the next 8 seconds, <em>every</em> request that reads <code>accounts</code> hangs, including the login page. The error rate hits 40%.</li>
+      <li><strong>All week.</strong> The logs show a steady trickle of <code>ERROR: deadlock detected</code> from the wallet-transfer job, and some transfers fail.</li>
+    </ol>
+    <p>Dashboards show the database server is calm: low CPU, low disk use, plenty of memory. That is the first clue. When requests are slow but the database is <em>idle</em>, they are usually <strong>waiting</strong>, not working. The most common thing to wait for is a <strong>lock</strong>.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Transaction</strong></td><td>A group of statements that succeed or fail together, between <code>BEGIN</code> and <code>COMMIT</code> (or <code>ROLLBACK</code>).</td></tr>
+        <tr><td><strong>Lock</strong></td><td>A mark that says "I am using this; others must wait or share". Databases lock rows and tables.</td></tr>
+        <tr><td><strong>Row lock</strong></td><td>Taken by <code>UPDATE</code>, <code>DELETE</code> and <code>SELECT ... FOR UPDATE</code> on the rows they touch. Held <strong>until the transaction ends</strong>, not until the statement ends.</td></tr>
+        <tr><td><strong>Table lock</strong></td><td>A lock on a whole table. Every query takes a weak one (a plain <code>SELECT</code> takes <code>ACCESS SHARE</code>). Schema changes like <code>ALTER TABLE</code> take the strongest one (<code>ACCESS EXCLUSIVE</code>), which conflicts with everything.</td></tr>
+        <tr><td><strong>Blocker</strong></td><td>The session holding the lock others want.</td></tr>
+        <tr><td><strong>Waiter</strong></td><td>A session that is stuck until the blocker lets go.</td></tr>
+        <tr><td><strong>Idle in transaction</strong></td><td>A session that started a transaction, ran some statements, and is now doing nothing, while still holding all its locks. Usually the app is busy elsewhere (an HTTP call) or forgot to commit.</td></tr>
+        <tr><td><strong>Deadlock</strong></td><td>Two or more transactions each wait for a lock the other holds. None can ever move. The database must kill one.</td></tr>
+        <tr><td><strong>Timeout</strong></td><td>A limit on how long to wait. PostgreSQL has several: <code>lock_timeout</code>, <code>statement_timeout</code>, <code>idle_in_transaction_session_timeout</code>.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A row lock is like taking a library book home. Nobody else can borrow it until you return it, even if you are not reading it right now. "Idle in transaction" is borrowing the book and then going on holiday.</p>
+    </div>
+  </section>
+
+  <section id="queues">
+    <h2>3. How Lock Queues Work</h2>
+    <p>Two facts explain almost every lock incident.</p>
+    <h3>Fact 1: locks last until the transaction ends</h3>
+    <pre><code>BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;   -- row 1 locked from here...
+-- app calls a payment API: 9 seconds
+COMMIT;                                                     -- ...to here</code></pre>
+    <p>The <code>UPDATE</code> took 0.1 ms. The lock lasted 9 seconds. Anyone else who wants to change row 1 waits those 9 seconds.</p>
+    <h3>Fact 2: waiters form a line, and the line is fair</h3>
+    <p>PostgreSQL serves lock requests roughly in arrival order. A new request will not jump ahead of an earlier waiter it conflicts with, even if the current holder would allow it. This stops strong locks from starving forever, but it has a nasty side effect:</p>
+    <pre><code>time ──────────────────────────────────────────────────────►
+long report:   holds ACCESS SHARE on accounts (a slow SELECT inside a transaction)
+ALTER TABLE:        wants ACCESS EXCLUSIVE ── waits for the report
+SELECT #1:               wants ACCESS SHARE ── would fit with the report,
+                                               but must wait BEHIND the ALTER
+SELECT #2:                   wants ACCESS SHARE ── also waits
+login page:                       ...everything that touches accounts waits</code></pre>
+    <p>The <code>ALTER TABLE</code> itself takes a millisecond once it gets the lock. The damage comes from <em>waiting</em> for the lock while holding a place in line. Plain reads, which never block each other, now queue behind it.</p>
+    <h3>Which table locks conflict?</h3>
+    <table>
+      <thead><tr><th>Statement</th><th>Table lock</th><th>Blocks plain SELECT?</th><th>Blocks INSERT/UPDATE/DELETE?</th></tr></thead>
+      <tbody>
+        <tr><td><code>SELECT</code></td><td>ACCESS SHARE</td><td>No</td><td>No</td></tr>
+        <tr><td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></td><td>ROW EXCLUSIVE</td><td>No</td><td>No (rows may still conflict)</td></tr>
+        <tr><td><code>CREATE INDEX CONCURRENTLY</code></td><td>SHARE UPDATE EXCLUSIVE</td><td>No</td><td>No</td></tr>
+        <tr><td><code>CREATE INDEX</code> (plain)</td><td>SHARE</td><td>No</td><td><strong>Yes</strong>, for the whole build</td></tr>
+        <tr><td>Most <code>ALTER TABLE</code>, <code>DROP</code>, <code>TRUNCATE</code>, <code>VACUUM FULL</code></td><td>ACCESS EXCLUSIVE</td><td><strong>Yes</strong></td><td><strong>Yes</strong></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="toolkit">
+    <h2>4. The Toolkit: Find the Blocker</h2>
+    <p>When requests hang, run this first. It lists every session, what it is doing, and <strong>who is blocking it</strong>:</p>
+    <pre><code>SELECT pid,
+       state,
+       wait_event_type,
+       pg_blocking_pids(pid)          AS blocked_by,
+       now() - xact_start             AS xact_age,
+       now() - state_change           AS in_state_for,
+       left(query, 60)                AS query
+FROM pg_stat_activity
+WHERE datname = current_database()
+ORDER BY xact_start;</code></pre>
+    <p>How to read it:</p>
+    <ul>
+      <li><code>wait_event_type = 'Lock'</code>: this session is waiting for a lock.</li>
+      <li><code>blocked_by</code>: the process IDs it waits for. Follow the arrows until you reach a session whose <code>blocked_by</code> is empty. That is the <strong>root blocker</strong>.</li>
+      <li><code>state = 'idle in transaction'</code> with a large <code>in_state_for</code>: the classic root blocker. The <code>query</code> column shows its <em>last</em> statement, not what it is doing now (it is doing nothing).</li>
+    </ul>
+    <h3>Ask the database to log waits</h3>
+    <pre><code>log_lock_waits = on          # log any lock wait longer than deadlock_timeout
+deadlock_timeout = 1s        # the default; also how often deadlock checks run</code></pre>
+    <p>Then the log shows lines like this (from our lab):</p>
+    <pre><code>LOG:  process 512796 still waiting for ShareLock on transaction 740 after 1000.099 ms
+DETAIL:  Process holding the lock: 512793. Wait queue: 512796.
+CONTEXT:  while updating tuple (0,1) in relation "accounts"
+STATEMENT:  UPDATE accounts SET balance = balance + 5 WHERE id = 1</code></pre>
+    <p>"ShareLock on transaction 740" sounds strange. It is how PostgreSQL waits for a row: the row says "transaction 740 changed me", so the waiter waits for transaction 740 to finish. "Tuple (0,1)" means page 0, item 1: the physical spot of the row.</p>
+    <h3>Stop the blocker (carefully)</h3>
+    <pre><code>SELECT pg_cancel_backend(12345);      -- cancel its current query (gentle)
+SELECT pg_terminate_backend(12345);   -- end the whole session; its transaction rolls back</code></pre>
+    <p>For an idle-in-transaction blocker, only <code>pg_terminate_backend</code> helps, because there is no running query to cancel. Its uncommitted work is lost, which is correct: it was never committed.</p>
+  </section>
+
+  <section id="lab">
+    <h2>5. The Lab</h2>
+    <p>This Python program reproduces all three incidents and times them. You need Python 3.10+, <code>pip install "psycopg[binary]"</code>, and a PostgreSQL server. The quickest way to get one:</p>
+    <pre><code>docker run --rm -d --name pglab -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust \
+  postgres:17 -c log_lock_waits=on -c deadlock_timeout=1s
+python3 locklab.py                     # takes about 75 seconds
+docker logs pglab 2&gt;&amp;1 | grep -A3 -E "still waiting|deadlock detected"</code></pre>
+    <pre><code># locklab.py - reproduce three kinds of lock trouble in PostgreSQL and time them.
+# Needs: pip install "psycopg[binary]", and a PostgreSQL server.
+import os, random, threading, time
+import psycopg
+
+DSN = os.environ.get("DSN", "host=localhost port=5432 user=postgres dbname=postgres")
+
+def conn():
+    return psycopg.connect(DSN, autocommit=True)
+
+def setup():
+    with conn() as c:
+        c.execute("DROP TABLE IF EXISTS accounts")
+        c.execute("CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL)")
+        c.execute("INSERT INTO accounts SELECT g, 1000 FROM generate_series(1, 100) g")
+
+def timed(label, sql, results, setting=None):
+    """Run one statement in its own connection; record how long it took."""
+    with conn() as c:
+        if setting:
+            c.execute(setting)
+        t0 = time.time()
+        try:
+            c.execute(sql)
+            results.append((label, round(time.time() - t0, 2), "ok"))
+        except psycopg.Error as e:
+            results.append((label, round(time.time() - t0, 2), type(e).__name__))
+
+def show_waits():
+    with conn() as c:
+        rows = c.execute("""
+            SELECT pid, state, coalesce(wait_event_type, '-'), pg_blocking_pids(pid),
+                   left(query, 45)
+            FROM pg_stat_activity
+            WHERE datname = current_database() AND pid &lt;&gt; pg_backend_pid()
+              AND query NOT LIKE '%pg_stat_activity%'
+            ORDER BY backend_start""").fetchall()
+    for r in rows:
+        print("   ", r)
+
+def part1_idle_in_transaction(timeout=None):
+    print(f"\n== Part 1: a transaction left open (idle_in_transaction_session_timeout={timeout}) ==")
+    setup()
+    holder = conn()
+    if timeout:
+        holder.execute(f"SET idle_in_transaction_session_timeout = '{timeout}'")
+    holder.execute("BEGIN")
+    holder.execute("UPDATE accounts SET balance = balance - 10 WHERE id = 1")
+    # the app now "forgets" to commit: it waits on a slow HTTP call for 10 s
+    results = []
+    ts = [threading.Thread(target=timed, args=(f"update #{i}",
+          "UPDATE accounts SET balance = balance + 5 WHERE id = 1", results)) for i in range(3)]
+    for t in ts: t.start()
+    time.sleep(1.5); show_waits()
+    time.sleep(8.5)
+    try:
+        holder.execute("COMMIT"); print("    holder committed at t=10s")
+    except psycopg.Error as e:
+        print("    holder's COMMIT failed:", type(e).__name__)
+    for t in ts: t.join()
+    for r in results: print("   ", r)
+    holder.close()
+
+def part2_migration_queue(lock_timeout=None):
+    print(f"\n== Part 2: ALTER TABLE behind a long read (lock_timeout={lock_timeout}) ==")
+    setup()
+    reader = conn()
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM accounts")        # holds ACCESS SHARE until commit
+    results = []
+    setting = f"SET lock_timeout = '{lock_timeout}'" if lock_timeout else None
+    mig = threading.Thread(target=timed, args=("ALTER TABLE",
+          "ALTER TABLE accounts ADD COLUMN note text", results, setting))
+    mig.start(); time.sleep(0.5)
+    reads = [threading.Thread(target=timed, args=(f"SELECT #{i}",
+             "SELECT balance FROM accounts WHERE id = 7", results)) for i in range(3)]
+    for t in reads: t.start()
+    time.sleep(1); show_waits()
+    time.sleep(6.5)
+    reader.execute("COMMIT"); print("    long read committed at t=8s")
+    for t in [mig] + reads: t.join()
+    for r in results: print("   ", r)
+    reader.close()
+
+def transfer(a, b, ordered, stats):
+    first, second = (min(a, b), max(a, b)) if ordered else (a, b)
+    with conn() as c:
+        try:
+            with c.transaction():
+                c.execute("UPDATE accounts SET balance = balance - 1 WHERE id = %s", (first,))
+                time.sleep(0.05)                      # some app work between the two writes
+                c.execute("UPDATE accounts SET balance = balance + 1 WHERE id = %s", (second,))
+            stats["ok"] += 1
+        except psycopg.errors.DeadlockDetected:
+            stats["deadlock"] += 1
+
+def part3_deadlocks(ordered):
+    print(f"\n== Part 3: 200 transfers among 5 hot accounts, 20 at a time (ordered={ordered}) ==")
+    setup()
+    random.seed(42)
+    pairs = [random.sample(range(1, 6), 2) for _ in range(200)]
+    stats = {"ok": 0, "deadlock": 0}
+    t0 = time.time()
+    for i in range(0, 200, 20):
+        ts = [threading.Thread(target=transfer, args=(a, b, ordered, stats)) for a, b in pairs[i:i+20]]
+        for t in ts: t.start()
+        for t in ts: t.join()
+    print(f"    committed={stats['ok']} deadlocks={stats['deadlock']} time={time.time()-t0:.1f}s")
+
+if __name__ == "__main__":
+    part1_idle_in_transaction()
+    part1_idle_in_transaction(timeout="3s")
+    part2_migration_queue()
+    part2_migration_queue(lock_timeout="2s")
+    part3_deadlocks(ordered=False)
+    part3_deadlocks(ordered=True)</code></pre>
+    <p>We ran it on PostgreSQL 17.12 on Linux. The results are in the next three sections. Your process IDs and exact times will differ a little.</p>
+  </section>
+
+  <section id="idle">
+    <h2>6. Incident 1: The Transaction That Never Ended</h2>
+    <p>Back to Monday. The order code looked like this:</p>
+    <pre><code>with db.transaction():
+    db.execute("UPDATE products SET stock = stock - 1 WHERE id = %s", (pid,))
+    payment = payment_api.charge(card, amount)     # HTTP call: usually 300 ms, sometimes 10 s
+    db.execute("INSERT INTO orders ...")</code></pre>
+    <p>The popular product's row stays locked during the whole payment call. When the payment provider got slow, every other order for that product queued behind it.</p>
+    <h3>What the lab showed</h3>
+    <p>Part 1 opens a transaction, updates row 1, then waits 10 s before committing (like the slow payment). Three other sessions try to update row 1. One and a half seconds in, the toolkit query shows:</p>
+    <pre><code>(512793, 'idle in transaction', 'Client', [],               'UPDATE accounts SET balance = balance - 10 WH')
+(512796, 'active',              'Lock',   [512793],         'UPDATE accounts SET balance = balance + 5 WHE')
+(512798, 'active',              'Lock',   [512796],         'UPDATE accounts SET balance = balance + 5 WHE')
+(512799, 'active',              'Lock',   [512796, 512798], 'UPDATE accounts SET balance = balance + 5 WHE')
+holder committed at t=10s
+('update #0', 10.01, 'ok')
+('update #2', 10.01, 'ok')
+('update #1', 10.01, 'ok')</code></pre>
+    <p>Read it like a detective:</p>
+    <ul>
+      <li><strong>512793</strong> is idle in transaction and blocked by nobody: the root blocker.</li>
+      <li><strong>512796</strong> waits directly for 512793.</li>
+      <li><strong>512798</strong> and <strong>512799</strong> say they wait for 512796, not 512793. They are in <em>line behind</em> 512796 for the same row. Following the chain always leads back to 512793.</li>
+      <li>All three updates took <strong>10.01 s</strong>, even though each needs under a millisecond of work.</li>
+    </ul>
+    <h3>Fix 1: never wait on the outside world inside a transaction</h3>
+    <pre><code>payment = payment_api.charge(card, amount, idempotency_key=order_id)  # outside any transaction
+with db.transaction():                                                # short: a few ms
+    db.execute("UPDATE products SET stock = stock - 1 WHERE id = %s AND stock &gt; 0", (pid,))
+    db.execute("INSERT INTO orders ...")</code></pre>
+    <p>If the stock update fails after the charge, refund using the same idempotency key. (For a stronger design, look up the "outbox" and "saga" patterns.) The point is that a transaction should contain <strong>only database work</strong>.</p>
+    <h3>Fix 2: a safety net timeout</h3>
+    <p>Part 1 ran again with <code>idle_in_transaction_session_timeout = '3s'</code> on the holder:</p>
+    <pre><code>holder's COMMIT failed: IdleInTransactionSessionTimeout
+('update #0', 3.0, 'ok')
+('update #2', 3.0, 'ok')
+('update #1', 3.0, 'ok')</code></pre>
+    <p>After 3 s idle, PostgreSQL ended the holder's session and rolled back its update. The waiters went through after <strong>3.0 s instead of 10 s</strong>. The holder's work was lost, so the app must treat this like any failed transaction (retry or report). Set this timeout for app users, for example 10 to 60 s, as a net under bugs, not as a substitute for Fix 1.</p>
+  </section>
+
+  <section id="migration">
+    <h2>7. Incident 2: The One-Second Migration That Froze Reads</h2>
+    <p>Wednesday's migration was <code>ALTER TABLE accounts ADD COLUMN note text</code>. Adding a nullable column is instant in PostgreSQL: it only changes the table's description. But it needs an <code>ACCESS EXCLUSIVE</code> lock for that instant. At the same time, an analyst's reporting tool held a transaction open with a <code>SELECT</code> on <code>accounts</code>.</p>
+    <h3>What the lab showed</h3>
+    <p>Part 2 holds a read transaction open for 8 s, starts the <code>ALTER TABLE</code>, then 0.5 s later sends three simple <code>SELECT</code>s:</p>
+    <pre><code>(512938, 'idle in transaction', 'Client', [],       'SELECT count(*) FROM accounts')
+(512940, 'active',              'Lock',   [512938], 'ALTER TABLE accounts ADD COLUMN note text')
+(512956, 'active',              'Lock',   [512940], 'SELECT balance FROM accounts WHERE id = 7')
+(512958, 'active',              'Lock',   [512940], 'SELECT balance FROM accounts WHERE id = 7')
+(512959, 'active',              'Lock',   [512940], 'SELECT balance FROM accounts WHERE id = 7')
+long read committed at t=8s
+('ALTER TABLE', 8.01, 'ok')
+('SELECT #0', 7.51, 'ok')
+...</code></pre>
+    <p>The <code>SELECT</code>s are blocked by the <strong>ALTER</strong> (512940), not by the long read. A read that would normally take 0.1 ms took <strong>7.51 s</strong>. In production, with hundreds of requests per second, that is hundreds of stuck requests, a full connection pool, and timeouts everywhere.</p>
+    <h3>Fix: make the migration give up quickly, then retry</h3>
+    <p>Part 2 again, with <code>SET lock_timeout = '2s'</code> before the <code>ALTER</code>:</p>
+    <pre><code>('ALTER TABLE', 2.0, 'LockNotAvailable')
+('SELECT #1', 1.5, 'ok')
+('SELECT #2', 1.5, 'ok')
+('SELECT #0', 1.5, 'ok')</code></pre>
+    <p>The <code>ALTER</code> gave up after 2 s with <code>ERROR: canceling statement due to lock timeout</code>. The moment it left the line, the reads went through: <strong>1.5 s instead of 7.5 s</strong>. In real migrations use a much shorter timeout and retry in a loop:</p>
+    <pre><code>SET lock_timeout = '500ms';
+-- run the ALTER; on "lock timeout", wait a few seconds and try again (up to N times)
+ALTER TABLE accounts ADD COLUMN note text;</code></pre>
+    <p>Each failed try blocks traffic for at most 0.5 s. Most migration tools can do this for you.</p>
+    <h3>Safe-migration habits</h3>
+    <ul>
+      <li>Check for long transactions before you start: <code>SELECT pid, now() - xact_start FROM pg_stat_activity WHERE xact_start &lt; now() - interval '1 minute';</code></li>
+      <li>Build indexes with <code>CREATE INDEX CONCURRENTLY</code> (does not block writes; cannot run inside a transaction block).</li>
+      <li>Add foreign keys and check constraints as <code>NOT VALID</code> first, then <code>VALIDATE CONSTRAINT</code> later (validation takes a weaker lock).</li>
+      <li>Changing a column's type usually rewrites the whole table under <code>ACCESS EXCLUSIVE</code>. Instead: add a new column, backfill in small batches, switch the code, drop the old column.</li>
+      <li>Since PostgreSQL 11, <code>ADD COLUMN ... DEFAULT 'x'</code> with a constant default is instant too; on older versions it rewrote the table.</li>
+      <li>Set <code>statement_timeout</code> or <code>idle_in_transaction_session_timeout</code> for reporting users, so a forgotten notebook cannot hold locks for hours.</li>
+    </ul>
+  </section>
+
+  <section id="deadlocks">
+    <h2>8. Incident 3: "deadlock detected"</h2>
+    <p>The wallet job moves money between accounts:</p>
+    <pre><code>with db.transaction():
+    db.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amt, src))
+    db.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amt, dst))</code></pre>
+    <p>If transfer T1 moves money 1 &rarr; 2 while T2 moves money 2 &rarr; 1 at the same time:</p>
+    <table>
+      <thead><tr><th>Time</th><th>T1 (1 &rarr; 2)</th><th>T2 (2 &rarr; 1)</th></tr></thead>
+      <tbody>
+        <tr><td>0 ms</td><td>locks row 1</td><td>locks row 2</td></tr>
+        <tr><td>500 ms</td><td>wants row 2: waits for T2</td><td>wants row 1: waits for T1</td></tr>
+        <tr><td>1,500 ms</td><td colspan="2">deadlock check runs (1 s after the wait began): cycle T1 &rarr; T2 &rarr; T1 found, T2 is cancelled</td></tr>
+      </tbody>
+    </table>
+    <p>We ran exactly these two transactions:</p>
+    <pre><code>T2 failed after 1.5 s: deadlock detected
+T1 committed after 1.5 s</code></pre>
+    <p>And the server log said:</p>
+    <pre><code>ERROR:  deadlock detected
+DETAIL:  Process 514415 waits for ShareLock on transaction 1181; blocked by process 514414.
+         Process 514414 waits for ShareLock on transaction 1182; blocked by process 514415.
+         Process 514415: UPDATE accounts SET balance = balance + 100 WHERE id = $1
+         Process 514414: UPDATE accounts SET balance = balance + 100 WHERE id = $1</code></pre>
+    <p>The DETAIL lines draw the cycle for you: 514415 waits for 514414, which waits for 514415. With more transactions the cycle gets longer. Our busy run logged a 4-process cycle, each waiting for the next.</p>
+    <h3>How bad does it get? The lab</h3>
+    <p>Part 3 runs 200 random transfers between 5 busy ("hot") accounts, 20 at a time, with 50 ms of app work between the two updates:</p>
+    <pre><code>== 200 transfers among 5 hot accounts, 20 at a time (ordered=False) ==
+    committed=95 deadlocks=105 time=32.2s
+== 200 transfers among 5 hot accounts, 20 at a time (ordered=True) ==
+    committed=200 deadlocks=0 time=6.4s</code></pre>
+    <p>Without a fixed order, more than half of the transfers died, and the run took 5 times longer because each deadlock costs a 1 s wait before detection.</p>
+    <h3>Fix: always lock in the same order</h3>
+    <p>A deadlock needs a cycle. If every transaction locks rows in the same global order (for example, lower <code>id</code> first), a cycle is impossible: nobody holding a higher id ever waits for a lower one. This is the "break circular wait" rule from <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html#handling">OS deadlock handling</a>.</p>
+    <pre><code>first, second = sorted([src, dst])
+with db.transaction():
+    # lock both rows up front, in id order
+    db.execute("SELECT id FROM accounts WHERE id IN (%s, %s) ORDER BY id FOR UPDATE", (first, second))
+    db.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amt, src))
+    db.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amt, dst))</code></pre>
+    <p>Other ways to reduce deadlocks:</p>
+    <ul>
+      <li><strong>Keep transactions short.</strong> Our lab's 50 ms gap made the window large. Less time holding locks means fewer collisions.</li>
+      <li><strong>Batch updates in sorted order.</strong> An <code>UPDATE ... WHERE id IN (...)</code> touching many rows can deadlock with another batch. Lock them first with <code>SELECT ... ORDER BY id FOR UPDATE</code>.</li>
+      <li><strong>Index foreign keys.</strong> Without an index, deleting a parent row scans the child table and can take more locks than you expect.</li>
+      <li><strong>Job queues:</strong> use <code>FOR UPDATE SKIP LOCKED</code> so workers take different rows instead of waiting on each other.</li>
+    </ul>
+  </section>
+
+  <section id="retries">
+    <h2>9. Retrying Safely</h2>
+    <p>Even with good habits, some deadlocks and serialization failures will happen. The database rolled back the whole transaction, so it is safe to run the <strong>whole transaction</strong> again (never just the last statement):</p>
+    <pre><code>import random, time, psycopg
+
+RETRYABLE = (psycopg.errors.DeadlockDetected,         # SQLSTATE 40P01
+             psycopg.errors.SerializationFailure)     # SQLSTATE 40001
+
+def run_with_retry(conn, work, tries=5):
+    for attempt in range(1, tries + 1):
+        try:
+            with conn.transaction():
+                return work(conn)
+        except RETRYABLE:
+            if attempt == tries:
+                raise
+            time.sleep(random.uniform(0, 0.05 * 2 ** attempt))   # backoff with jitter</code></pre>
+    <ul>
+      <li>The random delay (<strong>jitter</strong>) stops the same two transactions from colliding again at the same moment.</li>
+      <li>Do not retry lock <em>timeouts</em> blindly in request handlers. A lock timeout means "something is holding a lock for a long time"; retrying just adds more waiters. Fail fast and alert.</li>
+      <li>Make sure <code>work</code> has no outside side effects (emails, HTTP calls) that would happen twice.</li>
+    </ul>
+  </section>
+
+  <section id="mysql">
+    <h2>10. The Same Problems in MySQL</h2>
+    <p>MySQL's InnoDB engine has the same three problems with different tools:</p>
+    <table>
+      <thead><tr><th>Job</th><th>PostgreSQL</th><th>MySQL (InnoDB)</th></tr></thead>
+      <tbody>
+        <tr><td>Who blocks whom</td><td><code>pg_blocking_pids(pid)</code> in <code>pg_stat_activity</code></td><td><code>SELECT * FROM sys.innodb_lock_waits;</code></td></tr>
+        <tr><td>Last deadlock</td><td>Server log (<code>deadlock detected</code>)</td><td><code>SHOW ENGINE INNODB STATUS</code> (section "LATEST DETECTED DEADLOCK"); <code>innodb_print_all_deadlocks=ON</code> to log all</td></tr>
+        <tr><td>Row lock wait limit</td><td><code>lock_timeout</code> (off by default: wait forever)</td><td><code>innodb_lock_wait_timeout</code> (default 50 s)</td></tr>
+        <tr><td>Deadlock detection</td><td>After <code>deadlock_timeout</code> (1 s)</td><td>Immediately, on every wait (can be turned off on very busy systems)</td></tr>
+        <tr><td>Schema-change lock</td><td>ACCESS EXCLUSIVE table lock</td><td>Metadata lock (MDL): the same queue problem, "Waiting for table metadata lock"</td></tr>
+        <tr><td>Online schema change</td><td><code>lock_timeout</code> + retry; <code>CONCURRENTLY</code></td><td><code>ALGORITHM=INSTANT/INPLACE</code>, <code>lock_wait_timeout</code>, or tools like gh-ost and pt-online-schema-change</td></tr>
+      </tbody>
+    </table>
+    <p>One difference to remember: InnoDB at its default <code>REPEATABLE READ</code> level also locks <strong>gaps</strong> between index entries on locking reads and updates (to stop phantoms), so it can deadlock on rows that do not exist yet, such as two inserts into the same range. See <a href="../Databases/dbms-transactions-isolation-mvcc.html#levels">isolation levels</a>.</p>
+  </section>
+
+  <section id="prevent">
+    <h2>11. Prevention: Settings, Alerts, Reviews</h2>
+    <h3>Settings for the app's database user</h3>
+    <pre><code>ALTER ROLE app SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE app SET statement_timeout = '15s';      -- longer than any normal query
+ALTER ROLE app SET lock_timeout = '5s';            -- fail fast instead of piling up
+ALTER ROLE migrator SET lock_timeout = '500ms';    -- migrations give up fast and retry
+ALTER SYSTEM SET log_lock_waits = on;
+SELECT pg_reload_conf();</code></pre>
+    <p>Make sure the app's request timeout is a bit longer than <code>statement_timeout</code>, so the database cancels the query before the client gives up on it. Otherwise the database keeps working (and holding locks) for a request nobody is waiting for.</p>
+    <h3>Alerts</h3>
+    <ul>
+      <li>Sessions waiting on locks for more than 5 s: <code>count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND now() - query_start &gt; interval '5 s'</code>.</li>
+      <li>Oldest open transaction older than 5 minutes (also blocks VACUUM cleanup, see <a href="../Databases/dbms-transactions-isolation-mvcc.html#mvcc">MVCC</a>).</li>
+      <li>Deadlocks per minute: the <code>deadlocks</code> column of <code>pg_stat_database</code> is a counter; alert on its rate.</li>
+    </ul>
+    <h3>Code review checklist</h3>
+    <ul>
+      <li>Is there any HTTP call, file upload, sleep, or user prompt inside a transaction?</li>
+      <li>Do multi-row updates lock rows in a fixed order?</li>
+      <li>Does this migration take ACCESS EXCLUSIVE? Is <code>lock_timeout</code> set? Does it rewrite the table?</li>
+      <li>Is retry on 40P01/40001 wrapped around the <em>whole</em> transaction?</li>
+    </ul>
+  </section>
+
+  <section id="postmortem">
+    <h2>12. Blameless Postmortem</h2>
+    <p>A <strong>postmortem</strong> is a short write-up after an incident. "Blameless" means it looks at how the system allowed the mistake, not at who made it.</p>
+    <pre><code>Title:    Reads on accounts blocked for 8 s during a migration (Wed 11:05 IST)
+Impact:   ~40% of requests failed for 8 s; login unavailable.
+Cause:    ALTER TABLE needed ACCESS EXCLUSIVE; a reporting session held a long
+          transaction on accounts; the ALTER waited, and all reads queued behind it.
+Why it was possible:
+          - migrations ran with no lock_timeout
+          - reporting user had no idle/statement timeout
+          - no alert on lock waits
+Actions:  - migration tool sets lock_timeout=500ms with retries        (done)
+          - idle_in_transaction_session_timeout=5min for reporting role (done)
+          - alert: any session waiting on a lock &gt; 5 s                  (this week)
+          - move the order flow's payment call out of the transaction   (Incident 1)
+          - wallet transfers lock rows in id order + retry on 40P01     (Incident 3)</code></pre>
+  </section>
+
+  <section id="practice">
+    <h2>13. Practice Problems</h2>
+    <p>Answers follow each one.</p>
+
+    <h3>Problem 1: find the root blocker</h3>
+    <pre><code> pid  | state               | wait_event_type | blocked_by
+------+---------------------+-----------------+-----------
+ 201  | active              | Lock            | {203}
+ 202  | active              | Lock            | {201}
+ 203  | idle in transaction |                 | {}
+ 204  | active              | Lock            | {201,202}</code></pre>
+    <p>Which session should you look at, and what is the gentlest fix?</p>
+    <p><em>Answer:</em> Follow the arrows: 204 &rarr; 201/202 &rarr; 201 &rarr; 203. <strong>203</strong> waits for nobody and is idle in transaction: it is the root blocker. It has no running query, so <code>pg_cancel_backend</code> will not help; use <code>pg_terminate_backend(203)</code>, then find the code path that left it open.</p>
+
+    <h3>Problem 2: how long do they wait?</h3>
+    <p>A job runs <code>BEGIN; UPDATE settings SET v = v + 1 WHERE k = 'counter';</code>, then calls an API that takes 4 s, then commits. Requests that update the same row arrive every 100 ms. Each update itself takes 1 ms. Roughly how many requests are waiting by the time the job commits, and how long did the first one wait?</p>
+    <p><em>Answer:</em> Over 4 s, 4 / 0.1 = <strong>40 requests</strong> pile up. The first one waited almost the full <strong>4 s</strong>. After the commit they run one at a time, 1 ms each, so the line clears in about 40 ms. The fix is to move the API call out of the transaction.</p>
+
+    <h3>Problem 3: will it deadlock?</h3>
+    <p>T1 runs <code>UPDATE items SET qty = qty - 1 WHERE id IN (5, 9)</code>. T2 runs <code>UPDATE items SET qty = qty - 1 WHERE id IN (9, 5)</code>. Can they deadlock?</p>
+    <p><em>Answer:</em> <strong>Yes, it is possible.</strong> The order of values in <code>IN (...)</code> does not decide the order rows are locked; that depends on the plan (an index scan visits 5 then 9; a sequential scan visits rows in physical order). If the two statements visit rows in different orders, they can deadlock. To be safe, lock first with <code>SELECT ... WHERE id IN (5, 9) ORDER BY id FOR UPDATE</code>.</p>
+
+    <h3>Problem 4: pick the timeouts</h3>
+    <p>Your API's request timeout is 10 s. Normal queries take under 200 ms; the slowest normal report query takes 3 s. Choose <code>statement_timeout</code> and <code>lock_timeout</code> for the API's role.</p>
+    <p><em>Answer:</em> <code>statement_timeout</code> above 3 s and below 10 s, say <strong>8 s</strong>, so the database cancels the query before the client gives up. <code>lock_timeout</code> lower, say <strong>2 to 3 s</strong>, because a normal request should never wait seconds for a lock; failing fast keeps the connection pool from filling up.</p>
+
+    <h3>Problem 5: is this migration safe?</h3>
+    <p><code>ALTER TABLE orders ALTER COLUMN amount TYPE numeric(12,2);</code> on a 200 GB table that was <code>integer</code>. What happens, and what would you do instead?</p>
+    <p><em>Answer:</em> Changing <code>integer</code> to <code>numeric</code> <strong>rewrites the whole table</strong> while holding ACCESS EXCLUSIVE: no reads or writes on <code>orders</code> for the many minutes the rewrite takes. Instead: add a new nullable column <code>amount_new numeric(12,2)</code> (instant), backfill it in small batches, write to both columns from the app, switch reads, then drop the old column. Run each step with <code>lock_timeout</code> set.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>HTTP calls inside transactions.</strong> Locks live as long as the slowest outside service.</li>
+      <li><strong>Thinking "the ALTER is instant, so it is safe".</strong> The danger is the wait for the lock, during which everything queues behind it.</li>
+      <li><strong>No <code>lock_timeout</code> on migrations.</strong> PostgreSQL waits forever by default.</li>
+      <li><strong>Killing the waiter instead of the blocker.</strong> The waiters are victims; find the root with <code>pg_blocking_pids</code>.</li>
+      <li><strong>Retrying only the failed statement</strong> after a deadlock. The whole transaction was rolled back; retry all of it.</li>
+      <li><strong>Unordered multi-row updates.</strong> Lock in a fixed order (by primary key).</li>
+      <li><strong>Assuming idle means harmless.</strong> An "idle in transaction" session can hold locks and block VACUUM for hours.</li>
+      <li><strong>App timeout shorter than the database's.</strong> The client gives up, but the query keeps running and holding locks.</li>
+      <li><strong>Raising the connection pool size</strong> to "fix" lock waits. More waiters do not make the blocker finish sooner.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <pre><code>-- who is waiting, and on whom?
+SELECT pid, state, wait_event_type, pg_blocking_pids(pid) AS blocked_by,
+       now() - xact_start AS xact_age, left(query, 60)
+FROM pg_stat_activity WHERE datname = current_database() ORDER BY xact_start;
+
+-- long open transactions
+SELECT pid, usename, state, now() - xact_start AS age, left(query, 60)
+FROM pg_stat_activity WHERE xact_start &lt; now() - interval '1 minute' ORDER BY age DESC;
+
+-- deadlocks so far (a counter)
+SELECT datname, deadlocks FROM pg_stat_database WHERE datname = current_database();
+
+SELECT pg_cancel_backend(pid);      -- stop the running query
+SELECT pg_terminate_backend(pid);   -- end the session (needed for idle in transaction)
+
+SET lock_timeout = '500ms';         -- before any migration
+SET idle_in_transaction_session_timeout = '30s';</code></pre>
+    <table>
+      <thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Updates to one row hang; DB idle</td><td>Idle-in-transaction holder</td><td>Short transactions; idle timeout</td></tr>
+        <tr><td>Everything on one table hangs during a deploy</td><td>DDL waiting for ACCESS EXCLUSIVE</td><td><code>lock_timeout</code> + retry; check long transactions first</td></tr>
+        <tr><td><code>deadlock detected</code> (40P01)</td><td>Rows locked in different orders</td><td>Fixed lock order; retry whole transaction</td></tr>
+        <tr><td><code>could not serialize access</code> (40001)</td><td>SERIALIZABLE / REPEATABLE READ conflict</td><td>Retry whole transaction</td></tr>
+      </tbody>
+    </table>
+    <p class="refer-link"><small>Refer: <a href="https://www.postgresql.org/docs/17/explicit-locking.html" rel="noopener noreferrer">PostgreSQL: Explicit locking</a> &middot; <a href="https://www.postgresql.org/docs/17/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW" rel="noopener noreferrer">pg_stat_activity</a> &middot; <a href="https://www.postgresql.org/docs/17/runtime-config-client.html" rel="noopener noreferrer">Client timeouts (lock_timeout, statement_timeout)</a> &middot; <a href="https://www.postgresql.org/docs/17/runtime-config-locks.html" rel="noopener noreferrer">deadlock_timeout</a> &middot; <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks.html" rel="noopener noreferrer">MySQL: InnoDB deadlocks</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Databases/dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a> &middot; <a href="../Operating-Systems/os-concurrency-synchronization-deadlocks.html">Concurrency &amp; Deadlocks</a> &middot; <a href="../Databases/dbms-indexing-btrees-query-plans.html">Indexing &amp; Query Plans</a> &middot; <a href="scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a> &middot; <a href="scenario-service-cannot-reach-database.html">Scenario: A Service Cannot Reach Its Database</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

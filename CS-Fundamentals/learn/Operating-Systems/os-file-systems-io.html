@@ -370,7 +370,7 @@ def save_atomically(path, data: bytes):
         <tr><td><strong>Completion-based (io_uring)</strong></td><td>The program puts requests in a ring shared with the kernel ("read 4 KiB at offset X"). The kernel does them and puts results in a second ring. Very few system calls.</td><td>Newer high-performance databases and storage engines</td></tr>
       </tbody>
     </table>
-    <p>One gap to know: classic epoll readiness works well for network sockets, but regular files always report "ready", because the kernel assumes disk reads are short. That is why event-loop systems often send file I/O to a pool of helper threads. io_uring fixes this by handling files and sockets the same way.</p>
+    <p>One gap to know: classic epoll readiness works well for network sockets, but regular files always report "ready", because the kernel assumes disk reads are short. That is why event-loop systems often send file I/O to a pool of helper threads. io_uring fixes this by handling files and sockets the same way. For a full walkthrough with a hand-written epoll loop, async/await, and measured results, see <a href="os-io-models-event-loops.html">I/O Models &amp; Event Loops</a>.</p>
     <h3>Two ways to skip steps</h3>
     <ul>
       <li><strong><code>mmap</code></strong> maps a file into the program's memory. Reading <code>ptr[5000000]</code> reads the file; the first touch of each page causes a page fault that loads it from the page cache or disk (see <a href="os-virtual-memory-paging.html#page-faults">page faults</a>). It avoids copying data and is great for read-mostly files. It is harder to control exactly when changes are saved, and an I/O error becomes a crash signal instead of an error code.</li>

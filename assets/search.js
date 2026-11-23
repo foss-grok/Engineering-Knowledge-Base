@@ -312,13 +312,17 @@
       '<label class="site-search-label" for="site-search-input">Search</label>' +
       '<div class="site-search-field">' +
       '<input type="search" id="site-search-input" class="site-search-input" placeholder="Search topics, pages, sections (fuzzy matching)…" autocomplete="off" spellcheck="false" aria-controls="site-search-results" aria-expanded="false">' +
-      '<div id="site-search-results" class="site-search-results" role="listbox" hidden></div>' +
+      '<div id="site-search-results" class="site-search-results" aria-label="Search results" hidden></div>' +
       '</div>';
 
     header.appendChild(wrap);
 
     var input = wrap.querySelector('#site-search-input');
     var results = wrap.querySelector('#site-search-results');
+    input.setAttribute('aria-keyshortcuts', '/');
+    if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+      input.placeholder = 'Search topics, pages, sections (press / to focus)\u2026';
+    }
     var indexFailed = !indexData || !indexData.pages || indexData.pages.length === 0;
 
     function render(query) {
@@ -411,7 +415,45 @@
         results.hidden = true;
         input.setAttribute('aria-expanded', 'false');
         input.blur();
+      } else if (e.key === 'ArrowDown' && !results.hidden) {
+        // Arrow keys move from the box into the result list
+        var first = results.querySelector('a.site-search-hit');
+        if (first) {
+          e.preventDefault();
+          first.focus();
+        }
       }
+    });
+
+    // Up/Down move between results; Up from the first one, or Escape, returns to the box
+    results.addEventListener('keydown', function (e) {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Escape') return;
+      var hits = Array.prototype.slice.call(results.querySelectorAll('a.site-search-hit'));
+      var i = hits.indexOf(document.activeElement);
+      if (i === -1) return;
+      e.preventDefault();
+      if (e.key === 'Escape') {
+        input.focus(); // focus first: the box's focus handler re-opens the results
+        results.hidden = true;
+        input.setAttribute('aria-expanded', 'false');
+      } else if (e.key === 'ArrowDown') {
+        hits[Math.min(i + 1, hits.length - 1)].focus();
+      } else if (i === 0) {
+        input.focus();
+      } else {
+        hits[i - 1].focus();
+      }
+    });
+
+    // Press "/" anywhere (when not typing in a field) to jump to the search box
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+      var el = document.activeElement;
+      var tag = el && el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el && el.isContentEditable)) return;
+      e.preventDefault();
+      input.focus();
+      input.select();
     });
 
     results.addEventListener('click', function (e) {

@@ -64,7 +64,7 @@
 
   <section id="services">
     <h2>2. Services</h2>
-    <p>A <strong>Service</strong> is a stable network endpoint that selects Pods by label and load-balances traffic to them. kube-proxy programs iptables or IPVS rules on every node to implement the Service virtual IP (ClusterIP).</p>
+    <p>A <strong>Service</strong> is a stable network endpoint that selects Pods by label and load-balances traffic to them. kube-proxy programs iptables or IPVS rules on every node to implement the Service virtual IP (ClusterIP). This is Layer 4 balancing: a pod is chosen once per TCP connection, so long-lived HTTP/2 and gRPC connections can pin all traffic to one pod (see <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-load-balancing-reverse-proxies.html#grpc">the gRPC one-pod scenario</a>).</p>
 
     <h3>Service types</h3>
     <table>

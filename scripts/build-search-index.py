@@ -77,6 +77,19 @@ KEYWORDS = [
     (r"devops-cicd-mlops", ["CI/CD", "CI", "CD", "DevOps", "MLOps", "GitHub Actions", "GitOps", "Argo CD",
                             "canary", "blue-green", "rollback", "model registry", "MLflow", "drift", "PSI",
                             "KServe", "pipeline"]),
+    (r"os-io-models", ["operating system", "OS", "event loop", "epoll", "select", "poll", "kqueue",
+                       "non-blocking", "async", "await", "asyncio", "C10K", "thread pool", "io_uring",
+                       "edge-triggered", "level-triggered", "backpressure", "Node.js"]),
+    (r"cn-load-balancing", ["computer networks", "CN", "load balancer", "reverse proxy", "nginx", "HAProxy",
+                            "Envoy", "Layer 4", "Layer 7", "L4", "L7", "round robin", "least connections",
+                            "power of two choices", "health check", "sticky sessions", "X-Forwarded-For",
+                            "gRPC", "anycast", "GeoDNS", "ALB", "NLB"]),
+    (r"scenario-database-lock-waits", ["scenario", "database", "PostgreSQL", "MySQL", "lock wait", "deadlock",
+                                       "lock_timeout", "idle in transaction", "pg_stat_activity",
+                                       "pg_blocking_pids", "migration", "ALTER TABLE", "40P01", "debugging"]),
+    (r"ai-engineering-agents\.html$", ["agents", "AI agent", "tool use", "function calling", "tool calling",
+                                        "ReAct", "MCP", "Model Context Protocol", "prompt injection",
+                                        "pass^k", "agent evaluation", "multi-agent", "plan-and-execute"]),
 ]
 
 

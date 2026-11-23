@@ -351,7 +351,7 @@ Certificate will not expire
 
   <section id="load-balancers">
     <h2>12. TLS at Load Balancers and Proxies</h2>
-    <p>Most sites do not run TLS in the app itself. A <strong>load balancer</strong> (a machine that spreads incoming connections over many servers, see <a href="cn-dns-http.html#middle">Proxies, Load Balancers, and CDNs</a>) usually handles it. There are three layouts:</p>
+    <p>Most sites do not run TLS in the app itself. A <strong>load balancer</strong> (a machine that spreads incoming connections over many servers, see <a href="cn-dns-http.html#middle">Proxies, Load Balancers, and CDNs</a> and the deep dive <a href="cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a>) usually handles it. There are three layouts:</p>
     <pre><code>1. TLS termination        client ══TLS══► LB ──plain HTTP──► app
 2. Re-encryption          client ══TLS══► LB ══new TLS════► app
 3. TLS passthrough (L4)   client ══════════TLS═════════════► app
