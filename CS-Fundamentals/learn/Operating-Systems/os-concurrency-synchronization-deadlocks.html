@@ -547,6 +547,7 @@ Thread "worker-3":  waiting to lock  account:2210   held by "worker-7"
     </ol>
     <h3>Step 4: prove the fix</h3>
     <p>Write a stress test: 50 threads making random transfers between 3 accounts (few accounts means many collisions) for 60 seconds. Check two things at the end: no thread is stuck, and the total money across all accounts is unchanged. Run it in CI. The broken version freezes within seconds; the fixed one passes every time.</p>
+    <p>Databases have the same problem with row locks, and they detect the cycle for you. <a href="../Scenarios/scenario-database-lock-waits.html#deadlocks">Scenario: Requests Stuck on Database Locks</a> reproduces it in PostgreSQL: 105 of 200 unordered transfers deadlocked, and 0 once rows were locked in id order.</p>
     <div class="callout">
       <strong>If the locks live in the database</strong> (<code>SELECT ... FOR UPDATE</code>), the same lesson applies: lock rows in a fixed order (for example <code>ORDER BY id</code>), and retry on a deadlock error. The OS idea and the database idea are the same idea.
     </div>
@@ -590,9 +591,9 @@ Thread "worker-3":  waiting to lock  account:2210   held by "worker-7"
 
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
-    <a class="prev-next-prev" href="os-file-systems-io.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">File Systems &amp; Disk I/O</span></a>
+    <a class="prev-next-prev" href="os-io-models-event-loops.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">I/O Models &amp; Event Loops</span></a>
     <a class="prev-next-next" href="../Databases/dbms-normalization-schema-design.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Normalization &amp; Schema Design</span></a>
-    <p class="prev-next-step">Page 5 of 17 in the suggested reading order</p>
+    <p class="prev-next-step">Page 6 of 20 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

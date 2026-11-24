@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>I/O Models &amp; Event Loops | CS Fundamentals</title>
+  <meta name="description" content="How one program serves thousands of network clients: blocking vs non-blocking I/O, threads vs event loops, select, poll and epoll, level vs edge triggering, a hand-written event loop, async/await, measured results (200 clients: 20.1 s blocking, 0.16 s with threads or asyncio; 10,000 waiting threads +157 MB vs +9 MB for tasks), blocking the loop by mistake, backpressure, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; I/O Models &amp; Event Loops</p>
+  </nav>
+  <h1>I/O Models &amp; Event Loops</h1>
+  <p>A web server spends most of its life <strong>waiting</strong>: for a request to arrive, for the database to answer, for a slow phone to accept the reply. This page explains what a program can do while it waits, and why that choice decides whether one machine can serve 10 users or 10,000. We build up from a single blocking server to an event loop you write by hand, and every number on this page comes from code you can run. It builds on <a href="os-processes-threads-scheduling.html">processes and threads</a> and the short overview in <a href="os-file-systems-io.html#io-models">File Systems &amp; Disk I/O</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#waiting">The Problem: Programs Mostly Wait</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#blocking">Model 1: One Thread, Blocking</a></li>
+    <li><a href="#threads">Model 2: One Thread per Client</a></li>
+    <li><a href="#nonblocking">Non-Blocking Sockets: "Not Ready Yet"</a></li>
+    <li><a href="#readiness">Asking the Kernel: select, poll, epoll</a></li>
+    <li><a href="#by-hand">An Event Loop by Hand</a></li>
+    <li><a href="#triggering">Level-Triggered vs Edge-Triggered</a></li>
+    <li><a href="#async">async/await: Event Loops Made Readable</a></li>
+    <li><a href="#lab">The Lab: Four Servers, 200 Clients</a></li>
+    <li><a href="#block-loop">The Classic Bug: Blocking the Loop</a></li>
+    <li><a href="#hybrid">Real Servers Mix Models</a></li>
+    <li><a href="#backpressure">Backpressure: When Clients Are Slow</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="waiting">
+    <h2>1. The Problem: Programs Mostly Wait</h2>
+    <p>Look at one request to a typical API:</p>
+    <pre><code>receive request          ~0.05 ms of CPU
+parse JSON               ~0.05 ms of CPU
+ask the database         ~5 ms of WAITING (network + database work)
+build the reply          ~0.1 ms of CPU
+send the reply           ~0.05 ms of CPU (more waiting if the client is slow)</code></pre>
+    <p>The CPU is busy for about 0.25 ms. The request takes about 5.25 ms. So the CPU is idle about <strong>95% of the time</strong> for this request. If the program does nothing else while it waits, 95% of the machine is wasted.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Think of a waiter in a restaurant. A bad waiter takes one order, walks to the kitchen, and stands there until the food is ready. A good waiter takes the order to the kitchen and goes to the next table. The kitchen rings a bell when food is ready. The good waiter is an <strong>event loop</strong>, and the bell is <strong>epoll</strong>.</p>
+    </div>
+    <p>There are two big ways to use the waiting time:</p>
+    <ol>
+      <li><strong>Many workers.</strong> Use many threads. When one thread waits, the operating system runs another one.</li>
+      <li><strong>One clever worker.</strong> Use one thread that never waits on a single client. It keeps a list of all clients and only works on the ones that are ready.</li>
+    </ol>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>I/O</strong></td><td>Input/output: reading or writing data that lives outside the CPU and memory, such as a network socket, a disk file, or a keyboard.</td></tr>
+        <tr><td><strong>Socket</strong></td><td>The program's end of a network connection. You read bytes from it and write bytes to it (see <a href="../Computer-Networks/cn-tcp-deep-dive.html#sockets">TCP: sockets</a>).</td></tr>
+        <tr><td><strong>File descriptor (fd)</strong></td><td>A small number the kernel gives your program for each open file or socket, like a ticket number: 0, 1, 2, 3...</td></tr>
+        <tr><td><strong>System call</strong></td><td>A request from your program to the kernel, such as <code>read</code>, <code>write</code>, <code>accept</code>. Each one costs a little time (roughly 0.1 to 1 microsecond).</td></tr>
+        <tr><td><strong>Blocking call</strong></td><td>A call that puts your thread to sleep until it can finish. <code>recv()</code> on an empty socket blocks until data arrives.</td></tr>
+        <tr><td><strong>Non-blocking call</strong></td><td>A call that returns at once. If it cannot finish, it says "try again later" (the error <code>EAGAIN</code>).</td></tr>
+        <tr><td><strong>Ready</strong></td><td>A socket is "ready to read" when a read would not block (data is waiting). It is "ready to write" when there is room in the kernel's send buffer.</td></tr>
+        <tr><td><strong>Event loop</strong></td><td>A loop that asks the kernel "which sockets are ready?", handles each ready one a little, and asks again. Forever.</td></tr>
+        <tr><td><strong>Concurrency</strong></td><td>Many tasks are in progress at the same time (they take turns). <strong>Parallelism</strong> means tasks really run at the same instant on different CPU cores. An event loop gives concurrency on one core.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="blocking">
+    <h2>3. Model 1: One Thread, Blocking</h2>
+    <p>The simplest server. One thread does everything, one client at a time:</p>
+    <pre><code>while True:
+    conn = sock.accept()     # sleep until a client connects
+    data = conn.recv(64)     # sleep until the client sends something
+    reply = handle(data)     # maybe sleep again on the database
+    conn.sendall(reply)      # sleep if the client reads slowly
+    conn.close()</code></pre>
+    <p>Each line can block. While the thread waits for client A's database answer, client B is stuck in the kernel's queue of not-yet-accepted connections (the <strong>listen backlog</strong>).</p>
+    <h3>Worked example</h3>
+    <p>200 clients arrive at the same moment. Each request waits 100 ms on the database. The server handles them one after another:</p>
+    <ul>
+      <li>Client 1 finishes at 100 ms. Client 2 at 200 ms. Client <em>k</em> at <em>k</em> &times; 100 ms.</li>
+      <li>The last client finishes at 200 &times; 100 ms = <strong>20 s</strong>.</li>
+      <li>The middle client (the median, p50) waits about 100 &times; 100 ms = <strong>10 s</strong>.</li>
+    </ul>
+    <p>The CPU did almost nothing during those 20 seconds. In the <a href="#lab">lab</a> we measured exactly this: 20.1 s total, p50 10.1 s.</p>
+  </section>
+
+  <section id="threads">
+    <h2>4. Model 2: One Thread per Client</h2>
+    <p>Fix: start a new thread for each client. While one thread sleeps on the database, the kernel's scheduler runs another thread (see <a href="os-processes-threads-scheduling.html">scheduling</a>).</p>
+    <pre><code>while True:
+    conn = sock.accept()
+    threading.Thread(target=handle_one_client, args=(conn,)).start()</code></pre>
+    <p>Now 200 clients wait <em>at the same time</em>, so all of them finish after about 100 ms. This is how classic Apache (prefork/worker), Java servlet servers, and many database servers (PostgreSQL uses one process per connection) work.</p>
+    <h3>What threads cost</h3>
+    <ul>
+      <li><strong>Memory.</strong> Each thread has its own stack. Linux reserves up to 8 MB of address space per stack, but only the pages actually touched use real memory. In our lab, 10,000 Python threads that only wait used about <strong>157 MB</strong> of real memory (about 16 KB each). Java reserves 1 MB of stack per thread by default, and threads that run deep code touch more of it.</li>
+      <li><strong>Context switches.</strong> Switching the CPU from one thread to another costs a few microseconds, plus cold CPU caches afterwards. With 10,000 busy threads, this adds up.</li>
+      <li><strong>Limits.</strong> Operating systems cap threads per process and processes per user (<code>ulimit -u</code>, <code>/proc/sys/kernel/threads-max</code>). Containers often cap them too (the cgroup <code>pids.max</code>).</li>
+      <li><strong>Shared data.</strong> Threads run in parallel, so shared data needs locks, and locks bring <a href="os-concurrency-synchronization-deadlocks.html">races and deadlocks</a>.</li>
+    </ul>
+    <div class="callout">
+      <p><strong>The C10K problem.</strong> Around 1999, people asked: how can one server handle 10,000 connections at once? With one thread per connection, memory and switching costs were too high on the machines of that time. The answer was event loops, which is why nginx, Node.js, Redis and HAProxy are built on them.</p>
+    </div>
+    <p>A common middle ground is a <strong>thread pool</strong>: a fixed number of threads (say 50) and a queue of work. It caps memory but brings back waiting when all 50 threads are busy. That is the same math as a database connection pool (see <a href="../Scenarios/scenario-slow-api-debugging.html#littles-law">Little's law</a>).</p>
+  </section>
+
+  <section id="nonblocking">
+    <h2>5. Non-Blocking Sockets: "Not Ready Yet"</h2>
+    <p>You can tell the kernel: "never put this socket's calls to sleep". In Python, <code>sock.setblocking(False)</code>. In C, the <code>O_NONBLOCK</code> flag.</p>
+    <p>Now <code>recv()</code> on an empty socket returns at once with the error <code>EAGAIN</code> ("try again"). Your thread is free to do other work.</p>
+    <p>But how do you know <em>when</em> to try again? A bad idea is to ask every socket in a tight loop:</p>
+    <pre><code># BAD: busy polling
+while True:
+    for conn in all_connections:
+        try:
+            data = conn.recv(1024)      # returns at once
+            handle(conn, data)
+        except BlockingIOError:         # EAGAIN: nothing yet
+            pass</code></pre>
+    <p>With 10,000 mostly-idle connections, this makes 10,000 system calls per loop, and the CPU sits at 100% doing nothing useful. We need the kernel to <strong>tell us</strong> which sockets are ready.</p>
+  </section>
+
+  <section id="readiness">
+    <h2>6. Asking the Kernel: select, poll, epoll</h2>
+    <p>These are system calls that say: "Here are many file descriptors. Put me to sleep until <em>at least one</em> of them is ready, then tell me which."</p>
+    <table>
+      <thead><tr><th>Call</th><th>How you use it</th><th>Cost per call</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>select</code> (1983)</td><td>Pass bit masks of fds. The kernel marks the ready ones.</td><td>Checks <strong>all</strong> fds you passed: O(n)</td><td>Limited to fd numbers below 1024 on Linux. You must rebuild the masks every call.</td></tr>
+        <tr><td><code>poll</code></td><td>Pass an array of fds. The kernel fills in which are ready.</td><td>O(n)</td><td>No 1024 limit, but still copies and checks the whole list every time.</td></tr>
+        <tr><td><code>epoll</code> (Linux, 2002)</td><td>Register each fd <strong>once</strong> with <code>epoll_ctl</code>. Then <code>epoll_wait</code> returns only the ready ones.</td><td>O(number of ready fds)</td><td>The kernel keeps the interest list. Used by nginx, Node.js (libuv), Python asyncio, Redis, Go's runtime.</td></tr>
+        <tr><td><code>kqueue</code></td><td>Like epoll, on macOS and BSD.</td><td>O(ready)</td><td>Python's <code>selectors.DefaultSelector</code> picks epoll or kqueue for you.</td></tr>
+      </tbody>
+    </table>
+    <h3>Worked example: why epoll wins at scale</h3>
+    <p>A chat server has 10,000 connections. In each moment, about 10 of them have new messages.</p>
+    <ul>
+      <li><strong>poll:</strong> each call hands 10,000 entries to the kernel and the kernel checks all 10,000. Work per call: about 10,000 units.</li>
+      <li><strong>epoll:</strong> the 10,000 sockets were registered once. When data arrives on a socket, the kernel adds it to a "ready list" at that moment. <code>epoll_wait</code> just hands back the ready list. Work per call: about 10 units.</li>
+    </ul>
+    <p>That is a 1,000&times; difference in this example, and it grows as connections grow.</p>
+    <pre><code>  your program                     kernel
+  ────────────                     ──────
+  epoll_create()  ───────────────► new epoll instance (interest list + ready list)
+  epoll_ctl(ADD, fd 7, READ) ────► watch fd 7
+  epoll_ctl(ADD, fd 8, READ) ────► watch fd 8
+  epoll_wait() ──── sleeps ...
+                                   packet arrives for fd 8
+                                   fd 8 put on ready list, wake the waiter
+  epoll_wait() returns [fd 8] ◄─── 
+  recv(fd 8)  (will not block)</code></pre>
+  </section>
+
+  <section id="by-hand">
+    <h2>7. An Event Loop by Hand</h2>
+    <p>Here is a complete echo server (it sends back what you send, in capitals) using one thread and Python's <code>selectors</code> module, which uses epoll on Linux:</p>
+    <pre><code># sel.py - a tiny event loop by hand with the selectors module (epoll on Linux)
+import selectors, socket
+sel = selectors.DefaultSelector()          # EpollSelector on Linux
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 9000)); srv.listen(100); srv.setblocking(False)
+sel.register(srv, selectors.EVENT_READ, data="listener")
+print("selector:", type(sel).__name__)
+while True:
+    for key, _ in sel.select():            # sleep until at least one socket is ready
+        if key.data == "listener":
+            conn, addr = srv.accept()      # will not block: the kernel said it is ready
+            conn.setblocking(False)
+            sel.register(conn, selectors.EVENT_READ, data="client")
+        else:
+            conn = key.fileobj
+            data = conn.recv(1024)         # will not block either
+            if data:
+                conn.sendall(data.upper()) # echo back in capitals (fine for small replies)
+            else:                          # empty read = the client closed
+                sel.unregister(conn); conn.close()</code></pre>
+    <p>Read it slowly. There is only one place where the thread sleeps: <code>sel.select()</code>. Every other call is made only after the kernel said it will not block. A new connection on the listening socket counts as "ready to read".</p>
+    <h3>Watching the system calls</h3>
+    <p>We ran this server under <code>strace</code> (a tool that prints every system call a program makes) and connected 3 clients, each sending one line:</p>
+    <pre><code>$ strace -f -c -e trace=epoll_wait,epoll_ctl,accept4,recvfrom,sendto python3 sel.py
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 42.73    0.000047           4        10         1 epoll_wait
+ 29.09    0.000032          10         3           sendto
+ 12.73    0.000014           4         3           accept4
+  8.18    0.000009           1         7           epoll_ctl
+  7.27    0.000008           1         6           recvfrom</code></pre>
+    <p>Let us explain every count:</p>
+    <ul>
+      <li><strong>epoll_ctl = 7:</strong> 1 to register the listener, 3 to register each client, 3 to unregister each client when it closed.</li>
+      <li><strong>accept4 = 3:</strong> one per client.</li>
+      <li><strong>recvfrom = 6:</strong> two per client: one read with the data, one empty read that means "closed".</li>
+      <li><strong>sendto = 3:</strong> one reply per client.</li>
+      <li><strong>epoll_wait = 10:</strong> the loop woke up about 3 times per client, plus one call that was cut short when we stopped the server (the 1 error).</li>
+    </ul>
+    <p>No busy polling, no threads, and the process used almost no CPU while idle.</p>
+    <div class="callout">
+      <p><strong>Simplification.</strong> <code>sendall</code> on a non-blocking socket can fail if the send buffer is full. A real event loop keeps unsent bytes per connection and also watches for "ready to write". That is exactly what asyncio's <code>writer.drain()</code> does for you (see <a href="#backpressure">backpressure</a>).</p>
+    </div>
+  </section>
+
+  <section id="triggering">
+    <h2>8. Level-Triggered vs Edge-Triggered</h2>
+    <p>epoll can report readiness in two ways. Imagine 3,000 bytes arrive and you read only 1,024 of them.</p>
+    <table>
+      <thead><tr><th>Mode</th><th>Rule</th><th>What happens next</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Level-triggered</strong> (default)</td><td>"Tell me every time I ask, as long as data is waiting."</td><td>The next <code>epoll_wait</code> reports the socket again, because 1,976 bytes are still there. Safe and simple. <code>select</code> and <code>poll</code> work this way.</td></tr>
+        <tr><td><strong>Edge-triggered</strong> (<code>EPOLLET</code>)</td><td>"Tell me once, when new data arrives."</td><td>No new report until <em>more</em> data arrives. If you stop reading early, the 1,976 bytes can sit there forever. You must read in a loop until you get <code>EAGAIN</code>.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Level-triggered is a light that stays on while there is mail in the box. Edge-triggered is a doorbell that rings once when the postman comes. If you take only one letter after the doorbell, nobody reminds you about the rest.</p>
+    </div>
+    <p>Edge-triggered saves some wake-ups and is used by high-performance servers like nginx, but it is easy to get wrong. Start with level-triggered.</p>
+  </section>
+
+  <section id="async">
+    <h2>9. async/await: Event Loops Made Readable</h2>
+    <p>The hand-written loop works, but real handlers do many steps: read the request, call the database, call another API, write the reply. Writing every step as "register a callback and come back later" is hard to read (people call it <strong>callback hell</strong>).</p>
+    <p><code>async</code>/<code>await</code> lets you write code that <em>looks</em> blocking but gives control back to the loop at every <code>await</code>:</p>
+    <pre><code>async def handle(reader, writer):
+    request = await reader.read(64)        # pause here; loop serves others
+    row = await db.fetch("SELECT ...")    # pause here too
+    writer.write(render(row))
+    await writer.drain()                   # pause until the reply fits in the buffer
+    writer.close()</code></pre>
+    <p>What happens at an <code>await</code>:</p>
+    <ol>
+      <li>The function (called a <strong>coroutine</strong>) saves where it is, like a bookmark.</li>
+      <li>It tells the loop: "wake me when this socket is ready" (the loop registers it with epoll).</li>
+      <li>It returns control to the loop. The loop runs other coroutines that are ready.</li>
+      <li>When epoll reports the socket ready, the loop resumes the coroutine right after the <code>await</code>.</li>
+    </ol>
+    <p>This is called <strong>cooperative multitasking</strong>: tasks give up the CPU only when they choose to (at an <code>await</code>). Threads use <strong>preemptive multitasking</strong>: the kernel can pause a thread at any moment.</p>
+    <table>
+      <thead><tr><th></th><th>Threads</th><th>Event loop + async</th></tr></thead>
+      <tbody>
+        <tr><td>Who switches tasks</td><td>The kernel, at any instruction</td><td>Your code, only at <code>await</code></td></tr>
+        <tr><td>Memory per waiting task</td><td>A stack (KBs to MBs)</td><td>A small object (about 1 KB)</td></tr>
+        <tr><td>Uses many CPU cores</td><td>Yes (except Python's GIL for pure Python code)</td><td>No, one loop uses one core. Run one loop per core.</td></tr>
+        <tr><td>Data races</td><td>Possible anywhere</td><td>Only across <code>await</code> points</td></tr>
+        <tr><td>A slow CPU task</td><td>Slows only its thread</td><td><strong>Freezes every client</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Languages differ in how they hide this. Node.js runs one event loop (libuv) and everything is async. Go starts cheap "goroutines" that look like threads but are scheduled by Go's runtime on top of epoll, so blocking-looking code is fine. Java 21 added <strong>virtual threads</strong> that do the same.</p>
+  </section>
+
+  <section id="lab">
+    <h2>10. The Lab: Four Servers, 200 Clients</h2>
+    <p>We wrote four servers and hit each with 200 clients at once. Each request waits 100 ms (like a database call). The full program is below; run it with <code>python3 iolab.py</code> (Python 3.10+).</p>
+    <pre><code># iolab.py - four ways to serve 200 clients whose requests each wait 100 ms on I/O.
+import asyncio, socket, statistics, sys, threading, time
+
+WAIT = 0.1          # each request waits 100 ms (think: a database call)
+CLIENTS = 200
+
+def handle_blocking(conn):
+    conn.recv(64)
+    time.sleep(WAIT)                 # blocking wait: this thread can do nothing else
+    conn.sendall(b"done\n")
+    conn.close()
+
+def server_one_thread(sock):         # A: one thread, one client at a time
+    while True:
+        conn, _ = sock.accept()
+        handle_blocking(conn)
+
+def server_thread_per_conn(sock):    # B: a new thread for every client
+    while True:
+        conn, _ = sock.accept()
+        threading.Thread(target=handle_blocking, args=(conn,), daemon=True).start()
+
+async def handle_async(reader, writer, bad=False):
+    await reader.read(64)
+    if bad:
+        time.sleep(WAIT)             # D: a blocking call inside the event loop (bug!)
+    else:
+        await asyncio.sleep(WAIT)    # C: give control back to the loop while waiting
+    writer.write(b"done\n")
+    await writer.drain()
+    writer.close()
+
+def server_event_loop(sock, bad=False):
+    async def main():
+        srv = await asyncio.start_server(lambda r, w: handle_async(r, w, bad), sock=sock)
+        await srv.serve_forever()
+    asyncio.run(main())
+
+def run_clients(port):
+    lat = []
+    def one():
+        t0 = time.time()
+        s = socket.create_connection(("127.0.0.1", port))
+        s.sendall(b"hi\n"); s.recv(64); s.close()
+        lat.append(time.time() - t0)
+    t0 = time.time()
+    ts = [threading.Thread(target=one) for _ in range(CLIENTS)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    lat.sort()
+    return time.time() - t0, statistics.median(lat), lat[int(0.99 * len(lat)) - 1]
+
+if __name__ == "__main__":
+    kinds = {"A one thread, blocking": lambda s: server_one_thread(s),
+             "B thread per connection": lambda s: server_thread_per_conn(s),
+             "C event loop (asyncio)": lambda s: server_event_loop(s),
+             "D event loop + time.sleep": lambda s: server_event_loop(s, bad=True)}
+    for name, fn in kinds.items():
+        sock = socket.socket(); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0)); sock.listen(512)
+        threading.Thread(target=fn, args=(sock,), daemon=True).start()
+        time.sleep(0.2)
+        total, p50, p99 = run_clients(sock.getsockname()[1])
+        print(f"{name:28s} total {total:6.2f} s   p50 {p50*1000:7.0f} ms   p99 {p99*1000:7.0f} ms")</code></pre>
+    <h3>Results (8-core Linux machine, Python 3.13)</h3>
+    <pre><code>A one thread, blocking       total  20.08 s   p50   10065 ms   p99   19855 ms
+B thread per connection      total   0.16 s   p50     106 ms   p99     128 ms
+C event loop (asyncio)       total   0.16 s   p50     102 ms   p99     104 ms
+D event loop + time.sleep    total  20.13 s   p50   10117 ms   p99   19916 ms</code></pre>
+    <p>What this shows:</p>
+    <ul>
+      <li><strong>A</strong> matches our hand math: 200 &times; 100 ms = 20 s, median about 10 s.</li>
+      <li><strong>B and C</strong> both finish in about 0.16 s. Each client waits about its own 100 ms, plus a little overhead. Threads have a slightly worse p99 (128 ms vs 104 ms) because creating 200 threads and switching between them takes time. (A second run gave B a p99 of 220 ms: thread start-up cost varies.)</li>
+      <li><strong>D</strong> uses an event loop, but it is exactly as bad as A. One wrong line made the whole server single-file. The next section explains why.</li>
+    </ul>
+    <h3>Memory: 10,000 waiting clients</h3>
+    <p>We also started 10,000 threads that all wait on an event, and then 10,000 asyncio tasks that all wait on an event, and measured how much real memory (RSS) grew:</p>
+    <pre><code>10000 threads: +157 MB
+10000 asyncio tasks: +9 MB</code></pre>
+    <p>About 16 KB per thread vs about 1 KB per task. For 10,000 connections both are fine on a modern server. For 1,000,000 long-lived connections (chat, push notifications, IoT devices), only the event loop is practical.</p>
+  </section>
+
+  <section id="block-loop">
+    <h2>11. The Classic Bug: Blocking the Loop</h2>
+    <p>In server D, the handler called <code>time.sleep(0.1)</code> instead of <code>await asyncio.sleep(0.1)</code>. <code>time.sleep</code> puts the <strong>whole thread</strong> to sleep. The event loop runs in that thread. So for 100 ms, the loop cannot accept, read, or write for <em>anyone</em>.</p>
+    <pre><code>time ─────────────────────────────────────────────────►
+loop thread:  [client 1 sleeps 100ms][client 2 sleeps 100ms][client 3 ...
+other clients: waiting      waiting        waiting</code></pre>
+    <p>In real code the blocking call is rarely <code>time.sleep</code>. It is usually one of these:</p>
+    <ul>
+      <li>A normal (non-async) database driver or HTTP library, like <code>requests.get()</code> or <code>psycopg2</code>, called from an <code>async def</code>.</li>
+      <li>Heavy CPU work: parsing a 50 MB JSON file, resizing an image, running a machine learning model, a slow regular expression.</li>
+      <li>Reading a big file from disk (remember: regular files always look "ready" to epoll, see <a href="os-file-systems-io.html#io-models">File Systems</a>).</li>
+      <li>DNS lookups through the C library's blocking <code>getaddrinfo</code>.</li>
+    </ul>
+    <h3>How to fix it</h3>
+    <ol>
+      <li>Use the async version of the library (<code>httpx</code>/<code>aiohttp</code> instead of <code>requests</code>, <code>asyncpg</code> or async <code>psycopg</code> instead of <code>psycopg2</code>).</li>
+      <li>Move blocking calls to a thread pool: <code>await asyncio.to_thread(slow_function, arg)</code>. In Node.js, use worker threads.</li>
+      <li>Move heavy CPU work to a process pool or a separate service, so it can use other cores.</li>
+    </ol>
+    <h3>How to detect it</h3>
+    <ul>
+      <li>Python: run with <code>PYTHONASYNCIODEBUG=1</code>. asyncio then logs any step that holds the loop for more than 100 ms: <code>Executing &lt;Task ...&gt; took 0.105 seconds</code>.</li>
+      <li>Node.js: measure <strong>event loop lag</strong> (<code>perf_hooks.monitorEventLoopDelay()</code>). If a timer set for 0 ms fires after 200 ms, something blocked the loop for 200 ms.</li>
+      <li>Symptom in production: latency of <em>every</em> endpoint jumps together, even health checks, while CPU on one core is at 100%.</li>
+    </ul>
+  </section>
+
+  <section id="hybrid">
+    <h2>12. Real Servers Mix Models</h2>
+    <p>Almost nothing in production is purely one model:</p>
+    <table>
+      <thead><tr><th>System</th><th>Design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>nginx</strong></td><td>One event loop per worker process, one worker per CPU core. Each worker handles thousands of connections.</td></tr>
+        <tr><td><strong>Node.js</strong></td><td>One event loop for your JavaScript, plus a small thread pool (libuv, 4 threads by default) for file I/O, DNS and crypto.</td></tr>
+        <tr><td><strong>Gunicorn + Uvicorn (Python)</strong></td><td>Several worker processes (to use all cores), each running an asyncio event loop.</td></tr>
+        <tr><td><strong>Redis</strong></td><td>One main event loop thread runs all commands, which is why one slow command (like <code>KEYS *</code>) stalls everyone.</td></tr>
+        <tr><td><strong>PostgreSQL</strong></td><td>One process per client connection. That is why it needs a pooler like PgBouncer for thousands of clients.</td></tr>
+        <tr><td><strong>Go</strong></td><td>Many goroutines multiplexed onto a few OS threads; the runtime uses epoll underneath.</td></tr>
+      </tbody>
+    </table>
+    <p>The common rule: <strong>one event loop per core</strong> for waiting on the network, plus <strong>pools of threads or processes</strong> for work that would block or burn CPU.</p>
+    <p>Newer still is <strong>io_uring</strong> on Linux: instead of asking "which sockets are ready?" and then making a system call for each, the program puts whole requests ("read from fd 8 into this buffer") in a ring shared with the kernel and collects the results later. It works for files too. See the <a href="os-file-systems-io.html#io-models">overview in File Systems</a>.</p>
+  </section>
+
+  <section id="backpressure">
+    <h2>13. Backpressure: When Clients Are Slow</h2>
+    <p><strong>Backpressure</strong> means a slow receiver pushes back on a fast sender, so data does not pile up without limit.</p>
+    <p>Example: your server streams a 1 GB file to a phone on a slow network. Your disk reads at 500 MB/s, but the phone takes 1 MB/s. If you keep calling <code>writer.write()</code> without waiting, the unsent data piles up in your process's memory: after 2 seconds, about 1 GB is queued. With 50 such phones, the server runs out of memory.</p>
+    <p>The fix is to <strong>wait for the buffer to drain</strong>:</p>
+    <pre><code>async def stream_file(path, writer):
+    with open(path, "rb") as f:
+        while chunk := f.read(64 * 1024):
+            writer.write(chunk)
+            await writer.drain()     # pauses this task while the send buffer is full</code></pre>
+    <p>Underneath, TCP's <a href="../Computer-Networks/cn-tcp-deep-dive.html#flow">flow control</a> stops the kernel from sending faster than the phone can receive. When the kernel's send buffer is full, the socket is no longer "ready to write", so <code>drain()</code> waits. The same idea applies to queues between services: always put a size limit on a queue, and decide what happens when it is full (wait, drop, or return 503).</p>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Answers follow each one.</p>
+
+    <h3>Problem 1: how long?</h3>
+    <p>A single-threaded blocking server gets 50 requests at the same moment. Each takes 2 ms of CPU and 38 ms waiting on a database. How long until the last one finishes? What if the server is a correct event loop instead?</p>
+    <p><em>Answer:</em> Blocking: each takes 40 ms one after another, so 50 &times; 40 = <strong>2,000 ms</strong>. Event loop: the waits overlap, but the CPU work still runs one at a time on one core: 50 &times; 2 ms = 100 ms of CPU, plus one 38 ms wait at the end, so about <strong>138 ms</strong>.</p>
+
+    <h3>Problem 2: how many threads?</h3>
+    <p>A thread-per-request server gets 400 requests per second. Each request takes 250 ms, almost all of it waiting. How many threads are busy at once on average? (Hint: Little's law, busy = arrival rate &times; time in system.)</p>
+    <p><em>Answer:</em> 400 &times; 0.25 = <strong>100 threads</strong>. A pool of 50 threads would make requests queue up, and the queue would grow forever because the pool can only finish 50 / 0.25 = 200 requests per second.</p>
+
+    <h3>Problem 3: find the bug</h3>
+    <pre><code>@app.get("/report")
+async def report():
+    data = requests.get("https://slow-partner.example/api").json()   # takes 2 s
+    return summarize(data)</code></pre>
+    <p>Under load, every endpoint of this service (even <code>/health</code>) becomes slow. Why, and give two fixes.</p>
+    <p><em>Answer:</em> <code>requests.get</code> is a blocking call inside an <code>async def</code>, so it freezes the event loop for 2 s per call. Fix 1: use an async client, <code>async with httpx.AsyncClient() as c: data = (await c.get(url)).json()</code>. Fix 2: <code>data = await asyncio.to_thread(lambda: requests.get(url).json())</code>. (Or declare the route as a plain <code>def</code>, which frameworks like FastAPI then run in a thread pool.)</p>
+
+    <h3>Problem 4: select or epoll?</h3>
+    <p>A proxy holds 20,000 connections. In each loop round, about 20 are ready. Roughly how many fd checks does each round cost with <code>poll</code>, and with <code>epoll</code>? Could <code>select</code> even be used?</p>
+    <p><em>Answer:</em> poll: about <strong>20,000</strong> per round. epoll: about <strong>20</strong> (only the ready list). select cannot be used on Linux, because fd numbers go above its limit of 1024.</p>
+
+    <h3>Problem 5: edge-triggered trap</h3>
+    <p>With <code>EPOLLET</code>, a client sends 10 KB. Your code reads 4 KB once and goes back to <code>epoll_wait</code>. The client now waits for a reply that never comes. Why?</p>
+    <p><em>Answer:</em> Edge-triggered mode reports readiness only when <em>new</em> data arrives. The remaining 6 KB is still in the buffer, but no new data comes, so epoll never reports the socket again. Fix: in edge-triggered mode, keep reading until <code>recv</code> returns <code>EAGAIN</code>, or use level-triggered mode.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Blocking calls inside async code.</strong> One <code>time.sleep</code>, sync database driver, or big JSON parse stalls every client (our lab: 0.16 s became 20 s).</li>
+      <li><strong>Thinking async makes CPU work faster.</strong> An event loop only overlaps <em>waiting</em>. CPU-heavy work needs more cores (processes) or a faster algorithm.</li>
+      <li><strong>Unlimited concurrency.</strong> An event loop can accept 50,000 requests, then open 50,000 database connections and crash the database. Limit with a semaphore or pool.</li>
+      <li><strong>Forgetting backpressure.</strong> Writing without <code>drain()</code> or with unbounded queues uses unbounded memory with slow clients.</li>
+      <li><strong>Busy polling.</strong> A loop of non-blocking calls with no <code>select</code>/<code>epoll</code> burns 100% CPU.</li>
+      <li><strong>Edge-triggered without draining.</strong> Read until <code>EAGAIN</code>, or data gets stuck.</li>
+      <li><strong>Huge thread pools as a fix.</strong> 5,000 threads hide a slow dependency for a while, then cost memory and context switches. Find the slow dependency.</li>
+      <li><strong>Assuming files are async.</strong> epoll does not help with regular files; use a thread pool or io_uring.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Model</th><th>Good for</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td>One thread, blocking</td><td>Scripts, tools, one user</td><td>Serves one client at a time</td></tr>
+        <tr><td>Thread (or process) per client</td><td>Simple code, CPU work spread over cores, up to a few thousand clients</td><td>Memory, context switches, locks</td></tr>
+        <tr><td>Thread pool</td><td>Capping resources</td><td>Queueing when all threads are busy</td></tr>
+        <tr><td>Event loop (epoll) + async</td><td>Many mostly-idle connections: proxies, chat, APIs that wait on I/O</td><td>Any blocking call freezes everyone; one core per loop</td></tr>
+        <tr><td>Loop per core + worker pools</td><td>Most production servers</td><td>More moving parts</td></tr>
+      </tbody>
+    </table>
+    <pre><code>ss -s                              # how many sockets are open, by state
+ls /proc/&lt;pid&gt;/fd | wc -l          # how many fds a process has open
+ulimit -n                          # max open fds per process (raise for big servers)
+cat /proc/&lt;pid&gt;/status | grep Threads   # threads in a process
+strace -f -c -p &lt;pid&gt;              # count system calls of a running process
+PYTHONASYNCIODEBUG=1 python app.py # log slow event-loop steps (over 100 ms)</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://man7.org/linux/man-pages/man7/epoll.7.html" rel="noopener noreferrer">epoll(7) man page</a> &middot; <a href="https://docs.python.org/3/library/selectors.html" rel="noopener noreferrer">Python selectors</a> &middot; <a href="https://docs.python.org/3/library/asyncio-dev.html" rel="noopener noreferrer">Developing with asyncio (debug mode)</a> &middot; <a href="https://en.wikipedia.org/wiki/C10k_problem" rel="noopener noreferrer">The C10k problem</a> &middot; <a href="https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick" rel="noopener noreferrer">Node.js event loop</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="os-file-systems-io.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">File Systems &amp; Disk I/O</span></a>
+    <a class="prev-next-next" href="os-concurrency-synchronization-deadlocks.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Concurrency, Synchronization &amp; Deadlocks</span></a>
+    <p class="prev-next-step">Page 5 of 20 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a> &middot; <a href="os-file-systems-io.html">File Systems &amp; Disk I/O</a> &middot; <a href="os-concurrency-synchronization-deadlocks.html">Concurrency &amp; Deadlocks</a> &middot; <a href="../Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="../Computer-Networks/cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

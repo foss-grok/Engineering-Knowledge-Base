@@ -258,6 +258,7 @@ SELECT * FROM jobs WHERE status = 'new'
     <p><strong>Prevention:</strong> always lock rows in a consistent order, for example by ascending account ID. Then T2 would also lock Alice first, wait at step 2, and no cycle can form.</p>
     <pre><code>-- transfer(from, to): lock both rows in id order first
 SELECT id FROM accounts WHERE id IN (:from, :to) ORDER BY id FOR UPDATE;</code></pre>
+    <p>How to find the blocking session in production, why one schema change can freeze every read, and a lab that measures these fixes: <a href="../Scenarios/scenario-database-lock-waits.html">Scenario: Requests Stuck on Database Locks</a>.</p>
   </section>
 
   <section id="lab">
@@ -358,7 +359,7 @@ WHERE id = 42 AND status = 'free';
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="dbms-normalization-schema-design.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Normalization &amp; Schema Design</span></a>
     <a class="prev-next-next" href="dbms-indexing-btrees-query-plans.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Indexing, B+ Trees &amp; Query Plans</span></a>
-    <p class="prev-next-step">Page 7 of 17 in the suggested reading order</p>
+    <p class="prev-next-step">Page 8 of 20 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

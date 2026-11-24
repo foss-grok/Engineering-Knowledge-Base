@@ -416,7 +416,7 @@ HTTP/2 304</code></pre>
                  |  answer from cache                \-&gt; app server 3 --&gt; database</code></pre>
     <ul>
       <li>A <strong>reverse proxy</strong> sits in front of servers and forwards requests to them. Examples: Nginx, Envoy, HAProxy. It can handle TLS, compression, and rate limits so the app does not have to.</li>
-      <li>A <strong>load balancer</strong> is a reverse proxy that spreads requests over several servers, and stops sending to servers that fail health checks. In Kubernetes, this is the job of Services and <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html#ingress">Ingress</a>.</li>
+      <li>A <strong>load balancer</strong> is a reverse proxy that spreads requests over several servers, and stops sending to servers that fail health checks. In Kubernetes, this is the job of Services and <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html#ingress">Ingress</a>. How it picks a server and finds broken ones is covered in <a href="cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a>.</li>
       <li>A <strong>CDN</strong> (content delivery network) is a big network of caching proxies in many cities. In the real <code>example.com</code> reply above, <code>server: cloudflare</code>, <code>cf-cache-status: HIT</code>, and <code>age: 7</code> mean a Cloudflare server near the client answered from its cache, and that copy was 7 seconds old.</li>
     </ul>
     <p>Because of these middle boxes, the app sees the proxy's IP, not the user's. Proxies add headers like <code>X-Forwarded-For</code> (the original client IP) and <code>X-Forwarded-Proto</code> (was it https?). Only trust these headers when they come from your own proxy, because clients can fake them.</p>
@@ -485,7 +485,7 @@ HTTP/2 304</code></pre>
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="cn-tcp-deep-dive.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">TCP Deep Dive: From Handshake to Congestion Control</span></a>
     <a class="prev-next-next" href="cn-tls-https-certificates.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">TLS, HTTPS &amp; Certificates</span></a>
-    <p class="prev-next-step">Page 12 of 17 in the suggested reading order</p>
+    <p class="prev-next-step">Page 13 of 20 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

@@ -351,7 +351,7 @@ Certificate will not expire
 
   <section id="load-balancers">
     <h2>12. TLS at Load Balancers and Proxies</h2>
-    <p>Most sites do not run TLS in the app itself. A <strong>load balancer</strong> (a machine that spreads incoming connections over many servers, see <a href="cn-dns-http.html#middle">Proxies, Load Balancers, and CDNs</a>) usually handles it. There are three layouts:</p>
+    <p>Most sites do not run TLS in the app itself. A <strong>load balancer</strong> (a machine that spreads incoming connections over many servers, see <a href="cn-dns-http.html#middle">Proxies, Load Balancers, and CDNs</a> and the deep dive <a href="cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a>) usually handles it. There are three layouts:</p>
     <pre><code>1. TLS termination        client ══TLS══► LB ──plain HTTP──► app
 2. Re-encryption          client ══TLS══► LB ══new TLS════► app
 3. TLS passthrough (L4)   client ══════════TLS═════════════► app
@@ -455,8 +455,8 @@ curl -so /dev/null -w 'tcp=%{time_connect} tls=%{time_appconnect}\n' https://HOS
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="cn-dns-http.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">DNS &amp; HTTP: From a Name to a Web Page</span></a>
-    <a class="prev-next-next" href="../Scenarios/scenario-slow-api-debugging.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Scenario: Debugging a Slow API End to End</span></a>
-    <p class="prev-next-step">Page 13 of 17 in the suggested reading order</p>
+    <a class="prev-next-next" href="cn-load-balancing-reverse-proxies.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Load Balancing &amp; Reverse Proxies</span></a>
+    <p class="prev-next-step">Page 14 of 20 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

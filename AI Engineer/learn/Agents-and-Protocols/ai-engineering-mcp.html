@@ -40,7 +40,7 @@
   <section>
     <h2>Primitives</h2>
     <h3>Tools</h3>
-    <p>Callable actions with JSON Schema inputs (query database, create issue, read file). Similar to function calling in LLM APIs but standardized at the protocol level.</p>
+    <p>Callable actions with JSON Schema inputs (query database, create issue, read file). Similar to function calling in LLM APIs but standardized at the protocol level. For how the model actually calls a tool, and real <code>tools/list</code> and <code>tools/call</code> messages, see <a href="ai-engineering-agents.html#function-calling">Agents: how function calling works</a> and <a href="ai-engineering-agents.html#protocols">Agents: tool protocols</a>.</p>
     <h3>Resources</h3>
     <p>Readable data URIs (file contents, ticket JSON, config snapshots) the model can fetch for context without imperative side effects.</p>
     <h3>Prompts</h3>
@@ -51,7 +51,7 @@
 
   <section>
     <h2>Transport</h2>
-    <p>MCP supports stdio for local subprocess servers (common in desktop apps) and HTTP with Server-Sent Events for remote services. Local stdio keeps secrets on-machine; remote HTTP needs TLS, auth tokens, and network isolation like any microservice.</p>
+    <p>MCP supports stdio for local subprocess servers (common in desktop apps) and HTTP for remote services. The current HTTP transport is called Streamable HTTP; it replaced the older HTTP + Server-Sent Events transport in the 2025-03-26 version of the specification. Local stdio keeps secrets on-machine; remote HTTP needs TLS, auth tokens, and network isolation like any microservice.</p>
     <div class="callout">
       <strong>Security mindset:</strong> An MCP server is arbitrary code with access to your systems. Only install servers from trusted sources, scope credentials narrowly, and review tool definitions before enabling in production hosts.
     </div>

@@ -307,3 +307,35 @@
     init();
   }
 })();
+
+// Keyboard and screen-reader users: a "Skip to main content" link that is the
+// first thing Tab reaches on every page. It stays hidden until it gets focus
+// (see .skip-link in styles.css), then jumps past the breadcrumb, search box and
+// table of contents straight to the page's <main>.
+(function () {
+  'use strict';
+
+  function addSkipLink() {
+    var main = document.querySelector('main');
+    if (!main || document.querySelector('.skip-link')) return;
+    if (!main.id) main.id = 'main-content';
+    if (!main.hasAttribute('tabindex')) main.setAttribute('tabindex', '-1');
+    var link = document.createElement('a');
+    link.className = 'skip-link';
+    link.href = '#' + main.id;
+    link.textContent = 'Skip to main content';
+    link.addEventListener('click', function (e) {
+      e.preventDefault();
+      main.focus({ preventScroll: true });
+      main.scrollIntoView();
+      if (history.replaceState) history.replaceState(null, '', '#' + main.id);
+    });
+    document.body.insertBefore(link, document.body.firstChild);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', addSkipLink);
+  } else {
+    addSkipLink();
+  }
+})();

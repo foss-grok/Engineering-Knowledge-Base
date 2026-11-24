@@ -216,7 +216,7 @@ $ ss -ti dst example.com                            # per connection: cwnd, rtt,
     </ol>
     <p><strong>RST</strong> is the abrupt alternative: "this connection does not exist / abort now". You get one when connecting to a port nobody listens on, or when a program exits with unread data.</p>
     <div class="callout">
-      <strong>Practical note:</strong> a busy client opening thousands of short connections to the same server can run out of ephemeral ports because of TIME_WAIT. Fixes: reuse connections (pooling, keep-alive), and on Linux <code>net.ipv4.tcp_tw_reuse</code> for outgoing connections. Never use the long-removed <code>tcp_tw_recycle</code> advice you may find online.
+      <strong>Practical note:</strong> a busy client opening thousands of short connections to the same server can run out of ephemeral ports because of TIME_WAIT. Fixes: reuse connections (pooling, keep-alive), and on Linux <code>net.ipv4.tcp_tw_reuse</code> for outgoing connections. Never use the long-removed <code>tcp_tw_recycle</code> advice you may find online. Proxies hit this most often; see <a href="cn-load-balancing-reverse-proxies.html#nginx">keep-alive to backends</a>.
     </div>
   </section>
 
@@ -314,7 +314,7 @@ dns=0.001378 connect=0.001902 tls=0.024213 ttfb=0.039511 total=0.039601</code></
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="cn-ip-addressing-subnetting-routing.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">IP Addressing, Subnetting &amp; Routing</span></a>
     <a class="prev-next-next" href="cn-dns-http.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">DNS &amp; HTTP: From a Name to a Web Page</span></a>
-    <p class="prev-next-step">Page 11 of 17 in the suggested reading order</p>
+    <p class="prev-next-step">Page 12 of 20 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

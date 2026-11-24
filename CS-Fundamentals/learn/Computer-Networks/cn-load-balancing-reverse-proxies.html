@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Load Balancing &amp; Reverse Proxies | CS Fundamentals</title>
+  <meta name="description" content="How traffic is spread across many servers, from zero: reverse vs forward proxies, Layer 4 vs Layer 7, round robin, weighted, least connections, power of two choices and hashing compared in a real simulation (one slow server makes round robin's queue grow without limit), health checks and their math, timeouts and safe retries, sticky sessions, X-Forwarded-For, TLS termination, the gRPC one-pod problem, DNS and anycast, an nginx config explained line by line, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Load Balancing &amp; Reverse Proxies</p>
+  </nav>
+  <h1>Load Balancing &amp; Reverse Proxies</h1>
+  <p>One server can only do so much. To serve more users, and to survive when a server dies, we run many copies of an app and put something in front that spreads the requests. That "something" is a <strong>load balancer</strong>. This page explains how load balancers decide where each request goes, how they notice broken servers, and the mistakes that cause real outages. We compare balancing rules with a small simulation you can run. It builds on <a href="cn-tcp-deep-dive.html">TCP</a>, <a href="cn-dns-http.html">DNS &amp; HTTP</a> (which has a <a href="cn-dns-http.html#middle">short overview of proxies</a>) and <a href="cn-tls-https-certificates.html">TLS</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why We Need Load Balancers</a></li>
+    <li><a href="#proxies">Proxies: Forward and Reverse</a></li>
+    <li><a href="#layers">Layer 4 vs Layer 7</a></li>
+    <li><a href="#algorithms">Balancing Rules, One by One</a></li>
+    <li><a href="#simulation">A Simulation: Which Rule Wins?</a></li>
+    <li><a href="#slow-server">One Slow Server: the Math</a></li>
+    <li><a href="#health">Health Checks</a></li>
+    <li><a href="#timeouts">Timeouts and Retries</a></li>
+    <li><a href="#sticky">Sticky Sessions and Hashing</a></li>
+    <li><a href="#headers">Who Is the Real Client? X-Forwarded-For</a></li>
+    <li><a href="#nginx">An nginx Config, Line by Line</a></li>
+    <li><a href="#grpc">Scenario: All gRPC Traffic Hits One Pod</a></li>
+    <li><a href="#global">Across Regions: DNS and Anycast</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why We Need Load Balancers</h2>
+    <p>Say one copy of your API can handle 200 requests per second (rps). At lunch time you get 900 rps. You start 5 copies. Now you have three problems:</p>
+    <ol>
+      <li><strong>One address.</strong> Users only know <code>api.example.com</code>. Something must turn one address into five servers.</li>
+      <li><strong>Fair sharing.</strong> If 600 rps go to one copy and 75 to each of the others, the busy one falls over while the others relax.</li>
+      <li><strong>Failure.</strong> When one copy crashes, requests must stop going to it within seconds.</li>
+    </ol>
+    <p>A load balancer solves all three. It also becomes a natural place for shared jobs: TLS, logging, rate limits, and safe deploys.</p>
+    <pre><code>                       ┌──────────► app-1  10.0.1.11:8080
+  clients ──► LB  ─────┼──────────► app-2  10.0.1.12:8080
+   (one address:       ├──────────► app-3  10.0.1.13:8080
+   api.example.com)    └──────────► app-4  10.0.1.14:8080   (the "backends" or "upstreams")</code></pre>
+    <p><strong>Words:</strong> the servers behind the load balancer are called <strong>backends</strong>, <strong>upstreams</strong>, or <strong>targets</strong>. The group of them is a <strong>pool</strong> (nginx calls it an <code>upstream</code> block; AWS calls it a <strong>target group</strong>).</p>
+  </section>
+
+  <section id="proxies">
+    <h2>2. Proxies: Forward and Reverse</h2>
+    <p>A <strong>proxy</strong> is a program that sits in the middle of a conversation and passes messages along. There are two kinds, and the difference is <em>who it works for</em>.</p>
+    <table>
+      <thead><tr><th></th><th>Forward proxy</th><th>Reverse proxy</th></tr></thead>
+      <tbody>
+        <tr><td>Works for</td><td>The <strong>clients</strong></td><td>The <strong>servers</strong></td></tr>
+        <tr><td>Who knows it exists</td><td>The client is set up to use it</td><td>The client thinks it <em>is</em> the server</td></tr>
+        <tr><td>Typical uses</td><td>Company web filter, caching for an office, hiding the client's address</td><td>Load balancing, TLS, caching for a website, routing <code>/api</code> and <code>/images</code> to different apps</td></tr>
+        <tr><td>Examples</td><td>Squid, a corporate HTTP proxy</td><td>nginx, HAProxy, Envoy, Traefik, AWS ALB, Kubernetes Ingress controllers</td></tr>
+      </tbody>
+    </table>
+    <p>A load balancer is a reverse proxy that spreads requests over many backends. In daily speech the two words are used almost the same way.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A reverse proxy is the receptionist at a big office. Visitors talk only to the receptionist. The receptionist decides which person inside should help, walks the question over, and brings back the answer. Visitors never learn the inside room numbers.</p>
+    </div>
+  </section>
+
+  <section id="layers">
+    <h2>3. Layer 4 vs Layer 7</h2>
+    <p>The "layer" says how much of the traffic the load balancer understands (see <a href="cn-tcp-deep-dive.html#layers">where TCP fits</a>).</p>
+    <table>
+      <thead><tr><th></th><th>Layer 4 (transport)</th><th>Layer 7 (application)</th></tr></thead>
+      <tbody>
+        <tr><td>Sees</td><td>IP addresses and ports only. The data is just bytes.</td><td>Full HTTP requests: method, path, headers, cookies.</td></tr>
+        <tr><td>Decides per</td><td><strong>Connection</strong>. All bytes of one TCP connection go to the same backend.</td><td><strong>Request</strong>. Each HTTP request can go to a different backend.</td></tr>
+        <tr><td>Can route by path or header</td><td>No</td><td>Yes: <code>/api/*</code> to the API, <code>/static/*</code> to a file server</td></tr>
+        <tr><td>TLS</td><td>Usually passes it through untouched</td><td>Usually decrypts it (<strong>TLS termination</strong>) so it can read the request</td></tr>
+        <tr><td>Speed</td><td>Very fast, very cheap</td><td>More CPU per request</td></tr>
+        <tr><td>Examples</td><td>AWS NLB, Linux IPVS, Kubernetes Services (kube-proxy), HAProxy in TCP mode</td><td>AWS ALB, nginx, Envoy, HAProxy in HTTP mode, Ingress controllers</td></tr>
+      </tbody>
+    </table>
+    <h3>What actually happens with a Layer 7 proxy</h3>
+    <p>A Layer 7 proxy uses <strong>two separate TCP connections</strong>: one from the client to the proxy, and one from the proxy to the backend. It reads a full request from the first, picks a backend, and writes the request to the second.</p>
+    <pre><code>client ══TCP+TLS══► proxy ══TCP══► app-2
+          conn #1    reads "GET /orders/42"
+                     picks app-2 (least busy)
+                     reuses an idle keep-alive conn #2 to app-2</code></pre>
+    <p>The backend sees the <em>proxy's</em> IP address as the source, not the client's. We fix that with headers in <a href="#headers">section 10</a>. TLS at the proxy is covered in <a href="cn-tls-https-certificates.html#load-balancers">TLS at load balancers</a>.</p>
+  </section>
+
+  <section id="algorithms">
+    <h2>4. Balancing Rules, One by One</h2>
+    <p>Each new connection (Layer 4) or request (Layer 7) needs a backend. These are the common rules:</p>
+    <table>
+      <thead><tr><th>Rule</th><th>How it picks</th><th>Good</th><th>Bad</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Random</strong></td><td>Any backend, at random</td><td>Needs no memory or shared state</td><td>Bad luck piles requests onto one server for a while</td></tr>
+        <tr><td><strong>Round robin</strong></td><td>1, 2, 3, 4, 1, 2, 3, 4...</td><td>Simple, even <em>count</em> of requests</td><td>Ignores how busy each server is and how long each request takes</td></tr>
+        <tr><td><strong>Weighted round robin</strong></td><td>Like round robin, but a weight-2 server gets twice as many turns</td><td>Mixed machine sizes</td><td>Weights are set by hand and go stale</td></tr>
+        <tr><td><strong>Least connections</strong> (least outstanding requests)</td><td>The backend with the fewest requests in progress right now</td><td>Adapts to slow servers and slow requests</td><td>Needs an exact count; with many load balancers, each sees only its own traffic</td></tr>
+        <tr><td><strong>Power of two choices</strong></td><td>Pick 2 backends at random; send to the one with fewer requests in progress</td><td>Almost as good as least connections, cheap, works well with many load balancers</td><td>Slightly worse than a perfect least-connections choice</td></tr>
+        <tr><td><strong>Hash</strong> (of client IP, cookie, or URL)</td><td>The same key always goes to the same backend</td><td>Caches and sticky sessions</td><td>Hot keys overload one backend; see <a href="#sticky">section 9</a></td></tr>
+      </tbody>
+    </table>
+    <h3>Worked example: least connections</h3>
+    <p>Four backends have this many requests in progress: <code>[3, 1, 4, 1]</code>. A new request arrives.</p>
+    <ul>
+      <li><strong>Round robin</strong> (last one used was backend 2): goes to backend 3, which has 4 already. Now <code>[3, 1, 5, 1]</code>.</li>
+      <li><strong>Least connections:</strong> backends 2 and 4 tie at 1; pick one, say backend 2. Now <code>[3, 2, 4, 1]</code>.</li>
+      <li><strong>Power of two choices:</strong> pick 2 at random, say backends 1 and 3 (counts 3 and 4); send to backend 1. Now <code>[4, 1, 4, 1]</code>. Not perfect, but it avoided the worst one.</li>
+    </ul>
+  </section>
+
+  <section id="simulation">
+    <h2>5. A Simulation: Which Rule Wins?</h2>
+    <p>We simulated 10 backends. Each handles one request at a time (extra requests wait in its queue). A request takes 50 ms of work on average, with natural variation (some take 5 ms, some 200 ms). Requests arrive at random times at 90% of the total capacity. We sent 200,000 requests through each rule. Run it yourself with <code>python3 lbsim.py</code>:</p>
+    <pre><code># lbsim.py - compare load-balancing rules on 10 servers.
+# Each server does one request at a time; extra requests wait in its queue.
+import heapq, random
+
+def simulate(rule, slow=(), n_servers=10, load=0.9, n_req=200_000, seed=1):
+    rng = random.Random(seed)
+    speed = [1/3 if i in slow else 1.0 for i in range(n_servers)]
+    mean_work = 0.050                            # 50 ms of work on a normal server
+    rate = load * sum(speed) / mean_work         # arrivals per second (90% of capacity)
+    free_at = [0.0] * n_servers                  # when each server finishes its queue
+    open_reqs = [0] * n_servers                  # requests sent but not finished
+    ends = []                                    # heap of (finish time, server)
+    t, rr, lat = 0.0, 0, []
+    for _ in range(n_req):
+        t += rng.expovariate(rate)               # next request arrives
+        while ends and ends[0][0] &lt;= t:          # forget requests that already finished
+            open_reqs[heapq.heappop(ends)[1]] -= 1
+        if rule == "random":
+            s = rng.randrange(n_servers)
+        elif rule == "round robin":
+            s = rr % n_servers; rr += 1
+        elif rule == "least connections":
+            fewest = min(open_reqs)
+            s = rng.choice([i for i, n in enumerate(open_reqs) if n == fewest])
+        elif rule == "power of two choices":
+            a, b = rng.sample(range(n_servers), 2)
+            s = a if open_reqs[a] &lt;= open_reqs[b] else b
+        start = max(t, free_at[s])               # wait for the server to be free
+        free_at[s] = start + rng.expovariate(1 / mean_work) / speed[s]
+        heapq.heappush(ends, (free_at[s], s)); open_reqs[s] += 1
+        lat.append(free_at[s] - t)
+    lat.sort()
+    return lat[len(lat) // 2] * 1000, lat[int(0.99 * len(lat))] * 1000
+
+for slow in [(), (0,)]:
+    print("server 0 is 3x slower" if slow else "all 10 servers equal")
+    for rule in ["random", "round robin", "least connections", "power of two choices"]:
+        p50, p99 = simulate(rule, slow)
+        print(f"  {rule:21s} p50 {p50:8.0f} ms   p99 {p99:10.0f} ms")</code></pre>
+    <h3>Results</h3>
+    <pre><code>all 10 servers equal
+  random                p50      325 ms   p99       1908 ms
+  round robin           p50      195 ms   p99       1243 ms
+  least connections     p50       70 ms   p99        381 ms
+  power of two choices  p50      123 ms   p99        510 ms
+server 0 is 3x slower
+  random                p50      245 ms   p99    1585876 ms
+  round robin           p50      145 ms   p99    1631778 ms
+  least connections     p50       75 ms   p99        511 ms
+  power of two choices  p50      134 ms   p99        858 ms</code></pre>
+    <p>(p50 is the median time a request took, waiting plus working. p99 means 99% of requests were faster than this.)</p>
+    <h3>What the numbers teach</h3>
+    <ul>
+      <li><strong>Even with identical servers, the rule matters a lot.</strong> Random lets queues form by bad luck: p99 is 1.9 s. Least connections sends work to whoever is free: p99 is 0.38 s, five times better.</li>
+      <li><strong>Round robin beats random</strong>, because it spreads the <em>count</em> evenly. But it is blind to the fact that some requests are 4 times longer than others.</li>
+      <li><strong>Power of two choices</strong> gets most of the benefit by looking at only 2 servers. That is why Envoy's "least request" mode uses it by default.</li>
+      <li><strong>One slow server breaks random and round robin completely.</strong> Their p99 is about 1,600,000 ms, which is <em>27 minutes</em>. The next section shows why.</li>
+    </ul>
+    <div class="callout">
+      <p><strong>Limits of this model.</strong> Real servers handle several requests at once, and real traffic is burstier. The exact numbers will differ, but the ranking (least-busy rules beat blind rules, and the gap grows when servers differ) is what you see in production.</p>
+    </div>
+  </section>
+
+  <section id="slow-server">
+    <h2>6. One Slow Server: the Math</h2>
+    <p>Why did one slow server make round robin's waits explode? Do the math by hand:</p>
+    <ol>
+      <li>A normal server does one 50 ms request at a time: 1 / 0.05 = <strong>20 rps</strong>. The slow one is 3&times; slower: <strong>6.7 rps</strong>.</li>
+      <li>Total capacity: 9 &times; 20 + 6.7 = <strong>186.7 rps</strong>. We send 90% of that: <strong>168 rps</strong>.</li>
+      <li>Round robin gives each server 1/10 of the traffic: <strong>16.8 rps</strong> each.</li>
+      <li>The slow server gets 16.8 rps but can finish only 6.7 rps. Its queue grows by about <strong>10 requests every second</strong>, forever.</li>
+      <li>After 20 minutes the queue holds about 12,000 requests. A new request must wait for all of them: 12,000 &times; 150 ms = 1,800 s. That matches the 27-minute p99.</li>
+    </ol>
+    <p>Meanwhile the other 9 servers are only at 16.8 / 20 = 84% busy. The fleet has spare capacity, but the blind rule cannot use it. Least connections notices that the slow server's count keeps climbing and stops sending to it.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Round robin is like a supermarket manager who sends every 10th customer to lane 1, even though the cashier in lane 1 is a trainee. The line at lane 1 goes out the door while other cashiers stand idle. Customers choosing the shortest line (least connections) fix it on their own.</p>
+    </div>
+    <p>In real life, "one slow server" happens all the time: a noisy neighbor on the same host, a bad disk, a garbage collection pause, a node with throttled CPU (see <a href="../Operating-Systems/os-processes-threads-scheduling.html">container CPU throttling</a>), or a new pod with a cold cache.</p>
+  </section>
+
+  <section id="health">
+    <h2>7. Health Checks</h2>
+    <p>A load balancer must stop sending to dead backends. There are two ways to find them.</p>
+    <h3>Active health checks</h3>
+    <p>The load balancer itself asks each backend every few seconds, for example <code>GET /healthz</code>, and expects a <code>200</code>. Typical settings:</p>
+    <pre><code>interval            5s     # ask every 5 seconds
+timeout             2s     # no answer in 2 s counts as a failure
+unhealthy_threshold 3      # 3 failures in a row: remove the backend
+healthy_threshold   2      # 2 successes in a row: add it back</code></pre>
+    <h3>Worked example: how many errors before removal?</h3>
+    <p>A backend crashes right after passing a check. Checks run at 5 s, 10 s and 15 s after the crash, and each fails. After the third failure the backend is removed. So for about <strong>15 s</strong> it still gets traffic. At 500 rps spread over 10 backends, it gets 50 rps: 15 &times; 50 = about <strong>750 failed requests</strong>.</p>
+    <p>Making the interval smaller helps, but costs more check traffic. That is why we add passive checks.</p>
+    <h3>Passive health checks (outlier detection)</h3>
+    <p>The load balancer watches <em>real</em> traffic. If a backend refuses connections or returns errors several times in a row, it is taken out for a while. In nginx, <code>max_fails=3 fail_timeout=10s</code> does this. Envoy calls it <strong>outlier detection</strong>. Passive checks react within a few requests instead of 15 seconds.</p>
+    <h3>What should a health check test?</h3>
+    <ul>
+      <li><strong>Too shallow:</strong> "the process is running". A server stuck in a deadlock still passes.</li>
+      <li><strong>Too deep:</strong> "the database answered". If the database has a short hiccup, <em>every</em> backend fails its check at once, the load balancer removes all of them, and a small problem becomes a full outage.</li>
+      <li><strong>Good:</strong> "this process can serve requests": its own threads and event loop respond, and it has finished starting. Report dependency problems in metrics, not in the health check. Kubernetes splits this into liveness and readiness probes (see <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-autoscaling-probes-rollouts.html">probes and rollouts</a>).</li>
+    </ul>
+    <p>When removing a backend on purpose (a deploy), first stop sending it new requests, then let in-flight ones finish: <strong>connection draining</strong>. Getting this wrong causes 502s on every release; the full story is in <a href="../Scenarios/scenario-errors-during-deploys.html">Scenario: Errors During Every Deploy</a>.</p>
+  </section>
+
+  <section id="timeouts">
+    <h2>8. Timeouts and Retries</h2>
+    <p>A proxy has several separate timeouts. Each answers a different question:</p>
+    <table>
+      <thead><tr><th>Timeout</th><th>Question</th><th>Typical value</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Connect</strong></td><td>How long to wait for the TCP handshake to a backend?</td><td>1 to 3 s (a healthy backend in the same data center answers in under 1 ms)</td></tr>
+        <tr><td><strong>Read / response</strong></td><td>After sending the request, how long to wait for the reply?</td><td>Slightly above your slowest normal request</td></tr>
+        <tr><td><strong>Idle (keep-alive)</strong></td><td>How long to keep an unused connection open for reuse?</td><td>60 s or so; the side that <em>receives</em> requests must wait longer than the side that sends them</td></tr>
+      </tbody>
+    </table>
+    <h3>When is a retry safe?</h3>
+    <p>If a backend fails, the proxy can try another one. But only when the first backend <strong>surely did not act</strong> on the request, or when acting twice is harmless:</p>
+    <ul>
+      <li><strong>Connection refused</strong> or connect timeout: the request was never sent. Safe to retry anywhere.</li>
+      <li><strong>Error after the request was sent</strong> (reset, read timeout): the backend may have done the work. Retry only if the request is <strong>idempotent</strong> (doing it twice has the same effect as once: <code>GET</code>, <code>PUT</code>, <code>DELETE</code>), or if it carries an idempotency key. See <a href="cn-dns-http.html#methods">HTTP methods and idempotency</a>.</li>
+    </ul>
+    <h3>Retry storms</h3>
+    <p>Retries multiply load. Suppose the client retries 3 times, the load balancer retries 3 times, and the app retries its database call 3 times. One user request can become 3 &times; 3 &times; 3 = <strong>27</strong> database calls, exactly when the database is struggling. Rules: retry at <strong>one</strong> layer, add random delay between tries (jitter), and use a <strong>retry budget</strong> (for example, retries may add at most 10% extra traffic). The <a href="../Scenarios/scenario-slow-api-debugging.html#retries">slow API scenario</a> shows a storm in action.</p>
+  </section>
+
+  <section id="sticky">
+    <h2>9. Sticky Sessions and Hashing</h2>
+    <p>Sometimes we want the same user to reach the same backend every time. This is called <strong>session affinity</strong> or <strong>sticky sessions</strong>.</p>
+    <ul>
+      <li><strong>Why:</strong> the backend keeps something in memory for that user: a login session, a shopping cart, a WebSocket, or a warm cache.</li>
+      <li><strong>How:</strong> the load balancer sets a cookie naming the backend (<code>SERVERID=app-3</code>), or hashes the client IP.</li>
+      <li><strong>The cost:</strong> load is no longer spread by the balancing rule. One very busy customer can overload one server. When a server dies, all its users lose their sessions.</li>
+    </ul>
+    <p>Better: keep sessions in a shared store (Redis, a database) or in a signed cookie, so <em>any</em> backend can serve <em>any</em> request. Then stickiness is only an optimization, not a requirement.</p>
+    <h3>Hashing and adding servers</h3>
+    <p>Simple hashing picks <code>backend = hash(key) % N</code>. If N changes from 4 to 5, most keys move to a different backend (about 80% of them), and every cache goes cold at once. <strong>Consistent hashing</strong> moves only about 1/N of the keys. It is explained with a real experiment in <a href="../Databases/dbms-replication-sharding-cap.html#consistent-hashing">Replication &amp; Sharding</a>.</p>
+  </section>
+
+  <section id="headers">
+    <h2>10. Who Is the Real Client? X-Forwarded-For</h2>
+    <p>Behind a Layer 7 proxy, every request reaches the app from the proxy's IP address. The app still needs the real client address for logs, rate limits and fraud checks. Proxies add headers:</p>
+    <pre><code>X-Forwarded-For: 203.0.113.7, 10.0.0.5     # client, then each proxy it passed
+X-Forwarded-Proto: https                   # the client used HTTPS (the proxy-to-app hop may be HTTP)
+X-Forwarded-Host: api.example.com
+Forwarded: for=203.0.113.7;proto=https      # the standard version (RFC 7239)</code></pre>
+    <p>Each proxy <em>appends</em> the address it received the connection from.</p>
+    <div class="callout">
+      <p><strong>Security trap.</strong> Anyone can send a fake <code>X-Forwarded-For: 1.2.3.4</code>. Only trust the entries added by <em>your own</em> proxies. If you have one proxy in front, the real client is the <strong>last</strong> entry added by that proxy, which is the right-most one. Reading the <em>left-most</em> entry lets attackers pick any IP they like and skip your rate limits.</p>
+    </div>
+    <p>A Layer 4 load balancer cannot add HTTP headers. It can either keep the client's IP as the packet's source (some cloud NLBs do this) or use the <strong>PROXY protocol</strong>, a short line sent at the start of the TCP connection that carries the original addresses.</p>
+  </section>
+
+  <section id="nginx">
+    <h2>11. An nginx Config, Line by Line</h2>
+    <pre><code>upstream orders_api {
+    least_conn;                                   # rule: fewest active requests
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.13:8080 max_fails=3 fail_timeout=10s weight=2;   # a bigger machine
+    keepalive 32;                                 # keep up to 32 idle connections per worker
+}
+
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+    ssl_certificate     /etc/ssl/api.crt;
+    ssl_certificate_key /etc/ssl/api.key;
+
+    location / {
+        proxy_pass http://orders_api;
+        proxy_http_version 1.1;                   # needed for keep-alive to backends
+        proxy_set_header Connection "";           # ... together with this line
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 30s;
+        proxy_next_upstream error timeout;        # retry another backend on these errors
+        proxy_next_upstream_tries 2;              # at most 2 backends per request
+    }
+}</code></pre>
+    <ul>
+      <li><code>upstream</code> is the pool. <code>least_conn</code> chooses the rule; without it nginx uses weighted round robin.</li>
+      <li><code>max_fails=3 fail_timeout=10s</code> is a <strong>passive</strong> health check: 3 failures within 10 s mark the server down for 10 s. (Active checks need nginx Plus, or a different proxy such as HAProxy or Envoy.)</li>
+      <li><code>weight=2</code>: this server gets twice the share.</li>
+      <li><code>keepalive 32</code> plus the two <code>proxy_http_version</code>/<code>Connection</code> lines reuse TCP connections to backends instead of opening a new one per request. This saves a handshake each time and avoids running out of ports (lots of short connections leave many sockets in <a href="cn-tcp-deep-dive.html#teardown">TIME_WAIT</a>).</li>
+      <li><code>ssl_certificate</code>: TLS ends here. Traffic to the backends is plain HTTP on a private network (or re-encrypted, if you need encryption inside too).</li>
+      <li><code>proxy_next_upstream error timeout</code>: on a connection error or timeout, try the next backend. Since nginx 1.9.13, requests like <code>POST</code> are <em>not</em> retried by default if they were already sent, which protects you from double actions.</li>
+    </ul>
+  </section>
+
+  <section id="grpc">
+    <h2>12. Scenario: All gRPC Traffic Hits One Pod</h2>
+    <p>A team moves a service from REST to gRPC on Kubernetes. They have 6 pods. The dashboard shows one pod at 95% CPU and five pods nearly idle. Scaling to 12 pods changes nothing.</p>
+    <h3>Why</h3>
+    <ol>
+      <li>gRPC runs on HTTP/2. HTTP/2 sends <strong>many requests over one long-lived TCP connection</strong> (this is called multiplexing).</li>
+      <li>A Kubernetes Service (kube-proxy) is a <strong>Layer 4</strong> load balancer. It picks a pod once, when the connection opens (see <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html#services">Kubernetes Services</a>).</li>
+      <li>The client opened <strong>one</strong> connection at startup. So every request for hours goes to the pod chosen at that moment. New pods never receive anything.</li>
+    </ol>
+    <p>With REST over HTTP/1.1, clients open many connections, so per-connection balancing looked fine by accident.</p>
+    <h3>Fixes</h3>
+    <ul>
+      <li><strong>Layer 7 balancing:</strong> put an HTTP/2-aware proxy in the path (Envoy, Linkerd, Istio, or a gRPC-aware Ingress), which balances each <em>request</em>.</li>
+      <li><strong>Client-side balancing:</strong> use a headless Service so DNS returns all pod IPs, and let the gRPC client open a connection to each pod and spread requests (<code>round_robin</code> policy).</li>
+      <li><strong>Recycle connections:</strong> set the server's <code>MAX_CONNECTION_AGE</code> (for example 5 minutes), so clients reconnect and get re-balanced. This is a simple partial fix.</li>
+    </ul>
+    <p>The same trap appears with WebSockets, database connection pools, and any long-lived connection behind a Layer 4 balancer.</p>
+  </section>
+
+  <section id="global">
+    <h2>13. Across Regions: DNS and Anycast</h2>
+    <p>Load balancers inside one data center are not enough for a worldwide service. Two tools spread users across regions:</p>
+    <ul>
+      <li><strong>DNS-based balancing (GeoDNS):</strong> the DNS server returns a different IP depending on where the user is: Mumbai users get the Mumbai load balancer. Health checks remove a dead region from DNS answers. The catch is <strong>TTL</strong>: clients cache answers, so a failover takes at least one TTL to reach everyone (see <a href="cn-dns-http.html#ttl">DNS TTLs</a>).</li>
+      <li><strong>Anycast:</strong> many locations announce the <em>same</em> IP address. Internet routing sends each user to the nearest one. Failover is fast because routes change in seconds. Cloudflare, Google's global load balancer, and the DNS root servers use anycast.</li>
+    </ul>
+    <pre><code>user in Chennai ──DNS──► "api.example.com = 13.200.1.1"  (Mumbai LB)
+                    └──► Mumbai LB ──► Mumbai pods
+user in Berlin  ──DNS──► "api.example.com = 3.120.5.5"   (Frankfurt LB)
+                    └──► Frankfurt LB ──► Frankfurt pods</code></pre>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <p>Answers follow each one.</p>
+
+    <h3>Problem 1: Layer 4 or Layer 7?</h3>
+    <p>For each, choose: (a) send <code>/api/*</code> to one service and <code>/blog/*</code> to another; (b) balance a PostgreSQL read pool; (c) block requests whose <code>User-Agent</code> is a known bad bot; (d) pass end-to-end encrypted traffic you are not allowed to decrypt.</p>
+    <p><em>Answer:</em> (a) <strong>L7</strong>, needs the path. (b) <strong>L4</strong>, the database protocol is not HTTP. (c) <strong>L7</strong>, needs a header. (d) <strong>L4</strong>, TLS passthrough; an L7 proxy would have to decrypt.</p>
+
+    <h3>Problem 2: weights</h3>
+    <p>You have 2 servers that each handle 100 rps and 1 server that handles 300 rps. Traffic is 400 rps. What happens with plain round robin? What weights fix it?</p>
+    <p><em>Answer:</em> Round robin sends 400 / 3 = 133 rps to each. The two small servers can do only 100, so they overload and their queues grow. Use weights proportional to capacity: <strong>1, 1, 3</strong>. Shares become 80, 80 and 240 rps: each server at 80% busy.</p>
+
+    <h3>Problem 3: health check math</h3>
+    <p>Checks run every 10 s with an unhealthy threshold of 2. Traffic is 1,200 rps over 8 backends. One backend freezes. About how many requests fail before it is removed? How could you lower that number without checking more often?</p>
+    <p><em>Answer:</em> Up to 2 &times; 10 = 20 s of traffic. It gets 1,200 / 8 = 150 rps, so about 20 &times; 150 = <strong>3,000</strong> failed requests (fewer if timeouts are retried elsewhere). Lower it with <strong>passive checks</strong> (outlier detection), which notice errors in real traffic within a few requests, and with safe retries of connect failures.</p>
+
+    <h3>Problem 4: real client IP</h3>
+    <p>Your app sits behind exactly one trusted proxy. A request arrives with <code>X-Forwarded-For: 6.6.6.6, 198.51.100.20</code>. Which is the real client, and what is <code>6.6.6.6</code>?</p>
+    <p><em>Answer:</em> Your proxy appended the address it saw, which is the right-most entry: <strong>198.51.100.20</strong> is the real client. <code>6.6.6.6</code> was in the header the client sent, so it may be fake. Never use it for rate limits or security decisions.</p>
+
+    <h3>Problem 5: why did scaling not help?</h3>
+    <p>A WebSocket chat service runs behind a Layer 4 load balancer with 4 servers, all busy. You add 4 more servers. An hour later the new servers have almost no connections. Why, and what would you do?</p>
+    <p><em>Answer:</em> WebSockets are long-lived connections. An L4 balancer only chooses a server when a connection opens, and existing users stay connected for hours. Only <em>new</em> connections go to the new servers (and with round robin, only half of them). Use least-connections so new connections prefer the empty servers, and ask some clients to reconnect slowly over time (close a few percent of old connections per minute) to rebalance.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Round robin with unequal servers or requests.</strong> One slow server can build an endless queue (our simulation: 27 minutes at p99). Prefer least connections or power of two choices.</li>
+      <li><strong>Health checks that test the database.</strong> One database blip removes every backend at once.</li>
+      <li><strong>Retries at every layer.</strong> 3 &times; 3 &times; 3 = 27 times the load during an outage. Retry at one layer, with jitter and a budget.</li>
+      <li><strong>Retrying non-idempotent requests</strong> after they were sent: double payments.</li>
+      <li><strong>Trusting the left-most X-Forwarded-For.</strong> Attackers choose it.</li>
+      <li><strong>Long-lived connections behind Layer 4.</strong> gRPC, WebSockets and connection pools stick to one backend.</li>
+      <li><strong>No keep-alive to backends.</strong> A new TCP (and maybe TLS) handshake per request wastes time and fills TIME_WAIT.</li>
+      <li><strong>Idle timeout mismatch.</strong> If the backend closes idle connections before the proxy does, the proxy sometimes sends a request on a connection that was just closed: random 502s.</li>
+      <li><strong>The load balancer as a single point of failure.</strong> Run at least two, with a shared virtual IP or a managed cloud LB.</li>
+    </ul>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Need</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td>Fast, protocol-agnostic, TLS passthrough</td><td>Layer 4 (NLB, IPVS, HAProxy TCP mode)</td></tr>
+        <tr><td>Routing by path/header, per-request balancing, gRPC</td><td>Layer 7 (ALB, nginx, Envoy, HAProxy HTTP mode)</td></tr>
+        <tr><td>Default balancing rule</td><td>Least connections or power of two choices</td></tr>
+        <tr><td>Mixed machine sizes</td><td>Weights proportional to capacity</td></tr>
+        <tr><td>Cache locality</td><td>Consistent hashing on the URL or key</td></tr>
+        <tr><td>Fast failure detection</td><td>Active checks + passive (outlier detection)</td></tr>
+        <tr><td>Safe deploys</td><td>Connection draining, readiness probes</td></tr>
+        <tr><td>Global users</td><td>GeoDNS or anycast in front of regional LBs</td></tr>
+      </tbody>
+    </table>
+    <pre><code>curl -sv https://api.example.com/healthz          # does the LB answer? which cert?
+curl -s -o /dev/null -w '%{remote_ip}\n' https://api.example.com   # which LB IP did I hit?
+for i in $(seq 20); do curl -s https://api.example.com/whoami; done | sort | uniq -c
+                                                   # how evenly do requests spread?
+ss -tan state time-wait | wc -l                    # many? add keep-alive to backends
+kubectl get endpointslices -l kubernetes.io/service-name=orders   # which pods are in the pool?</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html" rel="noopener noreferrer">nginx upstream module</a> &middot; <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers" rel="noopener noreferrer">Envoy load balancers</a> &middot; <a href="https://www.eecs.harvard.edu/~michaelm/postscripts/mythesis.pdf" rel="noopener noreferrer">Mitzenmacher: The Power of Two Choices</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc7239" rel="noopener noreferrer">RFC 7239: Forwarded header</a> &middot; <a href="https://kubernetes.io/blog/2018/11/07/grpc-load-balancing-on-kubernetes-without-tears/" rel="noopener noreferrer">gRPC load balancing on Kubernetes</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="cn-tls-https-certificates.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">TLS, HTTPS &amp; Certificates</span></a>
+    <a class="prev-next-next" href="../Scenarios/scenario-slow-api-debugging.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Scenario: Debugging a Slow API End to End</span></a>
+    <p class="prev-next-step">Page 15 of 20 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="cn-dns-http.html">DNS &amp; HTTP</a> &middot; <a href="cn-tls-https-certificates.html">TLS, HTTPS &amp; Certificates</a> &middot; <a href="../Operating-Systems/os-io-models-event-loops.html">I/O Models &amp; Event Loops</a> &middot; <a href="../Scenarios/scenario-errors-during-deploys.html">Scenario: Errors During Every Deploy</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html">Kubernetes Networking</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>
