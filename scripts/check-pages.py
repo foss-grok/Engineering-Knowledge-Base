@@ -8,7 +8,11 @@ For each page (redirect stubs that only forward to another page are skipped):
   - exactly one <h1>
   - no duplicate id="..." values (outside <script> and <pre>), because
     duplicate ids break #anchor links and the table of contents
-  - no em dashes (the site style uses " - "; see scripts/remove-em-dashes.ps1)
+  - no em dashes, as a character or as an &mdash; entity (the site style uses
+    " - "; see scripts/remove-em-dashes.ps1)
+  - balanced tags: no stray closing tags and no unclosed elements. This also
+    catches a raw "<" in text or math, like $x_{<t}$, which the browser reads
+    as the start of a tag (write &lt; instead)
 
 Usage:
   python3 scripts/check-pages.py            # whole site
@@ -18,12 +22,53 @@ Exit code is 1 when anything fails, so it can run in CI.
 import re
 import sys
 from collections import Counter
+from html.parser import HTMLParser
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
 scan = root / (sys.argv[1] if len(sys.argv) > 1 else ".")
 
 ID = re.compile(r'\bid="([^"]+)"')
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+        "param", "source", "track", "wbr"}
+# end tags the HTML spec lets you leave out; a missing one is not an error
+OPTIONAL_END = {"p", "li", "td", "th", "tr", "thead", "tbody", "dt", "dd", "option",
+                "html", "head", "body"}
+
+
+class TagBalance(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.errors = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in VOID:
+            self.stack.append((tag, self.getpos()[0]))
+
+    def handle_startendtag(self, tag, attrs):
+        pass  # <br/> style: nothing to close
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                left_open = [f"<{t}> (line {ln})" for t, ln in self.stack[i + 1:] if t not in OPTIONAL_END]
+                if left_open:
+                    self.errors.append(f"</{tag}> on line {self.getpos()[0]} closes unclosed {', '.join(left_open)}")
+                del self.stack[i:]
+                return
+        self.errors.append(f"stray </{tag}> on line {self.getpos()[0]}")
+
+
+def tag_errors(text):
+    checker = TagBalance()
+    checker.feed(text)
+    checker.close()
+    left_open = [f"<{t}> (line {ln})" for t, ln in checker.stack if t not in OPTIONAL_END]
+    if left_open:
+        checker.errors.append(f"never closed: {', '.join(left_open)}")
+    return checker.errors
 problems = []
 pages = 0
 for html in sorted(scan.rglob("*.html")):
@@ -54,8 +99,11 @@ for html in sorted(scan.rglob("*.html")):
     dups = sorted(i for i, c in Counter(ID.findall(body)).items() if c > 1)
     if dups:
         fail(f"duplicate ids: {', '.join(dups)}")
-    if "\u2014" in text:
-        fail(f"{text.count(chr(0x2014))} em dash(es); use ' - ' instead")
+    dashes = text.count("\u2014") + len(re.findall(r"&mdash;|&#8212;|&#x2014;", text, re.I))
+    if dashes:
+        fail(f"{dashes} em dash(es) (character or &mdash; entity); use ' - ' instead")
+    for err in tag_errors(text)[:3]:
+        fail(f"tag structure: {err}")
 
 for p in problems:
     print("ERROR:", p)

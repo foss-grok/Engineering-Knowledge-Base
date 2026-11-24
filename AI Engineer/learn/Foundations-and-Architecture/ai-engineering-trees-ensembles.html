@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Decision Trees, Random Forests &amp; Gradient Boosting | AI Engineering</title>
+  <meta name="description" content="Tree models from zero with real runs: how a decision tree picks a split using Gini impurity worked by hand, why deep trees overfit, bagging and random forests with out-of-bag scores, gradient boosting built by hand on four houses, learning rate and number of trees, feature importance traps, when trees beat linear models and when they do not, pitfalls, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Trees and Ensembles</p>
+  </nav>
+  <h1>Decision Trees, Random Forests &amp; Gradient Boosting</h1>
+  <p>For data in tables (rows and columns, like a spreadsheet), tree models are often the strongest tool you can use. They power fraud checks, credit scores, search ranking, and many Kaggle wins. This page builds them from zero: one tree by hand, then many trees voting (random forests), then many trees fixing each other's mistakes (gradient boosting). It continues from <a href="ai-engineering-classical-ml.html">Classical ML from Zero</a>, and every number comes from a run you can repeat.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#intuition">The Idea: a Game of Twenty Questions</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#gini">Picking a Split: Gini Impurity by Hand</a></li>
+    <li><a href="#grow">Growing the Whole Tree, and When to Stop</a></li>
+    <li><a href="#overfit">Real Run: Deeper Trees Overfit</a></li>
+    <li><a href="#forest">Random Forests: Many Trees Voting</a></li>
+    <li><a href="#boosting">Gradient Boosting, Built by Hand</a></li>
+    <li><a href="#boosting-knobs">Boosting Knobs: Learning Rate, Trees, Depth</a></li>
+    <li><a href="#compare">Real Run: All Models Side by Side</a></li>
+    <li><a href="#importance">Feature Importance and Its Traps</a></li>
+    <li><a href="#when">When to Use Trees (and When Not)</a></li>
+    <li><a href="#code">The Full Recipe in Code</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="intuition">
+    <h2>1. The Idea: a Game of Twenty Questions</h2>
+    <p>Think of a doctor deciding if a patient needs more tests. They might ask: "Is the fever above 39?" If yes: "Has it lasted more than 3 days?" Each answer sends you down one path. At the end of the path is a decision.</p>
+    <p>A <strong>decision tree</strong> is exactly this: a set of yes/no questions about the features, arranged like an upside-down tree.</p>
+    <pre><code>                 hours studied &lt;= 3.5 ?
+                  /                 \
+                yes                  no
+                 |                    |
+             FAIL (4/4)      slept 7+ hours ?   ... and so on</code></pre>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A linear model draws one straight line through the data. A tree cuts the data into boxes, one question at a time, and gives each box its own answer. Boxes can follow odd shapes, like "young AND high income" or "old AND low income", which a single straight line cannot do.</p>
+    </div>
+    <p>The machine's job is to pick <em>which</em> questions to ask, and in which order. It does this greedily: at each step it picks the question that best separates the labels <em>right now</em>, without planning ahead.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Node</strong></td><td>One question in the tree, like "hours &lt;= 3.5?".</td></tr>
+        <tr><td><strong>Root</strong></td><td>The first question, at the top. All rows start here.</td></tr>
+        <tr><td><strong>Leaf</strong></td><td>An end point with no more questions. It holds the answer (a class, or a number).</td></tr>
+        <tr><td><strong>Split</strong></td><td>A question that divides rows into a left group and a right group.</td></tr>
+        <tr><td><strong>Depth</strong></td><td>How many questions you answer on the longest path from root to leaf.</td></tr>
+        <tr><td><strong>Impurity</strong></td><td>How mixed the labels are in a group. A group of only "pass" is pure (impurity 0). Half pass, half fail is the most mixed.</td></tr>
+        <tr><td><strong>Ensemble</strong></td><td>Many models whose answers are combined into one answer.</td></tr>
+        <tr><td><strong>Bagging</strong></td><td>"Bootstrap aggregating": train each model on a random resample of the rows, then average or vote.</td></tr>
+        <tr><td><strong>Boosting</strong></td><td>Train models one after another; each new one focuses on the mistakes left by the ones before.</td></tr>
+        <tr><td><strong>Residual</strong></td><td>The error that is left: true value minus current prediction.</td></tr>
+        <tr><td><strong>Hyperparameter</strong></td><td>A setting you choose before training (like max depth). It is not learned from data.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="gini">
+    <h2>3. Picking a Split: Gini Impurity by Hand</h2>
+    <p>We need a number that says "how mixed is this group?". The most common one is <strong>Gini impurity</strong>:</p>
+    <pre><code>Gini = 1 - (p_pass)^2 - (p_fail)^2</code></pre>
+    <p>Here <code>p_pass</code> is the share of rows in the group that passed. Some values:</p>
+    <table>
+      <thead><tr><th>Group</th><th>p_pass</th><th>Gini</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>4 pass, 0 fail</td><td>1.0</td><td>1 - 1 - 0 = <strong>0</strong></td><td>Pure. Nothing left to learn.</td></tr>
+        <tr><td>3 pass, 1 fail</td><td>0.75</td><td>1 - 0.5625 - 0.0625 = <strong>0.375</strong></td><td>Mostly one class</td></tr>
+        <tr><td>5 pass, 5 fail</td><td>0.5</td><td>1 - 0.25 - 0.25 = <strong>0.5</strong></td><td>Most mixed possible (for 2 classes)</td></tr>
+      </tbody>
+    </table>
+    <p>A split is good if the two groups it makes are <em>purer</em> than the group before. We score a split by the <strong>weighted average</strong> Gini of the two sides (weighted by how many rows land on each side). Lower is better.</p>
+
+    <h3>Worked example: ten students</h3>
+    <p>We want to predict pass (1) or fail (0) from hours studied and whether the student slept 7+ hours.</p>
+    <table>
+      <thead><tr><th>Student</th><th>Hours</th><th>Slept 7+</th><th>Passed</th></tr></thead>
+      <tbody>
+        <tr><td>A</td><td>1</td><td>no</td><td>0</td></tr>
+        <tr><td>B</td><td>2</td><td>yes</td><td>0</td></tr>
+        <tr><td>C</td><td>3</td><td>no</td><td>0</td></tr>
+        <tr><td>D</td><td>4</td><td>yes</td><td>1</td></tr>
+        <tr><td>E</td><td>5</td><td>no</td><td>1</td></tr>
+        <tr><td>F</td><td>6</td><td>yes</td><td>1</td></tr>
+        <tr><td>G</td><td>7</td><td>no</td><td>1</td></tr>
+        <tr><td>H</td><td>8</td><td>yes</td><td>1</td></tr>
+        <tr><td>I</td><td>2</td><td>no</td><td>0</td></tr>
+        <tr><td>J</td><td>6</td><td>no</td><td>0</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Step 1: Gini of the root.</strong> 5 passed, 5 failed, so p = 0.5 and Gini = <strong>0.5</strong>.</p>
+    <p><strong>Step 2: try every possible question.</strong> For a number feature, the tree tries cut points halfway between neighbouring values (1.5, 2.5, 3.5, ...). For a yes/no feature, there is only one question.</p>
+    <p>Take "hours &lt;= 3.5?":</p>
+    <ul>
+      <li>Left (yes): A, B, C, I. All 4 failed. Gini = <strong>0</strong>.</li>
+      <li>Right (no): D, E, F, G, H, J. 5 passed, 1 failed. p = 5/6, Gini = 1 - (5/6)^2 - (1/6)^2 = 1 - 0.694 - 0.028 = <strong>0.278</strong>.</li>
+      <li>Weighted: (4/10) &times; 0 + (6/10) &times; 0.278 = <strong>0.167</strong>.</li>
+    </ul>
+    <p>Doing this for every candidate gives (computed by the script in <a href="#code">section 12</a>):</p>
+    <table>
+      <thead><tr><th>Question</th><th>Left labels</th><th>Right labels</th><th>Weighted Gini</th></tr></thead>
+      <tbody>
+        <tr><td>hours &lt;= 1.5</td><td>0</td><td>0 0 1 1 1 1 1 0 0</td><td>0.444</td></tr>
+        <tr><td>hours &lt;= 2.5</td><td>0 0 0</td><td>0 1 1 1 1 1 0</td><td>0.286</td></tr>
+        <tr><td><strong>hours &lt;= 3.5</strong></td><td>0 0 0 0</td><td>1 1 1 1 1 0</td><td><strong>0.167</strong></td></tr>
+        <tr><td>hours &lt;= 4.5</td><td>0 0 0 1 0</td><td>1 1 1 1 0</td><td>0.320</td></tr>
+        <tr><td>hours &lt;= 5.5</td><td>0 0 0 1 1 0</td><td>1 1 1 0</td><td>0.417</td></tr>
+        <tr><td>hours &lt;= 6.5</td><td>0 0 0 1 1 1 0 0</td><td>1 1</td><td>0.375</td></tr>
+        <tr><td>hours &lt;= 7.5</td><td>0 0 0 1 1 1 1 0 0</td><td>1</td><td>0.444</td></tr>
+        <tr><td>slept 7+ = no</td><td>0 0 1 1 0 0</td><td>0 1 1 1</td><td>0.417</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Step 3: pick the lowest.</strong> "hours &lt;= 3.5" wins with 0.167. The drop from 0.5 to 0.167 (= 0.333) is called the <strong>impurity decrease</strong> or <strong>gain</strong>. That becomes the root question.</p>
+    <p><strong>Step 4: repeat on each side.</strong> The left side is already pure, so it becomes a leaf: "FAIL". The right side (D, E, F, G, H, J) still has one fail (J: 6 hours, did not sleep 7+). The tree now searches again, using only those 6 rows, and keeps going until the leaves are pure or a stopping rule says stop.</p>
+    <div class="callout callout-derivation">
+      <p><strong>Other impurity measures.</strong> <em>Entropy</em> = -p log2(p) - (1-p) log2(1-p) is another choice; it gives almost the same trees. For <strong>regression</strong> (predicting a number), the impurity is the variance of the values in the group, and each leaf predicts the mean of its rows. We use that in <a href="#boosting">section 7</a>.</p>
+    </div>
+  </section>
+
+  <section id="grow">
+    <h2>4. Growing the Whole Tree, and When to Stop</h2>
+    <p>The full algorithm is short:</p>
+    <ol>
+      <li>Start with all training rows at the root.</li>
+      <li>For every feature and every cut point, compute the weighted impurity of the split.</li>
+      <li>Keep the best split. Send rows left or right.</li>
+      <li>Repeat on each child, until a stopping rule is hit.</li>
+      <li>Each leaf predicts the majority class (classification) or the mean value (regression) of its training rows.</li>
+    </ol>
+    <p>If you never stop, the tree keeps splitting until <em>every leaf is pure</em>. Then it gets 100% of the training data right, including the noise and the odd cases. That is <strong>overfitting</strong>: it memorised, it did not learn. The common stopping rules (all are hyperparameters):</p>
+    <table>
+      <thead><tr><th>Setting (scikit-learn name)</th><th>What it does</th><th>Typical values</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_depth</code></td><td>Stop when the path is this many questions long</td><td>3 to 10 for a single tree</td></tr>
+        <tr><td><code>min_samples_leaf</code></td><td>Every leaf must keep at least this many rows</td><td>5 to 50; stops tiny "one odd row" leaves</td></tr>
+        <tr><td><code>min_samples_split</code></td><td>Do not split a node with fewer rows than this</td><td>10 to 100</td></tr>
+        <tr><td><code>ccp_alpha</code></td><td>Pruning: grow fully, then cut back branches that add little</td><td>Tune with cross-validation</td></tr>
+      </tbody>
+    </table>
+    <p>Prediction is fast: a depth-10 tree answers at most 10 questions per row, whatever the size of the training data.</p>
+  </section>
+
+  <section id="overfit">
+    <h2>5. Real Run: Deeper Trees Overfit</h2>
+    <p>We use the Breast Cancer Wisconsin dataset that ships with scikit-learn: 569 tumours, 30 number features measured from a scan image, label malignant (212) or benign (357). It is the same data as in <a href="ai-engineering-classical-ml.html">Classical ML from Zero</a>. We hold out 25% as a test set (143 rows).</p>
+    <table>
+      <thead><tr><th>max_depth</th><th>Leaves</th><th>Train accuracy</th><th>Test accuracy</th></tr></thead>
+      <tbody>
+        <tr><td>1 (one question)</td><td>2</td><td>0.930</td><td>0.888</td></tr>
+        <tr><td>2</td><td>4</td><td>0.932</td><td>0.888</td></tr>
+        <tr><td>3</td><td>8</td><td>0.977</td><td><strong>0.916</strong></td></tr>
+        <tr><td>5</td><td>18</td><td>1.000</td><td>0.902</td></tr>
+        <tr><td>no limit</td><td>18 (stops at depth 5: all leaves pure)</td><td>1.000</td><td>0.902</td></tr>
+      </tbody>
+    </table>
+    <p>Read the table like this: as the tree gets deeper, the train score climbs to a perfect 1.000, but the test score peaks at depth 3 and then falls. A <strong>gap</strong> between train and test is the sign of overfitting. Here is the depth-2 tree scikit-learn learned:</p>
+    <pre><code>|--- worst perimeter &lt;= 106.10
+|   |--- worst concave points &lt;= 0.13  -&gt; benign
+|   |--- worst concave points &gt;  0.13  -&gt; malignant
+|--- worst perimeter &gt;  106.10
+|   |--- worst concave points &lt;= 0.14  -&gt; malignant
+|   |--- worst concave points &gt;  0.14  -&gt; malignant</code></pre>
+    <p>A human can read it: "a big tumour outline, or many concave points, means malignant". That is the great strength of a single small tree.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Careful with small test sets.</strong> With 143 test rows, one row is 0.7 percentage points. So 0.916 vs 0.902 is only 2 rows. Do not trust small gaps from one split. Use cross-validation, as in <a href="#compare">section 9</a>.</p>
+    </div>
+    <p>A single tree has a bigger problem than overfitting: it is <strong>unstable</strong>. Change a few training rows and the root question can change, and then the whole tree below it changes. In ML words, a deep tree has <em>low bias</em> (it can fit any shape) but <em>high variance</em> (it changes a lot with the data). The next two ideas fix this in two different ways.</p>
+  </section>
+
+  <section id="forest">
+    <h2>6. Random Forests: Many Trees Voting</h2>
+    <p>Idea: if one tree is noisy, train many different trees and let them <strong>vote</strong>. Their random mistakes cancel out. The real pattern, which they all see, remains.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Ask one person to guess the number of sweets in a jar, and they may be far off. Ask 300 people and take the average, and you are usually very close. This only works if people make <em>different</em> mistakes. 300 copies of the same person give the same wrong answer.</p>
+    </div>
+    <p>So the trees must be different. A random forest makes them different in two ways:</p>
+    <ol>
+      <li><strong>Bootstrap rows (bagging).</strong> Each tree trains on a sample of N rows drawn <em>with replacement</em> from the N training rows. Some rows appear twice, some not at all. On average a tree sees about 63% of the distinct rows, because the chance a row is never picked is (1 - 1/N)^N, which is about 1/e = 0.37.</li>
+      <li><strong>Random features at each split.</strong> At every node, the tree may only look at a random subset of features. For classification the default is the square root of the feature count: with 30 features, each split picks the best of about 5 random ones. This stops every tree from using the same strong feature at the root.</li>
+    </ol>
+    <pre><code>  training rows ──► sample 1 ──► tree 1 ──┐
+                ──► sample 2 ──► tree 2 ──┤
+                ──►   ...    ──►  ...   ──┼──► vote (or average) ──► prediction
+                ──► sample T ──► tree T ──┘
+  (each tree: deep, no pruning, random feature subset at every split)</code></pre>
+    <p>Each tree is grown deep (it overfits on purpose). The vote removes the variance.</p>
+    <h3>A free validation score: out-of-bag (OOB)</h3>
+    <p>Each tree never saw about 37% of the rows. For each row, we can let only the trees that <em>did not</em> train on it vote. That gives an honest score without a separate validation set. It is called the <strong>out-of-bag score</strong>.</p>
+    <h3>Real run (same split as above)</h3>
+    <table>
+      <thead><tr><th>Trees</th><th>Train accuracy</th><th>Test accuracy</th><th>OOB accuracy</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0.969</td><td>0.881</td><td>-</td></tr>
+        <tr><td>10</td><td>1.000</td><td>0.951</td><td>-</td></tr>
+        <tr><td>100</td><td>0.998</td><td>0.944</td><td>0.960</td></tr>
+        <tr><td>300</td><td>1.000</td><td>0.944</td><td>0.962</td></tr>
+      </tbody>
+    </table>
+    <p>One tree: 0.881 on test. A forest: about 0.95. Train accuracy is near 1.000, but this is <em>not</em> a problem here: the test score did not fall. Adding more trees does not make a random forest overfit more; it only makes the vote more stable. The cost is time and memory. Past a few hundred trees the gain is usually tiny.</p>
+  </section>
+
+  <section id="boosting">
+    <h2>7. Gradient Boosting, Built by Hand</h2>
+    <p>Random forests build trees <em>side by side</em>, independently. Boosting builds them <em>one after another</em>, and each new tree tries to fix what the trees before it got wrong.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A golfer hits the ball toward the hole. It stops short. The next shot does not start from the tee; it starts from where the ball is and only covers the <em>remaining</em> distance. Each tree in boosting is one more shot, aimed at the remaining error (the residual).</p>
+    </div>
+    <p>The recipe for regression with squared error:</p>
+    <ol>
+      <li>Start with a flat guess: the mean of all labels. Call it F.</li>
+      <li>Compute residuals: r = y - F for each row.</li>
+      <li>Fit a small tree (often depth 1 to 6) to predict r from the features.</li>
+      <li>Update: F = F + learning_rate &times; (the tree's prediction).</li>
+      <li>Repeat steps 2 to 4 for T rounds.</li>
+    </ol>
+    <h3>Worked example: four houses</h3>
+    <p>Size x (square metres) and price y (lakhs): (50, 100), (70, 150), (90, 170), (110, 260). Learning rate 0.5. Each tree is a "stump" (depth 1: one question).</p>
+    <p><strong>Round 0.</strong> F = mean(100, 150, 170, 260) = <strong>170</strong> for every house.</p>
+    <p><strong>Round 1.</strong></p>
+    <ul>
+      <li>Residuals: 100 - 170 = -70, 150 - 170 = -20, 170 - 170 = 0, 260 - 170 = 90.</li>
+      <li>Best stump on x (it tries cuts at 60, 80, 100): "x &lt;= 100?". Left leaf = mean(-70, -20, 0) = -30. Right leaf = 90.</li>
+      <li>Update with rate 0.5: houses 1 to 3 get 170 + 0.5 &times; (-30) = 155. House 4 gets 170 + 0.5 &times; 90 = 215.</li>
+      <li>F = [155, 155, 155, 215]. Mean squared error (MSE) = ((-55)^2 + (-5)^2 + 15^2 + 45^2) / 4 = <strong>1325</strong>.</li>
+    </ul>
+    <p><strong>Round 2.</strong></p>
+    <ul>
+      <li>Residuals: -55, -5, 15, 45.</li>
+      <li>Best stump: "x &lt;= 60?". Left = -55. Right = mean(-5, 15, 45) = 18.33.</li>
+      <li>F = [155 - 27.5, 155 + 9.17, 155 + 9.17, 215 + 9.17] = [127.5, 164.17, 164.17, 224.17]. MSE = <strong>568.8</strong>.</li>
+    </ul>
+    <p><strong>Round 3.</strong></p>
+    <ul>
+      <li>Residuals: -27.5, -14.17, 5.83, 35.83.</li>
+      <li>Best stump: "x &lt;= 80?". Left = -20.83, right = 20.83.</li>
+      <li>F = [117.08, 153.75, 174.58, 234.58]. MSE = <strong>243.2</strong>.</li>
+    </ul>
+    <p>The error falls every round: 1325, then 568.8, then 243.2. No single stump could fit four prices, but the <em>sum</em> of small stumps can. That is boosting.</p>
+    <div class="callout callout-derivation">
+      <p><strong>Why "gradient"?</strong> For squared error, loss = (y - F)^2 / 2. Its slope (gradient) with respect to F is -(y - F). So the residual y - F is exactly the <em>negative gradient</em>. Fitting a tree to residuals means taking a step downhill on the loss, like <a href="ai-engineering-classical-ml.html#linear-regression">gradient descent</a>, but each step is a tree instead of a change to a weight. For other losses (log loss for classification, absolute error, ranking losses), you fit the tree to that loss's negative gradient instead. The rest of the recipe is the same.</p>
+    </div>
+    <p>For classification, F is a <em>score</em> (log-odds). The predicted probability is sigmoid(F), just as in <a href="ai-engineering-classical-ml.html#logistic-regression">logistic regression</a>.</p>
+  </section>
+
+  <section id="boosting-knobs">
+    <h2>8. Boosting Knobs: Learning Rate, Trees, Depth</h2>
+    <table>
+      <thead><tr><th>Knob</th><th>What it does</th><th>Rule of thumb</th></tr></thead>
+      <tbody>
+        <tr><td><strong>learning_rate</strong></td><td>How much of each tree's correction to apply. We used 0.5 above; real use is 0.01 to 0.3.</td><td>A smaller rate with more trees is usually better, but slower.</td></tr>
+        <tr><td><strong>n_estimators</strong> (trees)</td><td>Number of rounds.</td><td>Unlike a random forest, too many rounds <em>can</em> overfit. Use <strong>early stopping</strong>: stop when the validation score has not improved for, say, 20 rounds.</td></tr>
+        <tr><td><strong>max_depth</strong> / leaves</td><td>Size of each tree. Depth 1 looks at one feature at a time; depth 3 can learn how 3 features work together.</td><td>3 to 8.</td></tr>
+        <tr><td><strong>subsample</strong></td><td>Train each tree on a random part of the rows.</td><td>0.5 to 0.9 adds randomness and fights overfitting.</td></tr>
+        <tr><td><strong>Regularisation</strong> (L2 penalty on leaf values, minimum rows per leaf)</td><td>Keeps leaf values small and leaves big enough.</td><td>XGBoost and LightGBM expose these.</td></tr>
+      </tbody>
+    </table>
+    <p>Real run on the same split (depth 3 trees):</p>
+    <table>
+      <thead><tr><th>learning_rate</th><th>Trees</th><th>Train accuracy</th><th>Test accuracy</th></tr></thead>
+      <tbody>
+        <tr><td>0.1</td><td>100</td><td>1.000</td><td>0.958</td></tr>
+        <tr><td>0.1</td><td>300</td><td>1.000</td><td>0.944</td></tr>
+        <tr><td>0.05</td><td>300</td><td>1.000</td><td>0.951</td></tr>
+        <tr><td>1.0</td><td>300</td><td>1.000</td><td>0.944</td></tr>
+      </tbody>
+    </table>
+    <p>With learning rate 0.1, going from 100 to 300 trees made the test score slightly worse. That is boosting starting to overfit, which early stopping would catch. (These gaps are only 1 or 2 rows, so treat them as a hint, not proof.)</p>
+    <h3>The popular libraries</h3>
+    <ul>
+      <li><strong>XGBoost</strong>, <strong>LightGBM</strong>, <strong>CatBoost</strong>: fast, well-tested gradient boosting. LightGBM grows trees leaf by leaf and is very fast on big data. CatBoost handles category columns (like city names) well.</li>
+      <li><strong>scikit-learn HistGradientBoosting</strong>: the same ideas, built in. It first puts each feature into at most 255 bins (a histogram), so finding a split means scanning 255 bins instead of every unique value. This is why modern boosting is fast on millions of rows. It also handles missing values by itself.</li>
+    </ul>
+  </section>
+
+  <section id="compare">
+    <h2>9. Real Run: All Models Side by Side</h2>
+    <p>To avoid the "one lucky split" problem, this run uses 5-fold cross-validation repeated 3 times (15 train/validation splits; see <a href="ai-engineering-classical-ml.html#cross-validation">Cross-Validation</a>). The number after &plusmn; is the standard deviation across the 15 splits.</p>
+    <table>
+      <thead><tr><th>Model</th><th>Train accuracy</th><th>Validation accuracy</th></tr></thead>
+      <tbody>
+        <tr><td>Tree, depth 1</td><td>0.926</td><td>0.890 &plusmn; 0.017</td></tr>
+        <tr><td>Tree, depth 3</td><td>0.974</td><td>0.923 &plusmn; 0.019</td></tr>
+        <tr><td>Tree, no limit</td><td>1.000</td><td>0.927 &plusmn; 0.019</td></tr>
+        <tr><td>Random forest, 300 trees</td><td>1.000</td><td>0.960 &plusmn; 0.012</td></tr>
+        <tr><td>Gradient boosting (rate 0.1, 100 trees, depth 3)</td><td>1.000</td><td>0.960 &plusmn; 0.013</td></tr>
+        <tr><td>HistGradientBoosting (defaults)</td><td>1.000</td><td>0.965 &plusmn; 0.009</td></tr>
+        <tr><td>Logistic regression (scaled)</td><td>0.988</td><td><strong>0.975 &plusmn; 0.016</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Three lessons:</p>
+    <ol>
+      <li>Ensembles beat a single tree by about 3 to 4 points. That is the variance fix at work.</li>
+      <li>Forest and boosting are close. On many tabular problems boosting wins by a little after tuning; a forest is harder to get wrong with default settings.</li>
+      <li><strong>The simple linear model wins here.</strong> On this dataset the two classes are separated almost by a straight line, and with only 569 rows, the simplest model that fits has the least variance. Always train a simple baseline first. Trees shine when the pattern has thresholds and combinations ("risky only if new account AND large amount AND night time").</li>
+    </ol>
+  </section>
+
+  <section id="importance">
+    <h2>10. Feature Importance and Its Traps</h2>
+    <p>Tree models can tell you which features they used most. The default in scikit-learn is <strong>impurity-based importance</strong>: add up the impurity decrease of every split that used a feature, over all trees, then scale so all importances sum to 1. The top five in our 300-tree forest:</p>
+    <table>
+      <thead><tr><th>Feature</th><th>Importance</th></tr></thead>
+      <tbody>
+        <tr><td>worst perimeter</td><td>0.145</td></tr>
+        <tr><td>worst radius</td><td>0.134</td></tr>
+        <tr><td>worst concave points</td><td>0.121</td></tr>
+        <tr><td>worst area</td><td>0.101</td></tr>
+        <tr><td>mean concave points</td><td>0.100</td></tr>
+      </tbody>
+    </table>
+    <p>Traps:</p>
+    <ul>
+      <li><strong>Correlated features share the credit.</strong> Perimeter, radius and area all measure tumour size. The forest splits the credit between them, so each looks less important than "size" really is. Drop two of them and the third would jump up.</li>
+      <li><strong>Bias toward many-valued features.</strong> A column like a user ID has many possible cut points and can look important by chance. Impurity importance is computed on training data, so it rewards what the model memorised.</li>
+      <li><strong>Importance is not cause.</strong> It says what the model used, not what changes the outcome in the real world.</li>
+    </ul>
+    <p>A safer choice is <strong>permutation importance</strong>: shuffle one feature's column in the <em>validation</em> set and measure how much the score drops. If the score does not drop, the model did not really need that feature (<code>sklearn.inspection.permutation_importance</code>). For explaining one prediction at a time, SHAP values are the common tool.</p>
+  </section>
+
+  <section id="when">
+    <h2>11. When to Use Trees (and When Not)</h2>
+    <table>
+      <thead><tr><th>Situation</th><th>Good choice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Tabular data, mixed number and category columns, thresholds and combinations</td><td>Gradient boosting (then random forest)</td><td>Strong accuracy with little feature work; no scaling needed</td></tr>
+        <tr><td>Need a rule a human can read and check</td><td>One small tree (depth 2 to 4)</td><td>It is a flowchart</td></tr>
+        <tr><td>Few rows, roughly linear pattern</td><td>Logistic or linear regression</td><td>Least variance, as in section 9</td></tr>
+        <tr><td>Images, audio, free text</td><td>Neural networks (see <a href="ai-engineering-foundations.html">Foundations</a> and <a href="ai-engineering-transformers.html">Transformers</a>)</td><td>Trees cannot learn useful features from raw pixels or words</td></tr>
+        <tr><td>Must predict outside the training range (prices next year are higher than ever before)</td><td>Linear models, or trees on a target with the trend removed</td><td>A leaf is an average of training values, so a tree can never predict above the highest value it has seen</td></tr>
+      </tbody>
+    </table>
+    <p>Nice properties of trees: no need to scale features (a split "x &lt;= 3.5" does not care about units), they handle missing values (modern libraries learn which side missing values should go), and they are fast to predict.</p>
+  </section>
+
+  <section id="code">
+    <h2>12. The Full Recipe in Code</h2>
+    <p>The hand-worked Gini table and boosting rounds above come from this tiny script (plain Python, no libraries):</p>
+    <pre><code class="language-python">data = [(1,0,0),(2,1,0),(3,0,0),(4,1,1),(5,0,1),(6,1,1),(7,0,1),(8,1,1),(2,0,0),(6,0,0)]
+
+def gini(ys):
+    if not ys:
+        return 0
+    p = sum(ys) / len(ys)
+    return 1 - p*p - (1-p)*(1-p)
+
+for t in [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]:
+    left  = [d[2] for d in data if d[0] &lt;= t]
+    right = [d[2] for d in data if d[0] &gt; t]
+    w = len(left)/10 * gini(left) + len(right)/10 * gini(right)
+    print(f"hours &lt;= {t}: weighted gini {w:.3f}")
+
+# gradient boosting with stumps, by hand
+x, y, lr = [50, 70, 90, 110], [100, 150, 170, 260], 0.5
+F = [sum(y) / 4] * 4
+for step in range(3):
+    r = [a - b for a, b in zip(y, F)]
+    best = None
+    for t in [60, 80, 100]:
+        L = [ri for xi, ri in zip(x, r) if xi &lt;= t]
+        R = [ri for xi, ri in zip(x, r) if xi &gt; t]
+        ml, mr = sum(L)/len(L), sum(R)/len(R)
+        sse = sum((v-ml)**2 for v in L) + sum((v-mr)**2 for v in R)
+        if best is None or sse &lt; best[0]:
+            best = (sse, t, ml, mr)
+    _, t, ml, mr = best
+    F = [f + lr * (ml if xi &lt;= t else mr) for f, xi in zip(F, x)]
+    mse = sum((a-b)**2 for a, b in zip(y, F)) / 4
+    print(f"round {step+1}: split x &lt;= {t}, F = {[round(v, 2) for v in F]}, MSE = {mse:.1f}")</code></pre>
+    <p>And the model comparison (scikit-learn 1.9):</p>
+    <pre><code class="language-python">from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import cross_validate, RepeatedStratifiedKFold
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+
+X, y = load_breast_cancer(return_X_y=True)
+cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=0)
+
+models = {
+    "tree depth 3":  DecisionTreeClassifier(max_depth=3, random_state=0),
+    "forest 300":    RandomForestClassifier(n_estimators=300, random_state=0, n_jobs=-1),
+    "hist boosting": HistGradientBoostingClassifier(random_state=0),
+}
+for name, model in models.items():
+    r = cross_validate(model, X, y, cv=cv, return_train_score=True)
+    print(f"{name:14s} train {r['train_score'].mean():.3f}  "
+          f"val {r['test_score'].mean():.3f} +- {r['test_score'].std():.3f}")</code></pre>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Judging a tree by its training score.</strong> An unlimited tree always scores 100% on training data. Only validation or test scores count.</li>
+      <li><strong>Leakage through a too-good feature.</strong> Trees find leaks fast: one split on a leaked column gives a pure leaf. If one feature has a huge importance and the score looks too good, check that the feature exists at prediction time (see <a href="ai-engineering-classical-ml.html#leakage">Data Leakage</a>).</li>
+      <li><strong>Turning categories into numbers like 1, 2, 3.</strong> "City = 1, 2, 3" makes the tree think city 3 is "bigger" than city 1. Use one-hot columns (one yes/no column per city), or a library with built-in category support (LightGBM, CatBoost, or HistGradientBoosting with <code>categorical_features</code>).</li>
+      <li><strong>Boosting without early stopping.</strong> A fixed, huge tree count slowly overfits. Keep a validation set and stop when it stops improving.</li>
+      <li><strong>Tuning on the test set.</strong> Pick hyperparameters with cross-validation. Touch the test set once, at the end.</li>
+      <li><strong>Expecting extrapolation.</strong> A tree predicting house prices will never predict above the most expensive house it saw.</li>
+      <li><strong>Reading impurity importance as truth.</strong> Use permutation importance on validation data, and remember that correlated features split the credit.</li>
+      <li><strong>Huge forests in production.</strong> 1000 deep trees can take hundreds of megabytes and be slow per request. Check model size and latency before you ship.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: Gini of a group</h3>
+    <p>A leaf has 8 rows: 6 "spam" and 2 "not spam". What is its Gini impurity?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>p = 6/8 = 0.75. Gini = 1 - 0.75^2 - 0.25^2 = 1 - 0.5625 - 0.0625 = <strong>0.375</strong>.</p>
+    </details>
+    <h3>Problem 2: compare two splits</h3>
+    <p>A node has 10 rows (5 yes, 5 no). Split A gives left (4 yes, 0 no) and right (1 yes, 5 no). Split B gives left (3 yes, 2 no) and right (2 yes, 3 no). Which split does the tree choose?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Split A: left Gini 0. Right: p = 1/6, Gini = 1 - 0.028 - 0.694 = 0.278. Weighted = 0.4 &times; 0 + 0.6 &times; 0.278 = <strong>0.167</strong>.</p>
+      <p>Split B: each side has p = 0.6 or 0.4, so Gini = 1 - 0.36 - 0.16 = 0.48. Weighted = <strong>0.48</strong>.</p>
+      <p>The tree picks <strong>split A</strong> (lower weighted Gini; gain 0.5 - 0.167 = 0.333).</p>
+    </details>
+    <h3>Problem 3: one boosting round</h3>
+    <p>Three rows have labels 10, 20 and 60. Learning rate 0.1. The first tree predicts the residuals perfectly. What is the prediction for each row after round 1?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Start F = mean = 30. Residuals: -20, -10, 30. The tree predicts exactly these. New F = 30 + 0.1 &times; (-20, -10, 30) = <strong>28, 29, 33</strong>. With a small learning rate, each round only moves a little, so many rounds are needed.</p>
+    </details>
+    <h3>Problem 4: forest or boosting?</h3>
+    <p>Your team has one afternoon, no time to tune, and a tabular dataset of 50,000 rows. Which ensemble would you try first, and why?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>A random forest with default settings (a few hundred trees). More trees do not make it overfit, and it works well untuned. Gradient boosting may score a bit higher, but it needs the learning rate, depth and early stopping set well. Also train a logistic regression baseline: it takes seconds and tells you how much the trees really add.</p>
+    </details>
+    <h3>Problem 5: the suspicious importance</h3>
+    <p>A churn model (will a customer leave?) has 0.99 validation AUC. Its top feature, with importance 0.71, is "days since last support ticket closed". What do you check?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Whether that feature is computed only from data <em>before</em> the prediction time. A common leak: customers who already left get a "close account" ticket, so the feature holds the answer. Recompute it as of the prediction date (a point-in-time value; see <a href="../../../Docker-Kubernetes/learn/DevOps/mlops-tracking-registry-feature-stores.html#point-in-time">point-in-time joins</a>) and train again. If AUC drops a lot, it was leakage.</p>
+    </details>
+    <h3>Problem 6: bootstrap math</h3>
+    <p>With 1,000 training rows, about how many distinct rows does one tree in a random forest see? How many are out-of-bag for that tree?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The chance a row is never picked is (1 - 1/1000)^1000, about 0.368. So about 368 rows are out-of-bag and about <strong>632</strong> distinct rows are used (some more than once, to make 1,000 picks in total).</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://scikit-learn.org/stable/modules/tree.html" rel="noopener noreferrer">scikit-learn: Decision Trees</a> &middot; <a href="https://scikit-learn.org/stable/modules/ensemble.html" rel="noopener noreferrer">scikit-learn: Ensembles (forests and boosting)</a> &middot; <a href="https://scikit-learn.org/stable/modules/permutation_importance.html" rel="noopener noreferrer">scikit-learn: Permutation importance</a> &middot; <a href="https://link.springer.com/article/10.1023/A:1010933404324" rel="noopener noreferrer">Breiman (2001): Random Forests</a> &middot; <a href="https://projecteuclid.org/journals/annals-of-statistics/volume-29/issue-5/Greedy-function-approximation-A-gradient-boosting-machine/10.1214/aos/1013203451.full" rel="noopener noreferrer">Friedman (2001): Greedy Function Approximation (gradient boosting)</a> &middot; <a href="https://xgboost.readthedocs.io/en/stable/tutorials/model.html" rel="noopener noreferrer">XGBoost: Introduction to boosted trees</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Next: <a href="ai-engineering-foundations.html">Foundations (neural networks)</a> &middot; Related: <a href="ai-engineering-classical-ml.html">Classical ML from Zero</a> &middot; <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a> &middot; <a href="../../../Docker-Kubernetes/learn/DevOps/mlops-tracking-registry-feature-stores.html">Experiment Tracking, Model Registry &amp; Feature Stores</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

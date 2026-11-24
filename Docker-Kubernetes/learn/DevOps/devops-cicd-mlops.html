@@ -321,7 +321,7 @@ git revert &lt;commit-sha&gt; &amp;&amp; git push</code></pre>
       <tbody>
         <tr><td><strong>Data versioning</strong></td><td>Know exactly which data trained which model; be able to get it back</td><td>DVC, lakeFS, versioned tables (Delta Lake, Iceberg)</td></tr>
         <tr><td><strong>Experiment tracking</strong></td><td>Record every training run: code version, data version, settings, metrics, files</td><td>MLflow, Weights &amp; Biases</td></tr>
-        <tr><td><strong>Model registry</strong></td><td>A catalogue of trained models with versions and stages (staging, production) and who approved them</td><td>MLflow Model Registry, cloud ML platforms</td></tr>
+        <tr><td><strong>Model registry</strong></td><td>A catalogue of trained models with versions and aliases (like <code>champion</code>; older tools used stages such as staging and production) and who approved them. Deep dive: <a href="mlops-tracking-registry-feature-stores.html">Tracking, Registry &amp; Feature Stores</a></td><td>MLflow Model Registry, cloud ML platforms</td></tr>
         <tr><td><strong>Pipelines</strong></td><td>Training as repeatable automated steps, not a notebook run by hand</td><td>Kubeflow Pipelines, Argo Workflows, Airflow</td></tr>
         <tr><td><strong>Reproducibility</strong></td><td>Same inputs give the same model</td><td>Pinned package versions, fixed random seeds, container images for training</td></tr>
         <tr><td><strong>Continuous training (CT)</strong></td><td>Retrain automatically on a schedule or when drift is detected, then go through the same gate</td><td>Pipelines plus monitoring triggers</td></tr>
@@ -553,7 +553,8 @@ print(psi(m.predict_proba(Xtr)[:, 1], m.predict_proba(Xprod)[:, 1]))</code></pre
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="../Kubernetes/kubernetes-gpu-scheduling.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">GPU Scheduling on Kubernetes</span></a>
-    <p class="prev-next-step">Page 13 of 13 in the suggested reading order</p>
+    <a class="prev-next-next" href="mlops-tracking-registry-feature-stores.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Experiment Tracking, Model Registry &amp; Feature Stores</span></a>
+    <p class="prev-next-step">Page 15 of 16 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

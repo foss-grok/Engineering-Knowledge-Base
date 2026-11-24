@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scheduling: Taints, Affinity, Spreading &amp; Priority | Docker &amp; Kubernetes</title>
+  <meta name="description" content="How Kubernetes decides which node runs each pod, from zero with worked numbers: allocatable vs capacity, the filter and score phases with a scoring example, nodeSelector and node affinity, taints and tolerations including the 5-minute NoExecute timeline after a node dies, pod affinity and anti-affinity, topology spread constraints with skew math, priority and preemption, node-pressure eviction order, reading FailedScheduling messages, validated manifests, pitfalls, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; Scheduling</p>
+  </nav>
+  <h1>Scheduling: Taints, Affinity, Spreading &amp; Priority</h1>
+  <p>Every pod you create must end up on one node. The <strong>scheduler</strong> makes that choice. Most of the time you never think about it, until a pod is stuck in <code>Pending</code>, all three replicas land on the same machine and die together, or a batch job pushes your API off its node. This page explains how the choice is made and every knob that changes it, with numbers you can check by hand. It builds on <a href="kubernetes-architecture.html#control-plane">the scheduler's place in the control plane</a> and on <a href="kubernetes-workloads.html#resources">requests and limits</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#big-picture">The Big Picture</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#allocatable">How Much Room Does a Node Have? Allocatable</a></li>
+    <li><a href="#filter-score">Filter, Then Score: a Worked Example</a></li>
+    <li><a href="#node-affinity">Choosing Nodes: nodeSelector and Node Affinity</a></li>
+    <li><a href="#taints">Keeping Pods Away: Taints and Tolerations</a></li>
+    <li><a href="#pod-affinity">Pods Near or Far from Other Pods</a></li>
+    <li><a href="#spread">Topology Spread Constraints and Skew</a></li>
+    <li><a href="#priority">Priority and Preemption</a></li>
+    <li><a href="#eviction">When a Node Runs Short: Eviction Order</a></li>
+    <li><a href="#pending">Reading a FailedScheduling Message</a></li>
+    <li><a href="#manifests">A Full Example (Validated)</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="big-picture">
+    <h2>1. The Big Picture</h2>
+    <p>The scheduler is a program in the control plane. It watches for pods that have no node yet. For each one it does three things:</p>
+    <pre><code>  new pod (spec.nodeName is empty)
+        │
+        ▼
+  1. FILTER   drop every node that CANNOT run the pod
+              (not enough free CPU/memory, taint not tolerated,
+               affinity rule not met, spread rule broken, ...)
+        │     0 nodes left? ─► pod stays Pending (+ maybe preemption, section 9)
+        ▼
+  2. SCORE    give each remaining node 0-100 per scoring rule,
+              add the weighted scores, pick the highest
+        │
+        ▼
+  3. BIND     write spec.nodeName = chosen node
+        │
+        ▼
+  the kubelet on that node sees the pod and starts its containers</code></pre>
+    <p>The scheduler only <em>chooses</em>. It does not start containers, and it never moves a running pod. If conditions change later (a node fills up, a label changes), running pods stay where they are.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Think of a hotel front desk. First it removes rooms that cannot work (too small, wrong floor, under repair). Then it ranks the rest (quiet side, near the lift) and gives you the best. Once you are in the room, the desk does not move you, even if a better room frees up.</p>
+    </div>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Request</strong></td><td>How much CPU and memory a container says it needs. The scheduler reserves this much on the node.</td></tr>
+        <tr><td><strong>Capacity</strong></td><td>The total CPU and memory of the machine.</td></tr>
+        <tr><td><strong>Allocatable</strong></td><td>The part of capacity that pods may reserve, after the system takes its share.</td></tr>
+        <tr><td><strong>Label</strong></td><td>A key=value tag on an object, like <code>disktype=ssd</code> or <code>topology.kubernetes.io/zone=zone-a</code>.</td></tr>
+        <tr><td><strong>Taint</strong></td><td>A "keep out" mark on a <em>node</em>. Pods are repelled unless they tolerate it.</td></tr>
+        <tr><td><strong>Toleration</strong></td><td>A pass on a <em>pod</em> that lets it ignore a matching taint.</td></tr>
+        <tr><td><strong>Affinity</strong></td><td>A rule that attracts a pod to certain nodes, or to (or away from) other pods.</td></tr>
+        <tr><td><strong>Topology domain</strong></td><td>A group of nodes that share a label value: one zone, one rack, or one node (by hostname).</td></tr>
+        <tr><td><strong>Skew</strong></td><td>How uneven a spread is: pods in the fullest domain minus pods in the emptiest one.</td></tr>
+        <tr><td><strong>Priority</strong></td><td>A number on a pod. Higher-priority pods are scheduled first and may push out lower ones.</td></tr>
+        <tr><td><strong>Preemption</strong></td><td>Removing lower-priority pods from a node to make room for a higher-priority pod.</td></tr>
+        <tr><td><strong>Eviction</strong></td><td>The kubelet (or an API call) stopping a pod and removing it from its node.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="allocatable">
+    <h2>3. How Much Room Does a Node Have? Allocatable</h2>
+    <p>A node with 4 CPUs and 16 GiB of memory does not offer all of it to pods. The operating system, the kubelet and the container runtime need some, and the kubelet keeps a small safety margin for evictions:</p>
+    <pre><code>allocatable = capacity - system-reserved - kube-reserved - eviction threshold</code></pre>
+    <p><strong>Worked example.</strong> Capacity 4 CPU (4000m) and 16 GiB (16384 Mi). Reserved: system 100m CPU and 1 GiB, kube 100m CPU and 1 GiB. Hard eviction threshold: 100 Mi of memory (the default <code>memory.available&lt;100Mi</code>).</p>
+    <ul>
+      <li>CPU: 4000m - 100m - 100m = <strong>3800m</strong>.</li>
+      <li>Memory: 16384 - 1024 - 1024 - 100 = <strong>14236 Mi</strong> (about 13.9 GiB).</li>
+    </ul>
+    <p>See the real values with:</p>
+    <pre><code>kubectl describe node worker-1     # look at "Capacity", "Allocatable", and "Allocated resources"</code></pre>
+    <p>The scheduler checks <strong>requests</strong>, not real use. A pod fits if:</p>
+    <pre><code>sum of requests of pods already on the node + this pod's request &lt;= allocatable</code></pre>
+    <p>So a node can be "full" while its CPUs sit at 10% use, because pods requested far more than they use. And a pod with no requests always "fits", even on a busy node. Managed clouds set the reserved amounts for you, and often reserve more on bigger machines.</p>
+  </section>
+
+  <section id="filter-score">
+    <h2>4. Filter, Then Score: a Worked Example</h2>
+    <p>A new pod requests <code>cpu: 1</code> and <code>memory: 2Gi</code>. Three nodes:</p>
+    <table>
+      <thead><tr><th>Node</th><th>Allocatable</th><th>Already requested</th><th>Free</th></tr></thead>
+      <tbody>
+        <tr><td>A</td><td>4 CPU, 16 Gi</td><td>2 CPU, 4 Gi</td><td>2 CPU, 12 Gi</td></tr>
+        <tr><td>B</td><td>8 CPU, 32 Gi</td><td>6 CPU, 8 Gi</td><td>2 CPU, 24 Gi</td></tr>
+        <tr><td>C</td><td>4 CPU, 8 Gi</td><td>3.5 CPU, 2 Gi</td><td>0.5 CPU, 6 Gi</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Filter.</strong> Node C has only 0.5 CPU free and the pod needs 1. C is removed. A and B pass.</p>
+    <p><strong>Score.</strong> Many scoring plugins run, each giving 0 to 100. The main resource one, by default, is <strong>LeastAllocated</strong>: prefer the node that will have the most room left, as a share of its size. For each resource, after adding the pod:</p>
+    <pre><code>score = (allocatable - requested after placing the pod) / allocatable &times; 100</code></pre>
+    <table>
+      <thead><tr><th>Node</th><th>CPU score</th><th>Memory score</th><th>Average</th></tr></thead>
+      <tbody>
+        <tr><td>A</td><td>(4 - 3) / 4 = 25</td><td>(16 - 6) / 16 = 62.5</td><td><strong>43.75</strong></td></tr>
+        <tr><td>B</td><td>(8 - 7) / 8 = 12.5</td><td>(32 - 10) / 32 = 68.75</td><td>40.6</td></tr>
+      </tbody>
+    </table>
+    <p>Node A wins on this rule. The other scorers (balanced CPU-to-memory use, image already on the node, preferred affinities, spreading) add their own scores with weights, and the total decides. If two nodes tie, one is picked at random.</p>
+    <div class="callout callout-derivation">
+      <p><strong>Spreading vs packing.</strong> LeastAllocated <em>spreads</em> pods out, which is kind to noisy neighbours. The opposite strategy, <strong>MostAllocated</strong>, <em>packs</em> pods tight, so the autoscaler can remove empty nodes and save money. With MostAllocated: A = (75 + 37.5) / 2 = 56.25, B = (87.5 + 31.25) / 2 = 59.4, so B wins. You choose the strategy in the scheduler configuration (managed clouds often expose it as an "optimize utilization" profile).</p>
+    </div>
+    <p>In large clusters the scheduler does not score every node. Once it has found enough feasible nodes (a percentage that shrinks as the cluster grows), it stops looking and scores only those. This keeps scheduling fast.</p>
+  </section>
+
+  <section id="node-affinity">
+    <h2>5. Choosing Nodes: nodeSelector and Node Affinity</h2>
+    <h3>nodeSelector: the simple way</h3>
+    <p>Run only on nodes that have all these labels:</p>
+    <pre><code>spec:
+  nodeSelector:
+    disktype: ssd</code></pre>
+    <h3>Node affinity: the flexible way</h3>
+    <p>Node affinity has two kinds of rules. The long names tell you exactly what they do:</p>
+    <ul>
+      <li><code>requiredDuringSchedulingIgnoredDuringExecution</code>: a <strong>hard</strong> rule. Nodes that fail it are filtered out. "IgnoredDuringExecution" means: if the node's labels change later, the running pod is <em>not</em> removed.</li>
+      <li><code>preferredDuringSchedulingIgnoredDuringExecution</code>: a <strong>soft</strong> rule with a <code>weight</code> from 1 to 100. Matching nodes get extra score; others are still allowed.</li>
+    </ul>
+    <pre><code>affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 80
+      preference:
+        matchExpressions:
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["zone-a"]
+    - weight: 20
+      preference:
+        matchExpressions:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["m6i.xlarge"]</code></pre>
+    <p>Operators: <code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code>, <code>Gt</code>, <code>Lt</code>. Logic: several <code>nodeSelectorTerms</code> are ORed (any one may match); several <code>matchExpressions</code> inside one term are ANDed (all must match).</p>
+    <p><strong>Worked example.</strong> Under the rule above, an amd64 node in zone-a of type m6i.xlarge gets 80 + 20 = 100 preference points. One in zone-a of another type gets 80. One in zone-b of type m6i.xlarge gets 20. An arm64 node is filtered out completely. (The preference points are scaled and added to the other scores, so a strongly preferred node can still lose to one with much more free room.)</p>
+  </section>
+
+  <section id="taints">
+    <h2>6. Keeping Pods Away: Taints and Tolerations</h2>
+    <p>Affinity <em>pulls</em> a pod toward nodes. A taint <em>pushes</em> pods away from a node. Only pods with a matching toleration may stay.</p>
+    <pre><code>kubectl taint nodes gpu-1 dedicated=ml:NoSchedule        # add
+kubectl taint nodes gpu-1 dedicated=ml:NoSchedule-       # remove (note the minus at the end)</code></pre>
+    <p>A taint has a key, an optional value, and an <strong>effect</strong>:</p>
+    <table>
+      <thead><tr><th>Effect</th><th>New pods without a toleration</th><th>Pods already running without a toleration</th></tr></thead>
+      <tbody>
+        <tr><td><code>NoSchedule</code></td><td>Not placed here</td><td>Stay</td></tr>
+        <tr><td><code>PreferNoSchedule</code></td><td>Avoided if possible (soft)</td><td>Stay</td></tr>
+        <tr><td><code>NoExecute</code></td><td>Not placed here</td><td><strong>Evicted</strong> (right away, or after <code>tolerationSeconds</code>)</td></tr>
+      </tbody>
+    </table>
+    <p>The matching toleration on the pod:</p>
+    <pre><code>tolerations:
+- key: dedicated
+  operator: Equal      # key and value must match; "Exists" matches any value
+  value: ml
+  effect: NoSchedule   # leave effect empty to match every effect</code></pre>
+    <div class="callout callout-intuition">
+      <p><strong>A toleration is permission, not attraction.</strong> The pod above <em>may</em> run on gpu-1, but nothing sends it there; it can still land on any normal node. To <em>reserve</em> nodes for a team, use both: a taint (keep others out) and node affinity or a nodeSelector (bring this team in). The <a href="kubernetes-gpu-scheduling.html#placement">GPU Scheduling</a> page uses exactly this pattern.</p>
+    </div>
+    <h3>Taints Kubernetes adds by itself</h3>
+    <ul>
+      <li><code>node-role.kubernetes.io/control-plane:NoSchedule</code> keeps normal pods off control-plane nodes.</li>
+      <li><code>node.kubernetes.io/not-ready</code> and <code>node.kubernetes.io/unreachable</code> with effect <code>NoExecute</code> are added when a node stops being healthy.</li>
+      <li><code>node.kubernetes.io/memory-pressure</code>, <code>disk-pressure</code>, <code>pid-pressure</code> (NoSchedule) are added when the node is short on that resource.</li>
+      <li><code>node.kubernetes.io/unschedulable</code> is added by <code>kubectl cordon</code> or <code>drain</code>.</li>
+    </ul>
+    <h3>Worked timeline: a node dies</h3>
+    <p>Every pod gets two tolerations by default: <code>not-ready</code> and <code>unreachable</code>, each with <code>tolerationSeconds: 300</code>. So when a node's power fails at 10:00:00:</p>
+    <table>
+      <thead><tr><th>Time</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td>10:00:00</td><td>The node stops sending heartbeats.</td></tr>
+        <tr><td>about 10:00:50</td><td>The node controller's grace period (40 to 50 seconds by default, depending on version) runs out. The node is marked <code>NotReady</code> / <code>Unknown</code>, and the <code>unreachable:NoExecute</code> taint is added. Services stop sending traffic to its pods once those pods are marked not ready.</td></tr>
+        <tr><td>about 10:05:50</td><td>The 300-second toleration runs out. The pods are marked for deletion, and their Deployment or ReplicaSet creates replacements on healthy nodes.</td></tr>
+      </tbody>
+    </table>
+    <p>About <strong>6 minutes</strong> with fewer replicas. If that is too long for an app, lower its tolerationSeconds (for example to 30). Too low, and a short network blip causes needless pod churn. StatefulSet pods are special: a replacement with the same name is not created until the old pod is confirmed gone, which needs the node to come back, the node object to be deleted, or a manual force delete.</p>
+  </section>
+
+  <section id="pod-affinity">
+    <h2>7. Pods Near or Far from Other Pods</h2>
+    <p>Pod affinity rules look at <em>other pods</em>, not node labels. Each rule has a <code>topologyKey</code>: the node label that defines "the same place".</p>
+    <table>
+      <thead><tr><th>topologyKey</th><th>"Same place" means</th></tr></thead>
+      <tbody>
+        <tr><td><code>kubernetes.io/hostname</code></td><td>The same node</td></tr>
+        <tr><td><code>topology.kubernetes.io/zone</code></td><td>The same zone (one data centre in a cloud region)</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>podAffinity</strong>: "put me in the same place as pods with label X". Example: put a cache next to the app that calls it, to cut network delay.</li>
+      <li><strong>podAntiAffinity</strong>: "never (or preferably not) in the same place as pods with label X". Example: no two replicas of the API on one node, so one node failure cannot take them all.</li>
+    </ul>
+    <pre><code>affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          app: api
+      topologyKey: kubernetes.io/hostname</code></pre>
+    <p><strong>Worked example: the hard rule trap.</strong> The Deployment has 3 replicas and the rule above. The cluster has 2 nodes. Replica 1 goes to node 1, replica 2 to node 2. Replica 3 has no legal node: it stays <code>Pending</code> forever (or until a third node appears). Worse, during a rolling update with <code>maxSurge: 1</code>, the new pod also needs a node with no <code>app: api</code> pod, so a rollout on a 3-node cluster with 3 replicas gets stuck. For most apps, use the <code>preferred</code> form or, better, a topology spread constraint (next section).</p>
+    <p>Pod affinity is expensive for the scheduler in big clusters, because it must check pods on every node. Use it with care in clusters with thousands of nodes.</p>
+  </section>
+
+  <section id="spread">
+    <h2>8. Topology Spread Constraints and Skew</h2>
+    <p>A spread constraint says: "keep pods with this label <em>evenly</em> spread across these domains, within a tolerance". The tolerance is <code>maxSkew</code>.</p>
+    <pre><code>topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule    # hard; "ScheduleAnyway" makes it a soft preference
+  labelSelector:
+    matchLabels:
+      app: api</code></pre>
+    <p><strong>How the check works.</strong> For each candidate domain, the scheduler asks: if I put the new pod here, would (pods in this domain + 1) - (pods in the emptiest domain) be more than maxSkew? If yes, every node in that domain is filtered out.</p>
+    <p><strong>Worked example.</strong> 3 zones. Existing <code>app: api</code> pods: zone-a 3, zone-b 2, zone-c 1. The minimum is 1 (zone-c). maxSkew = 1.</p>
+    <table>
+      <thead><tr><th>Place new pod in</th><th>Skew if placed</th><th>Allowed?</th></tr></thead>
+      <tbody>
+        <tr><td>zone-a</td><td>(3 + 1) - 1 = 3</td><td>No</td></tr>
+        <tr><td>zone-b</td><td>(2 + 1) - 1 = 2</td><td>No</td></tr>
+        <tr><td>zone-c</td><td>(1 + 1) - 1 = 1</td><td><strong>Yes</strong></td></tr>
+      </tbody>
+    </table>
+    <p>The pod goes to zone-c. Keep adding pods and they fill zones evenly: a, b, c, a, b, c...</p>
+    <p>Useful facts:</p>
+    <ul>
+      <li>You can have two constraints, one per zone and one per node (<code>kubernetes.io/hostname</code>). Both must pass.</li>
+      <li>Only <em>scheduling</em> is checked. When pods are deleted (scale-down, a node dies), the spread can become uneven, and nothing moves pods back. A tool called the <strong>descheduler</strong> can evict pods to rebalance.</li>
+      <li>With <code>DoNotSchedule</code>, if a zone has no free room, pods can go Pending even while other zones have space. That is the rule doing its job: decide whether you prefer "even" or "running".</li>
+      <li>The cluster autoscaler understands these rules and can add a node in the right zone.</li>
+    </ul>
+  </section>
+
+  <section id="priority">
+    <h2>9. Priority and Preemption</h2>
+    <p>Some pods matter more than others. A <strong>PriorityClass</strong> gives pods a number:</p>
+    <pre><code>apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: business-critical
+value: 100000
+globalDefault: false
+description: "Customer-facing APIs"</code></pre>
+    <p>Pods use it with <code>priorityClassName: business-critical</code>. Pods without one get priority 0 (unless a class is marked <code>globalDefault</code>). Built-in classes <code>system-cluster-critical</code> (2000000000) and <code>system-node-critical</code> (2000001000) are for cluster parts like DNS and networking; your own classes may go up to 1000000000.</p>
+    <p>Priority does two things:</p>
+    <ol>
+      <li><strong>Queue order.</strong> Pending pods with higher priority are tried first.</li>
+      <li><strong>Preemption.</strong> If a high-priority pod fits nowhere, the scheduler looks for a node where deleting some <em>lower</em>-priority pods would make room. It picks the node and victims that cause the least damage (lowest priorities, fewest pods, and it tries not to break PodDisruptionBudgets).</li>
+    </ol>
+    <p><strong>Worked example.</strong> One node, 4 CPU allocatable, full with four batch pods (priority 0) of 1 CPU each. An API pod (priority 100000) needs 2 CPU.</p>
+    <ol>
+      <li>Filter: no node fits. Preemption starts.</li>
+      <li>Removing 2 batch pods frees 2 CPU, which is enough. Those 2 are the victims.</li>
+      <li>The victims get their normal graceful shutdown (SIGTERM, then up to <code>terminationGracePeriodSeconds</code>). The API pod's <code>status.nominatedNodeName</code> is set to the node while it waits.</li>
+      <li>When the room is free, the API pod is scheduled there. The 2 batch pods (if owned by a Job or Deployment) are recreated and wait as Pending.</li>
+    </ol>
+    <p>Set <code>preemptionPolicy: Never</code> on a class whose pods should jump the queue but never kick others out. And be careful: if every team marks its pods "critical", priority means nothing.</p>
+  </section>
+
+  <section id="eviction">
+    <h2>10. When a Node Runs Short: Eviction Order</h2>
+    <p>Scheduling uses requests, but pods can <em>use</em> more memory than they request (up to their limit). If many do at once, the node runs low. When free memory drops below the hard threshold (default 100 Mi), the <strong>kubelet</strong> evicts pods until it is back above. It ranks pods by:</p>
+    <ol>
+      <li>Is the pod using <strong>more than its request</strong>? Those go first.</li>
+      <li>Then by <strong>priority</strong>: lower first.</li>
+      <li>Then by <strong>how far above its request</strong> it is: more first.</li>
+    </ol>
+    <p><strong>Worked example.</strong> Three pods on a node under memory pressure, all priority 0:</p>
+    <table>
+      <thead><tr><th>Pod</th><th>Request</th><th>Using</th><th>Above request?</th><th>Eviction order</th></tr></thead>
+      <tbody>
+        <tr><td>api</td><td>1 Gi</td><td>900 Mi</td><td>No</td><td>3rd (last)</td></tr>
+        <tr><td>worker</td><td>512 Mi</td><td>1.5 Gi</td><td>Yes, by about 1 Gi</td><td><strong>1st</strong></td></tr>
+        <tr><td>cron</td><td>none (BestEffort)</td><td>300 Mi</td><td>Yes, by 300 Mi</td><td>2nd</td></tr>
+      </tbody>
+    </table>
+    <p>The lesson: a pod that stays within its memory request is the safest pod on the node. This order is linked to the QoS classes described in <a href="kubernetes-workloads.html#resources">Workloads</a>. Eviction is different from an OOM kill inside the container's own limit; that case is walked through in <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a>.</p>
+  </section>
+
+  <section id="pending">
+    <h2>11. Reading a FailedScheduling Message</h2>
+    <p>When a pod is Pending, <code>kubectl describe pod</code> shows an event that counts, for every node, why it was filtered out:</p>
+    <pre><code>Warning  FailedScheduling  default-scheduler  0/6 nodes are available:
+  1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+  2 Insufficient memory,
+  3 node(s) didn't match pod topology spread constraints.
+  preemption: 0/6 nodes are available: 1 Preemption is not helpful for scheduling,
+  2 No preemption victims found for incoming pod, 3 Preemption is not helpful for scheduling.</code></pre>
+    <p>Read it line by line. The numbers add up to the node count (1 + 2 + 3 = 6):</p>
+    <table>
+      <thead><tr><th>Phrase</th><th>Meaning</th><th>Usual fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>Insufficient cpu</code> / <code>memory</code></td><td>Requests do not fit in what is left of allocatable</td><td>Lower requests if they are too high, add nodes, or check for a typo like <code>memory: 64G</code> instead of <code>64Mi</code></td></tr>
+        <tr><td><code>untolerated taint {key: value}</code></td><td>The node is tainted and the pod has no matching toleration</td><td>Add the toleration, or this pod should not go there</td></tr>
+        <tr><td><code>didn't match Pod's node affinity/selector</code></td><td>No node has the labels you asked for</td><td>Check spelling with <code>kubectl get nodes --show-labels</code></td></tr>
+        <tr><td><code>didn't match pod anti-affinity rules</code></td><td>Every node already has a pod you said to avoid</td><td>More nodes, fewer replicas, or the preferred form</td></tr>
+        <tr><td><code>didn't match pod topology spread constraints</code></td><td>Placing here would break maxSkew</td><td>Room in the emptiest domain, or <code>ScheduleAnyway</code></td></tr>
+        <tr><td><code>had volume node affinity conflict</code></td><td>The pod's disk lives in another zone</td><td>See <a href="kubernetes-storage.html">Storage</a>: use <code>WaitForFirstConsumer</code> binding</td></tr>
+        <tr><td><code>Preemption is not helpful</code></td><td>Even removing lower-priority pods would not help on that node (for example, a taint blocks it)</td><td>Fix the filter reason first</td></tr>
+      </tbody>
+    </table>
+    <p>If there is <em>no</em> FailedScheduling event at all, check that a scheduler is running and that the pod's <code>schedulerName</code> is right, and whether the pod has <code>schedulingGates</code> (a pod with gates waits until another controller removes them). A step-by-step playbook for Pending and every other stuck pod state is on <a href="kubernetes-troubleshooting.html#pending">Debugging Pods</a>.</p>
+  </section>
+
+  <section id="manifests">
+    <h2>12. A Full Example (Validated)</h2>
+    <p>A customer-facing API with 6 replicas: amd64 only, prefers zone-a, spread evenly across zones and across nodes, not too sensitive to brief node failures, and protected by priority. This manifest passes <code>kubeconform -strict</code> against the Kubernetes 1.31 schemas.</p>
+    <pre><code>apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: business-critical
+value: 100000
+globalDefault: false
+description: "Customer-facing APIs"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      priorityClassName: business-critical
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["zone-a"]
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: api
+      tolerations:
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 60
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 60
+      containers:
+      - name: api
+        image: registry.example.com/api:1.4.2
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            memory: 512Mi</code></pre>
+    <p>Notes: the zone rule is hard, the node rule is soft (so a missing node never blocks the rollout). The zone <em>preference</em> (weight 50) and the zone <em>spread</em> pull in different directions; with maxSkew 1 the spread wins, and the preference only breaks ties. Memory request equals the limit, so the pod is never "above its request" in the eviction ranking of section 10.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>No requests at all.</strong> The scheduler thinks the pod needs nothing and may pile many on one node. Those pods are also first in line for eviction.</li>
+      <li><strong>Requests far above real use.</strong> Nodes look full while CPUs idle; you pay for empty machines and new pods go Pending.</li>
+      <li><strong>Toleration without affinity</strong> when you wanted dedicated nodes. The pod may land anywhere.</li>
+      <li><strong>Hard anti-affinity with replicas &gt;= nodes.</strong> Extra replicas, and rollouts, get stuck Pending.</li>
+      <li><strong>Expecting the scheduler to rebalance.</strong> It never moves running pods. Use the descheduler, or restart a rollout.</li>
+      <li><strong>Labels with typos.</strong> <code>topology.kubernetes.io/zone</code> vs <code>failure-domain.beta.kubernetes.io/zone</code> (old, removed). Check real labels with <code>kubectl get nodes -L topology.kubernetes.io/zone</code>.</li>
+      <li><strong>Priority for everyone.</strong> If every pod is "critical", the batch work you wanted to sacrifice is the same priority as the API.</li>
+      <li><strong>Very low tolerationSeconds.</strong> A 10-second network blip then reschedules every pod on the node, which can overload the rest of the cluster.</li>
+      <li><strong>Forgetting DaemonSets in the math.</strong> Logging, monitoring and networking agents run on every node and use part of its allocatable room.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: does it fit?</h3>
+    <p>Node allocatable: 3800m CPU, 14 Gi memory. Pods on it request 2500m and 9 Gi in total. A new pod requests 1500m and 4 Gi. Does it fit?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>CPU: 2500 + 1500 = 4000m &gt; 3800m. <strong>No</strong>, it does not fit, even though memory (13 Gi of 14 Gi) would. The event would say <code>Insufficient cpu</code>.</p>
+    </details>
+    <h3>Problem 2: scoring</h3>
+    <p>A pod requests 2 CPU and 4 Gi. Node X: allocatable 8 CPU / 16 Gi, requested 2 CPU / 8 Gi. Node Y: allocatable 16 CPU / 64 Gi, requested 12 CPU / 16 Gi. Which wins with LeastAllocated?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>X: CPU (8 - 4) / 8 = 50, memory (16 - 12) / 16 = 25, average <strong>37.5</strong>. Y: CPU (16 - 14) / 16 = 12.5, memory (64 - 20) / 64 = 68.75, average <strong>40.6</strong>. Y wins on this rule (the balanced-allocation scorer, which prefers similar CPU and memory use, would push back toward X; the final total depends on all scorers).</p>
+    </details>
+    <h3>Problem 3: skew</h3>
+    <p>Zones hold 4, 4 and 2 pods of an app with maxSkew 1 on zones. Where can the next pod go? And the one after that?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Minimum is 2. Zone 1: 5 - 2 = 3 (no). Zone 2: 3 (no). Zone 3: 3 - 2 = 1 (yes). Next pod goes to <strong>zone 3</strong>, making 4, 4, 3. The one after: minimum is 3; zone 1 or 2 gives 5 - 3 = 2 (no); zone 3 gives 4 - 3 = 1 (yes). Also <strong>zone 3</strong>, making 4, 4, 4.</p>
+    </details>
+    <h3>Problem 4: how long without the pods?</h3>
+    <p>A node loses power. The grace period before it is marked unhealthy is 50 seconds. Your pods have <code>tolerationSeconds: 60</code> for unreachable. Roughly when are replacements created?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>About 50 + 60 = <strong>110 seconds</strong> after the power loss, instead of about 350 seconds with the default 300.</p>
+    </details>
+    <h3>Problem 5: who is evicted?</h3>
+    <p>Memory pressure on a node. Pod P1: priority 1000, request 1 Gi, using 2 Gi. Pod P2: priority 0, request 2 Gi, using 1.8 Gi. Pod P3: priority 0, request 256 Mi, using 512 Mi. In what order are they evicted?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Step 1, above request: P1 (yes) and P3 (yes) come before P2 (no). Step 2, priority among P1 and P3: P3 (0) before P1 (1000). Order: <strong>P3, then P1, then P2</strong>. P1 uses the most above its request, but its higher priority protects it.</p>
+    </details>
+    <h3>Problem 6: the stuck rollout</h3>
+    <p>A 3-node cluster runs 3 replicas with required pod anti-affinity on hostname. The Deployment uses <code>maxSurge: 1, maxUnavailable: 0</code>. A rollout never finishes. Why, and what are two fixes?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The surge pod needs a node with no <code>app</code> pod, but all 3 nodes have one, and maxUnavailable 0 means no old pod may be removed first. Fixes: set <code>maxUnavailable: 1, maxSurge: 0</code> (remove one old pod before adding a new one), or replace the hard rule with a topology spread on hostname using <code>ScheduleAnyway</code>, or the <code>preferred</code> anti-affinity form. (Adding a 4th node also works.)</p>
+    </details>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Goal</th><th>Tool</th></tr></thead>
+      <tbody>
+        <tr><td>Only on nodes with label X</td><td><code>nodeSelector</code> or required node affinity</td></tr>
+        <tr><td>Prefer nodes with label X</td><td>Preferred node affinity with a weight</td></tr>
+        <tr><td>Keep everyone else off some nodes</td><td>Taint the nodes; tolerate in your pods; add affinity to attract</td></tr>
+        <tr><td>Replicas on different nodes or zones</td><td><code>topologySpreadConstraints</code> (or preferred anti-affinity)</td></tr>
+        <tr><td>Two services on the same node</td><td>Pod affinity on <code>kubernetes.io/hostname</code></td></tr>
+        <tr><td>Important pods win when the cluster is full</td><td>PriorityClass (preemption)</td></tr>
+        <tr><td>Faster failover from dead nodes</td><td>Lower <code>tolerationSeconds</code> for not-ready / unreachable</td></tr>
+        <tr><td>Safe from node-pressure eviction</td><td>Stay within requests; set memory request = limit</td></tr>
+      </tbody>
+    </table>
+    <pre><code>kubectl describe node &lt;node&gt;                       # Allocatable, Allocated resources, Taints
+kubectl get nodes -L topology.kubernetes.io/zone,kubernetes.io/arch
+kubectl taint nodes &lt;node&gt; key=value:NoSchedule    # add; append "-" to remove
+kubectl get pods --field-selector=status.phase=Pending
+kubectl describe pod &lt;pod&gt; | sed -n '/Events/,$p'   # FailedScheduling reasons
+kubectl get pod &lt;pod&gt; -o wide                       # which node it landed on
+kubectl get priorityclass
+kubectl cordon &lt;node&gt;; kubectl drain &lt;node&gt; --ignore-daemonsets</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/" rel="noopener noreferrer">Kubernetes scheduler</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/resource-bin-packing/" rel="noopener noreferrer">Resource bin packing</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/" rel="noopener noreferrer">Assigning pods to nodes</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/" rel="noopener noreferrer">Taints and tolerations</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/" rel="noopener noreferrer">Topology spread constraints</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/" rel="noopener noreferrer">Pod priority and preemption</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" rel="noopener noreferrer">Node-pressure eviction</a> &middot; <a href="https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/" rel="noopener noreferrer">Reserve compute resources</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="kubernetes-workloads.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Kubernetes Workloads</span></a>
+    <a class="prev-next-next" href="kubernetes-autoscaling-probes-rollouts.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Autoscaling, Probes &amp; Rollouts</span></a>
+    <p class="prev-next-step">Page 7 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="kubernetes-workloads.html">Kubernetes Workloads</a> &middot; <a href="kubernetes-autoscaling-probes-rollouts.html">Autoscaling, Probes &amp; Rollouts</a> &middot; <a href="kubernetes-gpu-scheduling.html">GPU Scheduling</a> &middot; <a href="kubernetes-troubleshooting.html">Debugging Pods</a> &middot; <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-processes-threads-scheduling.html">OS: Processes, Threads &amp; CPU Scheduling</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

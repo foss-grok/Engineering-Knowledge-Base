@@ -53,8 +53,8 @@ Open [http://localhost:8080](http://localhost:8080).
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`AI Engineer/ai-engineering.html`](AI%20Engineer/ai-engineering.html) | 1 |
-| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 31 |
-| Interview | [`AI Engineer/interview/`](AI%20Engineer/interview/) | 23 |
+| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 33 |
+| Interview | [`AI Engineer/interview/`](AI%20Engineer/interview/) | 24 |
 | Research | [`AI Engineer/research/`](AI%20Engineer/research/) | 2 |
 
 Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and-Retrieval/`).
@@ -67,6 +67,29 @@ Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and
 | Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 20 |
 
 Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`. Pages in the suggested reading order have Previous / Next links, written by `scripts/update-prev-next.py`.
+
+### Docker & Kubernetes
+
+| Track | Path | Pages |
+|-------|------|------:|
+| Hub | [`Docker-Kubernetes/docker-kubernetes.html`](Docker-Kubernetes/docker-kubernetes.html) | 1 |
+| Learn | [`Docker-Kubernetes/learn/`](Docker-Kubernetes/learn/) | 16 |
+| Interview | [`Docker-Kubernetes/interview/`](Docker-Kubernetes/interview/) | 9 |
+| Cheat sheets | [`Docker-Kubernetes/cheatsheets/`](Docker-Kubernetes/cheatsheets/) | 3 |
+
+Docker, Kubernetes (architecture, workloads, scheduling, autoscaling, networking, storage, security, observability, GPUs, debugging broken pods), and DevOps/MLOps (`DevOps/`). The learn pages have a suggested reading order with Previous / Next links.
+
+### Graph Machine Learning
+
+| Track | Path | Pages |
+|-------|------|------:|
+| Hub | [`Graph ML/graph-ml.html`](Graph%20ML/graph-ml.html) | 1 |
+| Learn | [`Graph ML/learn/`](Graph%20ML/learn/) | 13 |
+| Interview | [`Graph ML/interview/`](Graph%20ML/interview/) | 10 |
+| Formulas | [`Graph ML/formulas/`](Graph%20ML/formulas/) | 1 |
+| Papers hub | [`Graph ML/research/`](Graph%20ML/research/) | 1 |
+
+Page counts exclude each track's own hub page (for example `learn/docker-kubernetes-learn.html`).
 
 ## Project structure
 
@@ -86,6 +109,7 @@ Engineering-Knowledge-Base/
 │   ├── build-search-index.py   # Search index builder (Python 3, no dependencies)
 │   ├── build-search-index.ps1  # Wrapper that calls the Python builder
 │   ├── check-links.py          # Internal link and #anchor checker; also fails if a learn page is missing from its learn hub
+│   ├── check-pages.py          # Page basics: one title and h1, meta description, viewport, unique ids, no em dashes, balanced tags
 │   └── update-prev-next.py     # Previous / Next links along a track's reading order
 └── AI Engineer/
     ├── ai-engineering.html
@@ -124,7 +148,7 @@ python3 scripts/update-prev-next.py
 
 The script rewrites the block between `<!-- prev-next:start -->` and `<!-- prev-next:end -->` on every page in the order, so running it again is safe.
 
-## Checking links
+## Checking links and pages
 
 ```bash
 python3 scripts/check-links.py            # whole site; exits 1 if any internal link or #anchor is broken,
@@ -132,7 +156,12 @@ python3 scripts/check-links.py            # whole site; exits 1 if any internal 
 python3 scripts/check-links.py AI\ Engineer   # one folder
 ```
 
-Both checks also run automatically on every pull request (`.github/workflows/site-checks.yml`).
+```bash
+python3 scripts/check-pages.py            # every page: title, description, viewport, one <h1>, unique ids,
+                                          # no em dashes, and balanced tags (a raw "<" in math breaks a page)
+```
+
+All of these checks, plus `update-prev-next.py --check` and a stale search index check, run automatically on every pull request (`.github/workflows/site-checks.yml`).
 
 ## Contributing
 
