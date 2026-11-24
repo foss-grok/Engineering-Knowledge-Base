@@ -125,7 +125,7 @@ $ kubectl logs cuda-smoke-test       # nvidia-smi table showing exactly ONE GPU<
   <section id="placement">
     <h2>5. Putting GPU Pods on the Right Nodes</h2>
     <h3>Keep non-GPU pods off GPU nodes: taints</h3>
-    <p>If ordinary pods land on a GPU node, they can use up its CPU or memory and block GPU pods from fitting. So GPU nodes are usually <strong>tainted</strong>, and only GPU workloads <strong>tolerate</strong> the taint. Several managed clouds add a taint like <code>nvidia.com/gpu=present:NoSchedule</code> automatically, and the <code>ExtendedResourceToleration</code> admission plugin can add the matching toleration to any pod that requests GPUs.</p>
+    <p>If ordinary pods land on a GPU node, they can use up its CPU or memory and block GPU pods from fitting. So GPU nodes are usually <strong>tainted</strong>, and only GPU workloads <strong>tolerate</strong> the taint. Several managed clouds add a taint like <code>nvidia.com/gpu=present:NoSchedule</code> automatically, and the <code>ExtendedResourceToleration</code> admission plugin can add the matching toleration to any pod that requests GPUs. (Taints, tolerations and affinity in general, with worked examples, are on the <a href="kubernetes-scheduling.html#taints">Scheduling</a> page.)</p>
     <pre><code>kubectl taint nodes gpu-node-1 nvidia.com/gpu=present:NoSchedule</code></pre>
     <h3>Pick the GPU model: node affinity on GFD labels</h3>
     <pre><code>apiVersion: v1
@@ -383,9 +383,9 @@ kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset</code></pre>
 
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
-    <a class="prev-next-prev" href="kubernetes-helm-observability.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Helm &amp; Observability</span></a>
+    <a class="prev-next-prev" href="kubernetes-troubleshooting.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Debugging Pods: Pending, CrashLoopBackOff, ImagePullBackOff</span></a>
     <a class="prev-next-next" href="../DevOps/devops-cicd-mlops.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">CI/CD and MLOps on Kubernetes</span></a>
-    <p class="prev-next-step">Page 12 of 13 in the suggested reading order</p>
+    <p class="prev-next-step">Page 14 of 16 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

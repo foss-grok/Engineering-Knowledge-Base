@@ -41,7 +41,7 @@
     <h3>1.2 Queries, keys, and values</h3>
     <p>Each token's hidden vector \(x_i \in \mathbb{R}^d\) is linearly projected into three different vectors using learned weight matrices \(W_Q, W_K, W_V\):</p>
     <p>\[ q_i = x_i W_Q, \qquad k_i = x_i W_K, \qquad v_i = x_i W_V \]</p>
-    <p>Intuitively: the <strong>query</strong> represents "what this token is looking for," the <strong>key</strong> represents "what this token has to offer / how it advertises itself," and the <strong>value</strong> represents "the actual content this token will contribute if attended to." Relevance between token \(i\) (asking) and token \(j\) (being looked at) is computed as the dot product \(q_i \cdot k_j\) &mdash; a similarity score between what \(i\) wants and what \(j\) offers.</p>
+    <p>Intuitively: the <strong>query</strong> represents "what this token is looking for," the <strong>key</strong> represents "what this token has to offer / how it advertises itself," and the <strong>value</strong> represents "the actual content this token will contribute if attended to." Relevance between token \(i\) (asking) and token \(j\) (being looked at) is computed as the dot product \(q_i \cdot k_j\) - a similarity score between what \(i\) wants and what \(j\) offers.</p>
 
     <h3>1.3 Scaled dot-product attention, step by step</h3>
     <p>Stacking every token's queries, keys, and values into matrices \(Q, K, V \in \mathbb{R}^{n \times d_k}\) (for a sequence of length \(n\)), attention is computed for the whole sequence at once:</p>
@@ -51,7 +51,7 @@
       <li><strong>Similarity scores:</strong> \(QK^\top\) computes the dot product between every query and every key, producing an \(n \times n\) matrix of raw relevance scores.</li>
       <li><strong>Scaling:</strong> divide by \(\sqrt{d_k}\), where \(d_k\) is the dimensionality of each key vector. Without scaling, dot products grow large in magnitude as \(d_k\) grows (since they're a sum of \(d_k\) terms), which pushes the softmax into regions with extremely small gradients (saturation). Scaling by \(\sqrt{d_k}\) keeps the variance of the scores roughly constant regardless of dimensionality.</li>
       <li><strong>Softmax:</strong> convert each row of scores into a probability distribution that sums to 1: \(\text{softmax}(s)_j = \dfrac{e^{s_j}}{\sum_{l} e^{s_l}}\). Each token now has a weight for every other token, representing "how much attention to pay."</li>
-      <li><strong>Weighted sum:</strong> multiply these attention weights by \(V\), producing, for every token, a new representation that is a weighted blend of all tokens' value vectors &mdash; dominated by whichever tokens had high relevance.</li>
+      <li><strong>Weighted sum:</strong> multiply these attention weights by \(V\), producing, for every token, a new representation that is a weighted blend of all tokens' value vectors - dominated by whichever tokens had high relevance.</li>
     </ol>
     <pre><code>Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) * V</code></pre>
 
@@ -70,7 +70,7 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     <h3>1.4 Multi-head attention</h3>
     <p>Instead of computing attention once with the full hidden dimension \(d\), the model splits \(Q, K, V\) into \(h\) smaller "heads," each of dimension \(d_k = d/h\), runs scaled dot-product attention independently and in parallel within each head, and concatenates the results back together before a final linear projection:</p>
     <p>\[ \text{MultiHead}(Q,K,V) = \text{Concat}(\text{head}_1, \dots, \text{head}_h)W_O, \qquad \text{head}_i = \text{Attention}(QW_Q^{(i)}, KW_K^{(i)}, VW_V^{(i)}) \]</p>
-    <p>Each head can specialize in a different type of relationship &mdash; one head might learn to track subject-verb agreement, another might track coreference (like the "it" example above), another might track positional adjacency. This gives the model multiple independent "views" of the sequence's relationships at every layer, at roughly the same total compute cost as one large attention operation.</p>
+    <p>Each head can specialize in a different type of relationship - one head might learn to track subject-verb agreement, another might track coreference (like the "it" example above), another might track positional adjacency. This gives the model multiple independent "views" of the sequence's relationships at every layer, at roughly the same total compute cost as one large attention operation.</p>
   </section>
 
   <section>
@@ -91,7 +91,7 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
   <section>
     <h2>3. Positional Information</h2>
     <h3>3.1 Why position must be injected explicitly</h3>
-    <p>Attention as defined above is <strong>permutation-invariant</strong>: if you shuffled the input tokens, the set of pairwise dot products would be the same, just rearranged &mdash; the mechanism has no innate sense of word order. But word order carries meaning ("dog bites man" vs "man bites dog"), so models must inject positional information explicitly.</p>
+    <p>Attention as defined above is <strong>permutation-invariant</strong>: if you shuffled the input tokens, the set of pairwise dot products would be the same, just rearranged - the mechanism has no innate sense of word order. But word order carries meaning ("dog bites man" vs "man bites dog"), so models must inject positional information explicitly.</p>
     <h3>3.2 Approaches</h3>
     <ul>
       <li><strong>Absolute positional embeddings</strong>: learn (or fix via sinusoids) a separate vector for each position \(1, 2, 3, \dots\) and add it to the token embedding before the first layer (early GPT, BERT). Simple, but generalizes poorly beyond the maximum length seen during training, and treats position as an absolute property rather than encoding useful relative distance information directly inside attention.</li>
@@ -104,7 +104,7 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
   <section>
     <h2>4. Efficiency Variants</h2>
     <h3>4.1 Grouped-query and multi-query attention</h3>
-    <p>Standard multi-head attention (MHA) uses a completely separate set of K and V projections for every one of the \(h\) heads. At inference time, autoregressive generation caches all past keys and values (the <strong>KV cache</strong>, see Section 5) so they don't need to be recomputed at every new token step &mdash; but storing a separate K/V per head for every layer and every token consumes a large amount of GPU memory, which directly limits batch size and context length.</p>
+    <p>Standard multi-head attention (MHA) uses a completely separate set of K and V projections for every one of the \(h\) heads. At inference time, autoregressive generation caches all past keys and values (the <strong>KV cache</strong>, see Section 5) so they don't need to be recomputed at every new token step - but storing a separate K/V per head for every layer and every token consumes a large amount of GPU memory, which directly limits batch size and context length.</p>
     <ul>
       <li><strong>Multi-query attention (MQA)</strong> shares a <em>single</em> K/V head across all query heads, cutting KV cache memory by roughly a factor of \(h\) (the number of heads), at some cost to model quality since all heads now attend using the same keys/values.</li>
       <li><strong>Grouped-query attention (GQA)</strong> is a middle ground: heads are split into a small number of groups, and each group shares one K/V head. This recovers most of MQA's memory savings while retaining more of MHA's quality, and is the choice used in production LLMs like LLaMA 2/3 and Mistral.</li>
@@ -119,24 +119,24 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
   <section>
     <h2>5. Causal Masking and Autoregressive Decoding</h2>
     <h3>5.1 Causal masking</h3>
-    <p>Decoder-only LLMs must respect the fact that during generation, position \(i\) can only ever have seen positions \(1, \dots, i\) &mdash; it hasn't been told the future yet. To enforce this even during parallel training (where the whole sequence is available at once), a <strong>causal mask</strong> sets attention scores for any \(j > i\) to \(-\infty\) before the softmax, so those positions receive exactly zero attention weight:</p>
+    <p>Decoder-only LLMs must respect the fact that during generation, position \(i\) can only ever have seen positions \(1, \dots, i\) - it hasn't been told the future yet. To enforce this even during parallel training (where the whole sequence is available at once), a <strong>causal mask</strong> sets attention scores for any \(j > i\) to \(-\infty\) before the softmax, so those positions receive exactly zero attention weight:</p>
     <p>\[ \text{scores}_{ij} = \begin{cases} q_i \cdot k_j / \sqrt{d_k} & j \le i \\ -\infty & j > i \end{cases} \]</p>
     <p>This forces the model to learn genuinely left-to-right, autoregressive next-token prediction, matching how it will actually be used at inference time.</p>
 
     <h3>5.2 The KV cache</h3>
-    <p>At inference, tokens are generated one at a time: predict the next token, append it to the sequence, repeat. Naively, this would mean recomputing attention over the entire growing sequence from scratch at every single step &mdash; wasteful, since the keys and values for all previously-generated tokens never change once computed. Instead, systems cache the \(K\) and \(V\) vectors computed for every past token (the <strong>KV cache</strong>) and, at each new step, only compute \(Q, K, V\) for the newest token, attending it against the cached keys/values from all previous positions. This turns each generation step from \(O(n^2)\) (recomputing full attention) into roughly \(O(n)\) work relative to sequence length, at the cost of memory proportional to sequence length \(\times\) number of layers \(\times\) number of KV heads \(\times\) head dimension &mdash; which is exactly why MQA/GQA (Section 4.1) matter so much for serving long contexts efficiently.</p>
+    <p>At inference, tokens are generated one at a time: predict the next token, append it to the sequence, repeat. Naively, this would mean recomputing attention over the entire growing sequence from scratch at every single step - wasteful, since the keys and values for all previously-generated tokens never change once computed. Instead, systems cache the \(K\) and \(V\) vectors computed for every past token (the <strong>KV cache</strong>) and, at each new step, only compute \(Q, K, V\) for the newest token, attending it against the cached keys/values from all previous positions. This turns each generation step from \(O(n^2)\) (recomputing full attention) into roughly \(O(n)\) work relative to sequence length, at the cost of memory proportional to sequence length \(\times\) number of layers \(\times\) number of KV heads \(\times\) head dimension - which is exactly why MQA/GQA (Section 4.1) matter so much for serving long contexts efficiently.</p>
   </section>
 
   <section>
     <h2>6. Scaling and Design Tradeoffs</h2>
     <p>Transformer quality improves predictably with more parameters, data, and compute, following empirical <strong>scaling laws</strong> (see the <a href="../../learn/Foundations-and-Architecture/ai-engineering-llms.html">LLMs</a> page for the Chinchilla relationship in detail). Within a fixed compute and memory budget, engineers make several architecture tradeoffs:</p>
     <ul>
-      <li><strong>More layers vs wider hidden dimensions</strong> &mdash; depth tends to help compositional/hierarchical reasoning, width increases per-layer representational capacity; empirically there are compute-optimal ratios that most model families converge toward.</li>
-      <li><strong>Dense FFN vs MoE routing</strong> &mdash; MoE trades training/serving complexity for a better capacity-to-inference-FLOPs ratio.</li>
-      <li><strong>Full MHA vs GQA</strong> &mdash; trades a small amount of quality for large inference memory and latency savings, essential for long-context serving at scale.</li>
-      <li><strong>Context length vs quadratic attention cost</strong> &mdash; naive attention is \(O(n^2)\) in sequence length \(n\) (every token attends to every other token), so doubling context roughly quadruples raw attention compute (though FFN cost only scales linearly), making long-context support an active systems engineering problem, not just an architecture choice.</li>
+      <li><strong>More layers vs wider hidden dimensions</strong> - depth tends to help compositional/hierarchical reasoning, width increases per-layer representational capacity; empirically there are compute-optimal ratios that most model families converge toward.</li>
+      <li><strong>Dense FFN vs MoE routing</strong> - MoE trades training/serving complexity for a better capacity-to-inference-FLOPs ratio.</li>
+      <li><strong>Full MHA vs GQA</strong> - trades a small amount of quality for large inference memory and latency savings, essential for long-context serving at scale.</li>
+      <li><strong>Context length vs quadratic attention cost</strong> - naive attention is \(O(n^2)\) in sequence length \(n\) (every token attends to every other token), so doubling context roughly quadruples raw attention compute (though FFN cost only scales linearly), making long-context support an active systems engineering problem, not just an architecture choice.</li>
     </ul>
-    <p><strong>FlashAttention</strong> and other IO-aware attention kernels reduce memory-bandwidth bottlenecks (they avoid materializing the full \(n \times n\) attention matrix in slow GPU memory, computing softmax in fused, tiled blocks instead) without changing the mathematical definition of attention itself &mdash; they are a systems-level optimization, not an algorithmic approximation, which is why they've become close to universal in production training and inference stacks.</p>
+    <p><strong>FlashAttention</strong> and other IO-aware attention kernels reduce memory-bandwidth bottlenecks (they avoid materializing the full \(n \times n\) attention matrix in slow GPU memory, computing softmax in fused, tiled blocks instead) without changing the mathematical definition of attention itself - they are a systems-level optimization, not an algorithmic approximation, which is why they've become close to universal in production training and inference stacks.</p>
   </section>
 
   <section>

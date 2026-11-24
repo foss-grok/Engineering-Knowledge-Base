@@ -464,7 +464,7 @@ kubectl top pods -n production</code></pre>
 
   <section id="resources">
     <h2>9. Resource Requests &amp; Limits</h2>
-    <p>Every container should declare <strong>requests</strong> (used for scheduling) and <strong>limits</strong> (maximum allowed). Without requests, the scheduler cannot place Pods intelligently; without limits, one Pod can starve others.</p>
+    <p>Every container should declare <strong>requests</strong> (used for scheduling) and <strong>limits</strong> (maximum allowed). Without requests, the scheduler cannot place Pods intelligently; without limits, one Pod can starve others. How the scheduler uses requests to pick a node, step by step, is shown in <a href="kubernetes-scheduling.html#filter-score">Scheduling</a>.</p>
     <table>
       <thead><tr><th>Field</th><th>Effect</th></tr></thead>
       <tbody>
@@ -561,8 +561,8 @@ spec:
     <!-- prev-next:start -->
     <nav class="prev-next" aria-label="Reading order">
       <a class="prev-next-prev" href="kubernetes-architecture.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Kubernetes Architecture</span></a>
-      <a class="prev-next-next" href="kubernetes-autoscaling-probes-rollouts.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Autoscaling, Probes &amp; Rollouts</span></a>
-      <p class="prev-next-step">Page 6 of 13 in the suggested reading order</p>
+      <a class="prev-next-next" href="kubernetes-scheduling.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Scheduling: Taints, Affinity, Spreading &amp; Priority</span></a>
+      <p class="prev-next-step">Page 6 of 16 in the suggested reading order</p>
     </nav>
     <!-- prev-next:end -->
 

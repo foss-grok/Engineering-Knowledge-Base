@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Decoding &amp; Sampling: How an LLM Picks Each Token | AI Engineering</title>
+  <meta name="description" content="How a language model turns scores into words, from zero with worked numbers: logits and softmax by hand, greedy decoding, temperature with 10,000 real draws, top-k, top-p and min-p on the same example, repetition, frequency and presence penalties, beam search, the order a real sampler applies them, why temperature 0 is not always repeatable, structured outputs and constrained decoding with token masks, stop conditions, a runnable sampler, settings per task, pitfalls, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Decoding and Sampling</p>
+  </nav>
+  <h1>Decoding &amp; Sampling: How an LLM Picks Each Token</h1>
+  <p>A language model does not output text. At each step it outputs a <em>score for every token</em> in its vocabulary. Something else must turn those scores into one chosen token, again and again. That "something" is the <strong>decoder</strong> (or <strong>sampler</strong>), and its settings (temperature, top-p, penalties, JSON schemas) change answers as much as a better prompt does. This page works through each setting with real numbers, so you can predict what a change will do before you make it.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#loop">The Generation Loop</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#softmax">From Logits to Probabilities, by Hand</a></li>
+    <li><a href="#greedy">Greedy Decoding</a></li>
+    <li><a href="#temperature">Temperature</a></li>
+    <li><a href="#truncation">Top-k, Top-p and Min-p</a></li>
+    <li><a href="#penalties">Repetition, Frequency and Presence Penalties</a></li>
+    <li><a href="#beam">Beam Search</a></li>
+    <li><a href="#order">The Order a Real Sampler Uses</a></li>
+    <li><a href="#determinism">Seeds, and Why Temperature 0 Can Still Change</a></li>
+    <li><a href="#structured">Structured Outputs and Constrained Decoding</a></li>
+    <li><a href="#stopping">When Generation Stops</a></li>
+    <li><a href="#settings">Choosing Settings per Task</a></li>
+    <li><a href="#code">A Complete Sampler in 30 Lines</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="loop">
+    <h2>1. The Generation Loop</h2>
+    <p>Generation is a loop. Each turn of the loop adds exactly one token.</p>
+    <pre><code>  prompt tokens ─► model ─► one score (logit) per vocabulary token   e.g. 128,000 numbers
+                              │
+                              ▼
+                   decoder: penalties ─► temperature ─► filter (top-k / top-p / min-p)
+                              │                         ─► (optional) grammar mask
+                              ▼
+                   pick ONE token (the most likely, or a random draw)
+                              │
+             ┌────────────────┴────────────────┐
+             ▼                                 ▼
+   is it a stop token / stop string     append it to the input
+   or did we hit max_tokens?            and run the model again
+             │ yes
+             ▼
+           done</code></pre>
+    <p>The model part is expensive and the same for every setting. The decoder part is cheap, but it decides <em>which</em> of the many possible answers you get. The model's speed side (prefill, decode, KV cache, speculative decoding) is covered in <a href="../Inference-Deployment-Operations/ai-engineering-inference-optimization.html">Inference Optimization</a>. This page is about the choice.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Plain meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Token</strong></td><td>A piece of text the model works with: a word, part of a word, or a symbol (see <a href="ai-engineering-tokenization.html">Tokenization</a>).</td></tr>
+        <tr><td><strong>Vocabulary</strong></td><td>The full list of tokens the model knows. Often 32,000 to 260,000.</td></tr>
+        <tr><td><strong>Logit</strong></td><td>The raw score the model gives a token. Any real number. Higher means "more likely". Not a probability yet.</td></tr>
+        <tr><td><strong>Softmax</strong></td><td>The formula that turns logits into probabilities that are all positive and add up to 1.</td></tr>
+        <tr><td><strong>Distribution</strong></td><td>The list of probabilities for all tokens at this step.</td></tr>
+        <tr><td><strong>Sampling</strong></td><td>Picking a token at random, where likelier tokens are picked more often. Like a weighted dice roll.</td></tr>
+        <tr><td><strong>Greedy</strong></td><td>Always picking the single most likely token. No randomness.</td></tr>
+        <tr><td><strong>Truncation</strong></td><td>Removing unlikely tokens before sampling (top-k, top-p, min-p).</td></tr>
+        <tr><td><strong>Renormalise</strong></td><td>After removing some tokens, divide the rest by their new total so they add up to 1 again.</td></tr>
+        <tr><td><strong>Entropy</strong></td><td>One number for "how spread out" a distribution is. 0 means one token is certain. Higher means more choices are open.</td></tr>
+        <tr><td><strong>EOS</strong></td><td>"End of sequence": a special token that means "I am done".</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="softmax">
+    <h2>3. From Logits to Probabilities, by Hand</h2>
+    <p>We will use one running example for the whole page. The prompt is "The cat sat on the". Pretend the vocabulary has only six tokens, and the model gives these logits:</p>
+    <table>
+      <thead><tr><th>Token</th><th>mat</th><th>floor</th><th>sofa</th><th>bed</th><th>roof</th><th>moon</th></tr></thead>
+      <tbody>
+        <tr><td>Logit z</td><td>5.0</td><td>4.2</td><td>3.9</td><td>3.5</td><td>2.0</td><td>0.5</td></tr>
+      </tbody>
+    </table>
+    <p>Softmax has two steps:</p>
+    <ol>
+      <li>Raise e (about 2.718) to the power of each logit. This makes every value positive, and makes bigger logits <em>much</em> bigger.</li>
+      <li>Divide each by the total, so they add to 1.</li>
+    </ol>
+    <pre><code>probability(token) = e^z(token) / (sum of e^z over all tokens)</code></pre>
+    <table>
+      <thead><tr><th>Token</th><th>z</th><th>e^z</th><th>Probability = e^z / 306.66</th></tr></thead>
+      <tbody>
+        <tr><td>mat</td><td>5.0</td><td>148.41</td><td><strong>0.484</strong></td></tr>
+        <tr><td>floor</td><td>4.2</td><td>66.69</td><td>0.217</td></tr>
+        <tr><td>sofa</td><td>3.9</td><td>49.40</td><td>0.161</td></tr>
+        <tr><td>bed</td><td>3.5</td><td>33.12</td><td>0.108</td></tr>
+        <tr><td>roof</td><td>2.0</td><td>7.39</td><td>0.024</td></tr>
+        <tr><td>moon</td><td>0.5</td><td>1.65</td><td>0.005</td></tr>
+        <tr><td colspan="2"><strong>Total</strong></td><td>306.66</td><td>1.000</td></tr>
+      </tbody>
+    </table>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Softmax only cares about <em>differences</em> between logits. Add 100 to every logit and the probabilities do not change. A gap of 1 in logits means a factor of e (about 2.7) in probability. "mat" (5.0) vs "floor" (4.2): gap 0.8, so mat is e^0.8 = 2.2 times as likely (0.484 / 0.217 = 2.2).</p>
+    </div>
+    <p>In code, real systems subtract the largest logit before taking e^z. The answer is the same (only differences matter), but it avoids huge numbers that overflow.</p>
+  </section>
+
+  <section id="greedy">
+    <h2>4. Greedy Decoding</h2>
+    <p>The simplest decoder: always take the top token. Here that is "mat", every time.</p>
+    <ul>
+      <li><strong>Good:</strong> repeatable, and often the best choice for short factual answers, classification, and extraction.</li>
+      <li><strong>Bad:</strong> for long text it tends to be dull and can fall into <strong>loops</strong> ("I think that I think that I think..."). Once a phrase repeats, the model sees the repeat as evidence that repeating is likely, so it becomes even more likely.</li>
+      <li><strong>Also bad:</strong> picking the best token <em>now</em> does not always give the best <em>sentence</em>. Section 8 shows a case.</li>
+    </ul>
+    <p>Setting <code>temperature = 0</code> in most APIs means greedy decoding.</p>
+  </section>
+
+  <section id="temperature">
+    <h2>5. Temperature</h2>
+    <p>Temperature T divides every logit before softmax:</p>
+    <pre><code>probability = softmax(z / T)</code></pre>
+    <ul>
+      <li><strong>T &lt; 1</strong> makes the gaps between logits bigger, so the top token gets even more likely. The distribution gets <em>sharper</em>.</li>
+      <li><strong>T &gt; 1</strong> makes the gaps smaller, so rare tokens get more chances. The distribution gets <em>flatter</em>.</li>
+      <li><strong>T close to 0</strong> becomes greedy.</li>
+    </ul>
+    <p>Our example at four temperatures:</p>
+    <table>
+      <thead><tr><th>T</th><th>mat</th><th>floor</th><th>sofa</th><th>bed</th><th>roof</th><th>moon</th><th>Entropy (bits)</th></tr></thead>
+      <tbody>
+        <tr><td>0.1</td><td>1.000</td><td>0.000</td><td>0.000</td><td>0.000</td><td>0.000</td><td>0.000</td><td>about 0</td></tr>
+        <tr><td>0.5</td><td>0.733</td><td>0.148</td><td>0.081</td><td>0.036</td><td>0.002</td><td>0.000</td><td>1.22</td></tr>
+        <tr><td>1.0</td><td>0.484</td><td>0.217</td><td>0.161</td><td>0.108</td><td>0.024</td><td>0.005</td><td>1.93</td></tr>
+        <tr><td>2.0</td><td>0.328</td><td>0.220</td><td>0.189</td><td>0.155</td><td>0.073</td><td>0.035</td><td>2.32</td></tr>
+      </tbody>
+    </table>
+    <p>Worked check for T = 0.5: the logits become 10, 8.4, 7.8, 7, 4, 1. The gap between mat and floor is now 1.6 instead of 0.8, so mat is e^1.6 = 5 times as likely as floor (0.733 / 0.148 = 5.0).</p>
+    <h3>Real run: 10,000 draws</h3>
+    <p>We drew 10,000 tokens at each temperature with NumPy (seed 0):</p>
+    <table>
+      <thead><tr><th>T</th><th>mat</th><th>floor</th><th>sofa</th><th>bed</th><th>roof</th><th>moon</th></tr></thead>
+      <tbody>
+        <tr><td>1.0</td><td>4842</td><td>2173</td><td>1643</td><td>1048</td><td>229</td><td>65</td></tr>
+        <tr><td>0.5</td><td>7275</td><td>1544</td><td>801</td><td>367</td><td>13</td><td>0</td></tr>
+      </tbody>
+    </table>
+    <p>At T = 1.0, "The cat sat on the moon" happened 65 times in 10,000. That sounds small, but a chatbot answering 1 million requests with long replies makes thousands of such "odd" choices every day, and one odd token early in a reply can steer everything after it. This is why we also cut off the tail (next section).</p>
+  </section>
+
+  <section id="truncation">
+    <h2>6. Top-k, Top-p and Min-p</h2>
+    <p>All three remove unlikely tokens, then renormalise the rest. They differ in <em>how</em> they decide what is "unlikely". All numbers below use T = 1.0.</p>
+    <h3>Top-k: keep the k best</h3>
+    <p>With k = 3, keep mat, floor, sofa. Their probabilities add to 0.484 + 0.217 + 0.161 = 0.862. Divide each by 0.862:</p>
+    <pre><code>mat 0.561   floor 0.252   sofa 0.187   (bed, roof, moon: 0)</code></pre>
+    <p>Problem: k is fixed. If the model is very sure (one token at 0.99), k = 3 still keeps two bad options. If the model is unsure (20 good options), k = 3 throws good options away.</p>
+    <h3>Top-p (nucleus): keep the smallest set that covers p</h3>
+    <p>Sort tokens from most to least likely and add up probabilities until the total reaches p. With p = 0.9:</p>
+    <table>
+      <thead><tr><th>Token</th><th>Probability</th><th>Running total</th><th>Kept?</th></tr></thead>
+      <tbody>
+        <tr><td>mat</td><td>0.484</td><td>0.484</td><td>yes</td></tr>
+        <tr><td>floor</td><td>0.217</td><td>0.701</td><td>yes</td></tr>
+        <tr><td>sofa</td><td>0.161</td><td>0.863</td><td>yes</td></tr>
+        <tr><td>bed</td><td>0.108</td><td>0.971</td><td>yes (this one crosses 0.9)</td></tr>
+        <tr><td>roof</td><td>0.024</td><td>0.995</td><td>no</td></tr>
+        <tr><td>moon</td><td>0.005</td><td>1.000</td><td>no</td></tr>
+      </tbody>
+    </table>
+    <p>Kept total = 0.971. Renormalised: mat 0.499, floor 0.224, sofa 0.166, bed 0.111. The "moon" answer is now impossible.</p>
+    <p>Top-p <em>adapts</em>: when the model is sure, the set is tiny (maybe one token); when it is unsure, the set grows.</p>
+    <h3>Min-p: keep tokens at least a fraction of the best one</h3>
+    <p>Keep any token whose probability is at least <code>min_p &times; (top probability)</code>. With min_p = 0.1, the bar is 0.1 &times; 0.484 = 0.0484. mat, floor, sofa and bed pass; roof (0.024) and moon (0.005) do not. Same result as top-p here: mat 0.499, floor 0.224, sofa 0.166, bed 0.111.</p>
+    <p>Why min-p exists: at high temperature the distribution is flat, and top-p = 0.9 then lets in a long tail of junk tokens (because 90% of a flat distribution is a lot of tokens). Min-p scales with the top token's confidence, so it keeps the tail out even at high temperature. It is popular for creative writing with T above 1.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Keeps</th><th>Adapts to confidence?</th><th>Typical value</th></tr></thead>
+      <tbody>
+        <tr><td>Top-k</td><td>The k best tokens</td><td>No</td><td>k = 20 to 50</td></tr>
+        <tr><td>Top-p</td><td>Best tokens until their total reaches p</td><td>Yes</td><td>p = 0.9 to 0.95</td></tr>
+        <tr><td>Min-p</td><td>Tokens at least min_p &times; the best one</td><td>Yes, and stays strict at high T</td><td>min_p = 0.05 to 0.1</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="penalties">
+    <h2>7. Repetition, Frequency and Presence Penalties</h2>
+    <p>These lower the logits of tokens that have <em>already appeared</em>, to fight loops.</p>
+    <h3>Repetition penalty (multiplicative)</h3>
+    <p>Used by Hugging Face Transformers and many open-model servers. For each token already in the text: if its logit is positive, divide by the penalty; if negative, multiply by it. Both push it down.</p>
+    <p>Say "mat" already appeared, and the penalty is 1.3. Its logit goes from 5.0 to 5.0 / 1.3 = 3.85. New probabilities:</p>
+    <pre><code>mat 0.228   floor 0.325   sofa 0.241   bed 0.161   roof 0.036   moon 0.008</code></pre>
+    <p>One setting moved "mat" from first place (0.484) to second (0.228). Penalties are strong. Values above about 1.2 often damage normal text, because words like "the" and "is" <em>should</em> repeat.</p>
+    <h3>Frequency and presence penalties (subtractive)</h3>
+    <p>Used by OpenAI-style APIs:</p>
+    <pre><code>new logit = logit - (count of the token so far) &times; frequency_penalty
+                  - (1 if the token appeared at all, else 0) &times; presence_penalty</code></pre>
+    <p>Example: "mat" appeared 3 times, frequency_penalty = 0.5, presence_penalty = 0.4. New logit = 5.0 - 3 &times; 0.5 - 0.4 = <strong>3.1</strong>. The frequency penalty grows with each repeat; the presence penalty is a flat "you have used this before" push toward new topics.</p>
+  </section>
+
+  <section id="beam">
+    <h2>8. Beam Search</h2>
+    <p>Greedy picks the best token at each step. But the best <em>sequence</em> may start with a worse token. Toy example with two steps:</p>
+    <table>
+      <thead><tr><th>First token</th><th>P(first)</th><th>Second token</th><th>P(second | first)</th><th>P(sequence)</th></tr></thead>
+      <tbody>
+        <tr><td>A</td><td>0.6</td><td>x / y / z</td><td>0.40 / 0.35 / 0.25</td><td>0.24 / 0.21 / 0.15</td></tr>
+        <tr><td>B</td><td>0.4</td><td>x / y / z</td><td>0.90 / 0.05 / 0.05</td><td><strong>0.36</strong> / 0.02 / 0.02</td></tr>
+      </tbody>
+    </table>
+    <p>Greedy takes A (0.6 &gt; 0.4), then x, for a sequence probability of 0.24. But "B x" has 0.36. After A, the model is unsure; after B, it is very sure.</p>
+    <p><strong>Beam search</strong> with beam width 2 keeps the 2 best partial sequences at every step instead of 1:</p>
+    <ol>
+      <li>Step 1: keep A (0.6) and B (0.4).</li>
+      <li>Step 2: score all 6 extensions; keep the best 2: "B x" (0.36) and "A x" (0.24).</li>
+      <li>Answer: "B x". Greedy missed it.</li>
+    </ol>
+    <p>In practice, beam search works well for tasks with one right answer and a fixed shape: translation, speech-to-text, short summaries. For chat and open writing it tends to give short, generic, repetitive text, because the most probable text is often the blandest. Chat systems use sampling instead. Real beam search also divides the score by length (a <em>length penalty</em>), because longer sequences multiply more probabilities and always look worse.</p>
+  </section>
+
+  <section id="order">
+    <h2>9. The Order a Real Sampler Uses</h2>
+    <p>When you set several options at once, they run in a fixed order. A common order (Hugging Face Transformers uses this one) is:</p>
+    <pre><code>logits
+  ─► 1. penalties (repetition / frequency / presence)
+  ─► 2. grammar mask, if you asked for structured output (section 11)
+  ─► 3. temperature (divide by T)
+  ─► 4. top-k  ─► 5. top-p  ─► 6. min-p   (each removes tokens)
+  ─► 7. softmax over what is left, then one random draw (or argmax if greedy)</code></pre>
+    <p>Order matters. Temperature runs <em>before</em> top-p, so a higher temperature lets <em>more</em> tokens through the same top-p. With our example and p = 0.9:</p>
+    <ul>
+      <li>T = 1.0: running totals 0.484, 0.701, 0.863, 0.971. <strong>4 tokens</strong> kept.</li>
+      <li>T = 2.0: running totals 0.328, 0.548, 0.737, 0.892, 0.965. <strong>5 tokens</strong> kept, and "roof" is now possible.</li>
+    </ul>
+    <p>Exact order differs a little between servers (vLLM, llama.cpp, Hugging Face). If a result surprises you, check your server's docs for its order.</p>
+  </section>
+
+  <section id="determinism">
+    <h2>10. Seeds, and Why Temperature 0 Can Still Change</h2>
+    <p>Sampling uses a random number generator. Fix the <strong>seed</strong> and, on the same machine with the same software and the same input, you get the same draws. That is useful for tests.</p>
+    <p>But even greedy decoding (T = 0) on a busy server can give different answers to the same prompt. Reasons:</p>
+    <ul>
+      <li><strong>Floating-point order.</strong> Computers round after each addition, so (a + b) + c can differ from a + (b + c) in the last digit. GPU code adds numbers in different orders depending on how many requests are batched together. A tiny change can flip the top token when two logits are almost tied, and after one different token, the rest of the reply differs.</li>
+      <li><strong>Batching changes with load.</strong> Your request is grouped with whatever else is running at that moment (see <a href="../Inference-Deployment-Operations/ai-engineering-inference-optimization.html#batching">Batching and Scheduling</a>), so the batch size, and so the adding order, changes from call to call.</li>
+      <li><strong>Model or server updates.</strong> An API model name can point to a new version.</li>
+    </ul>
+    <p>So for evaluation, do not assume one run is "the" answer. Run important evals several times, and compare averages (see <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a>). Some servers offer a "batch-invariant" mode that removes this effect at some speed cost.</p>
+  </section>
+
+  <section id="structured">
+    <h2>11. Structured Outputs and Constrained Decoding</h2>
+    <p>Programs often need the model to return valid JSON, like <code>{"approved": true}</code>. Asking nicely in the prompt works most of the time. "Most of the time" breaks programs. <strong>Constrained decoding</strong> makes invalid output <em>impossible</em>.</p>
+    <h3>The trick: a mask on the logits</h3>
+    <p>At each step, a small checker knows which tokens are allowed next under the rules (the JSON schema or a grammar). Before sampling, every <em>forbidden</em> token's logit is set to minus infinity. e^(-infinity) = 0, so it can never be picked.</p>
+    <p><strong>Worked example.</strong> The model has written <code>{"approved":</code> and the schema says the value must be a boolean. Without a mask, the model's top choices are:</p>
+    <table>
+      <thead><tr><th>Next token</th><th>Probability before mask</th><th>Allowed by schema?</th><th>After mask and renormalise</th></tr></thead>
+      <tbody>
+        <tr><td><code> "yes"</code></td><td>0.60</td><td>no (a string, not a boolean)</td><td>0</td></tr>
+        <tr><td><code> true</code></td><td>0.25</td><td>yes</td><td>0.25 / 0.40 = <strong>0.625</strong></td></tr>
+        <tr><td><code> false</code></td><td>0.15</td><td>yes</td><td>0.15 / 0.40 = <strong>0.375</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Without the mask, 60% of replies would break your parser. With it, 0% do.</p>
+    <h3>How the checker knows what is allowed</h3>
+    <ol>
+      <li>The JSON schema (or a grammar, such as GBNF in llama.cpp) is compiled into a <strong>state machine</strong>: a small map of "where am I in the format, and what may come next".</li>
+      <li>For each state, the library works out which vocabulary tokens are allowed. This is the hard part, because one token can cover several characters (like <code>":</code> or <code>true,</code>). Libraries such as XGrammar, llguidance and Outlines precompute and cache these masks so the check costs well under a millisecond per token.</li>
+      <li>After each chosen token, the state machine moves forward.</li>
+    </ol>
+    <p>Where you meet this: OpenAI-style "Structured Outputs" with a strict JSON schema, vLLM's structured output options, llama.cpp grammars, and tool calling (the tool arguments are JSON; see <a href="../Agents-and-Protocols/ai-engineering-agents.html">Agents</a>).</p>
+    <div class="callout callout-intuition">
+      <p><strong>Valid is not the same as correct.</strong> The mask guarantees the <em>shape</em>, not the <em>truth</em>. In the example, the model really wanted to say "yes", which was approval. The mask turned that into true (62.5%) or false (37.5%): it can turn a confident answer into a coin flip. Give the model the format in the prompt too, so its own top choice is already valid.</p>
+    </div>
+    <h3>Field order matters</h3>
+    <p>The model writes JSON left to right. If your schema is <code>{"answer": ..., "reasoning": ...}</code>, the model must commit to the answer <em>before</em> it writes any reasoning. Put <code>reasoning</code> first and <code>answer</code> last, so the answer can use the reasoning tokens (the same idea as in <a href="../Inference-Deployment-Operations/ai-engineering-reasoning-test-time-compute.html">Reasoning Models</a>).</p>
+  </section>
+
+  <section id="stopping">
+    <h2>12. When Generation Stops</h2>
+    <p>The loop ends on the first of these:</p>
+    <ul>
+      <li><strong>EOS token.</strong> The model picks its "end" token. The API reports <code>finish_reason: "stop"</code>.</li>
+      <li><strong>Stop string.</strong> You gave a list like <code>["\n\nUser:"]</code>; the server stops when the text contains one, and usually cuts it off.</li>
+      <li><strong>max_tokens.</strong> The length limit. The API reports <code>finish_reason: "length"</code>. The answer is cut mid-sentence, and JSON will be invalid even with constrained decoding, because the closing <code>}</code> was never written.</li>
+    </ul>
+    <p>Always check <code>finish_reason</code> in code. Treat <code>"length"</code> as an error or a retry with a bigger limit, never as a normal answer.</p>
+  </section>
+
+  <section id="settings">
+    <h2>13. Choosing Settings per Task</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Settings to start with</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Extraction, classification, routing</td><td>T = 0 (greedy), structured output</td><td>One right answer; you want the same answer every time</td></tr>
+        <tr><td>Code generation</td><td>T = 0 to 0.3, top-p 0.95</td><td>Small changes break code; a little randomness helps when you retry</td></tr>
+        <tr><td>Chat assistant</td><td>T = 0.7, top-p 0.9 to 0.95</td><td>Natural variety without odd words</td></tr>
+        <tr><td>Creative writing, brainstorming</td><td>T = 1.0 to 1.3, min-p 0.05 to 0.1</td><td>More variety; min-p keeps the junk tail out</td></tr>
+        <tr><td>Several tries, then pick the best (best-of-n, self-consistency voting)</td><td>T = 0.7 to 1.0</td><td>Tries must differ, or the vote is pointless</td></tr>
+        <tr><td>Reasoning models</td><td>Use the model card's settings</td><td>Many are trained and tested at a fixed temperature (often 0.6 to 1.0); greedy can make them loop</td></tr>
+      </tbody>
+    </table>
+    <p>Change one setting at a time, and measure on an eval set. Your feelings about a few outputs are not a measurement.</p>
+  </section>
+
+  <section id="code">
+    <h2>14. A Complete Sampler in 30 Lines</h2>
+    <p>This NumPy code does everything above except grammars. Run it and it prints <code>{'mat': 4984, 'floor': 2269, 'sofa': 1662, 'bed': 1085, 'roof': 0, 'moon': 0}</code>: with top-p 0.9, roof and moon can no longer be drawn (compare the 229 and 65 in section 5).</p>
+    <pre><code class="language-python">import numpy as np
+
+def softmax(z):
+    e = np.exp(z - z.max())          # subtract max: same answer, no overflow
+    return e / e.sum()
+
+def sample(logits, seen_counts, rng, temperature=1.0, top_k=0, top_p=1.0,
+           min_p=0.0, rep_penalty=1.0, freq_penalty=0.0, presence_penalty=0.0):
+    z = logits.astype(float).copy()
+    # 1. penalties, only for tokens already generated
+    for tok, count in seen_counts.items():
+        z[tok] = z[tok] / rep_penalty if z[tok] &gt; 0 else z[tok] * rep_penalty
+        z[tok] -= count * freq_penalty + (count &gt; 0) * presence_penalty
+    # 2. greedy
+    if temperature == 0:
+        return int(np.argmax(z))
+    # 3. temperature
+    p = softmax(z / temperature)
+    order = np.argsort(-p)                       # most likely first
+    keep = np.ones_like(p, dtype=bool)
+    # 4. top-k
+    if top_k &gt; 0:
+        keep[order[top_k:]] = False
+    # 5. top-p: keep tokens until the running total reaches top_p
+    cum = np.cumsum(p[order])
+    cutoff = np.searchsorted(cum, top_p) + 1
+    keep[order[cutoff:]] = False
+    # 6. min-p
+    keep &amp;= p &gt;= min_p * p.max()
+    # 7. renormalise and draw
+    p = np.where(keep, p, 0.0)
+    return int(rng.choice(len(p), p=p / p.sum()))
+
+tokens = ["mat", "floor", "sofa", "bed", "roof", "moon"]
+logits = np.array([5.0, 4.2, 3.9, 3.5, 2.0, 0.5])
+rng = np.random.default_rng(0)
+draws = [sample(logits, {}, rng, temperature=1.0, top_p=0.9) for _ in range(10_000)]
+print({t: draws.count(i) for i, t in enumerate(tokens)})   # roof and moon: 0</code></pre>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Tuning temperature and top-p at the same time.</strong> They interact (section 9). Change one, measure, then the other.</li>
+      <li><strong>Using greedy for long creative text.</strong> It gets dull and can loop. Use sampling with truncation.</li>
+      <li><strong>Heavy repetition penalties.</strong> Above about 1.2 they start banning normal words and even needed code symbols (brackets, indentation), so code breaks.</li>
+      <li><strong>Trusting "temperature 0 = same answer forever".</strong> Batching, hardware and model updates change answers. Pin model versions and run evals more than once.</li>
+      <li><strong>Ignoring <code>finish_reason</code>.</strong> A reply cut by <code>max_tokens</code> looks fine at a glance but is incomplete or invalid JSON.</li>
+      <li><strong>Constraining without prompting.</strong> If the prompt does not describe the format, the mask fights the model and quality drops. Describe it in the prompt <em>and</em> enforce it with the schema.</li>
+      <li><strong>Answer field before reasoning field</strong> in a JSON schema. The model commits before it thinks.</li>
+      <li><strong>Letting end users set any temperature.</strong> Keep sampling settings in server config per use case, and expose only safe ranges.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>16. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: softmax by hand</h3>
+    <p>Three tokens have logits 2, 1, 0. What are their probabilities? (e = 2.718, e^2 = 7.389.)</p>
+    <details>
+      <summary>Solution</summary>
+      <p>e^2 = 7.389, e^1 = 2.718, e^0 = 1. Total = 11.107. Probabilities: 7.389 / 11.107 = <strong>0.665</strong>, 2.718 / 11.107 = <strong>0.245</strong>, 1 / 11.107 = <strong>0.090</strong>.</p>
+    </details>
+    <h3>Problem 2: temperature</h3>
+    <p>Same logits (2, 1, 0), temperature 0.5. What is the new probability of the first token?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Divide by 0.5: logits become 4, 2, 0. e^4 = 54.6, e^2 = 7.39, e^0 = 1. Total = 62.99. First token: 54.6 / 62.99 = <strong>0.867</strong> (up from 0.665). Lower temperature made the top token more certain.</p>
+    </details>
+    <h3>Problem 3: top-p</h3>
+    <p>Sorted probabilities are 0.40, 0.30, 0.15, 0.10, 0.05. With top-p = 0.8, which tokens are kept, and what is the renormalised probability of the first one?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Running totals: 0.40, 0.70, 0.85. The third token pushes the total past 0.8, so the first <strong>three</strong> are kept (total 0.85). First token: 0.40 / 0.85 = <strong>0.471</strong>.</p>
+    </details>
+    <h3>Problem 4: min-p</h3>
+    <p>Same probabilities, min-p = 0.3. Which tokens survive?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The bar is 0.3 &times; 0.40 = 0.12. Tokens at 0.40, 0.30 and 0.15 pass; 0.10 and 0.05 do not. <strong>Three</strong> tokens survive.</p>
+    </details>
+    <h3>Problem 5: presence and frequency</h3>
+    <p>The token "great" has logit 3.0 and has appeared 4 times. frequency_penalty = 0.3 and presence_penalty = 0.5. What is its new logit?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>3.0 - 4 &times; 0.3 - 1 &times; 0.5 = 3.0 - 1.2 - 0.5 = <strong>1.3</strong>.</p>
+    </details>
+    <h3>Problem 6: the broken pipeline</h3>
+    <p>An extraction job uses a strict JSON schema, yet 2% of replies fail to parse. Logs show those replies are all exactly 512 tokens long. What happened, and what do you change?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>They hit <code>max_tokens = 512</code> (<code>finish_reason: "length"</code>), so the JSON was cut before its closing brace. The schema cannot help, because generation simply stopped. Raise the limit for these inputs, shorten the output (fewer or shorter fields), and treat <code>"length"</code> as a retry case in code.</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://arxiv.org/abs/1904.09751" rel="noopener noreferrer">Holtzman et al. (2019): The Curious Case of Neural Text Degeneration (top-p)</a> &middot; <a href="https://arxiv.org/abs/2407.01082" rel="noopener noreferrer">Nguyen et al. (2024): Min-p sampling</a> &middot; <a href="https://huggingface.co/docs/transformers/generation_strategies" rel="noopener noreferrer">Hugging Face: Generation strategies</a> &middot; <a href="https://platform.openai.com/docs/guides/structured-outputs" rel="noopener noreferrer">OpenAI: Structured Outputs</a> &middot; <a href="https://docs.vllm.ai/en/latest/features/structured_outputs.html" rel="noopener noreferrer">vLLM: Structured outputs</a> &middot; <a href="https://arxiv.org/abs/2411.15100" rel="noopener noreferrer">XGrammar (2024)</a> &middot; <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/" rel="noopener noreferrer">Defeating Nondeterminism in LLM Inference</a></small></p>
+  </section>
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="ai-engineering-llms.html">LLMs</a> &middot; <a href="ai-engineering-tokenization.html">Tokenization</a> &middot; <a href="../Inference-Deployment-Operations/ai-engineering-inference-optimization.html">Inference Optimization</a> &middot; <a href="../Prompting-and-Retrieval/ai-engineering-prompt-engineering.html">Prompt Engineering</a> &middot; <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

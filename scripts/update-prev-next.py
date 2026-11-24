@@ -52,13 +52,16 @@ TRACKS = {
         "Docker/docker-advanced.html",
         "Kubernetes/kubernetes-architecture.html",
         "Kubernetes/kubernetes-workloads.html",
+        "Kubernetes/kubernetes-scheduling.html",
         "Kubernetes/kubernetes-autoscaling-probes-rollouts.html",
         "Kubernetes/kubernetes-networking.html",
         "Kubernetes/kubernetes-storage.html",
         "Kubernetes/kubernetes-config-security.html",
         "Kubernetes/kubernetes-helm-observability.html",
+        "Kubernetes/kubernetes-troubleshooting.html",
         "Kubernetes/kubernetes-gpu-scheduling.html",
         "DevOps/devops-cicd-mlops.html",
+        "DevOps/mlops-tracking-registry-feature-stores.html",
     ]),
 }
 

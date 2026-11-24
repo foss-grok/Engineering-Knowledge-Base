@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="../../assets/logo.svg" type="image/svg+xml">
   <title>Learn | Docker &amp; Kubernetes</title>
-  <meta name="description" content="Docker and Kubernetes learning track: fundamentals, Compose, advanced builds, cluster architecture, workloads, probes, rollouts and autoscaling, networking, storage, security, Helm, and observability.">
+  <meta name="description" content="Docker and Kubernetes learning track: fundamentals, Compose, advanced builds, cluster architecture, workloads, scheduling, probes, rollouts and autoscaling, networking, storage, security, Helm, observability, GPU scheduling, debugging broken pods, CI/CD, and MLOps (experiment tracking, model registry, feature stores).">
   <link rel="stylesheet" href="../../styles.css">
 </head>
 <body class="learn-page">
@@ -30,13 +30,16 @@
       <li><a href="Docker/docker-advanced.html">Advanced Docker</a>: smaller, safer, faster builds</li>
       <li><a href="Kubernetes/kubernetes-architecture.html">Kubernetes Architecture</a>: the parts of a cluster and how they talk</li>
       <li><a href="Kubernetes/kubernetes-workloads.html">Workloads</a>: Pods, Deployments, StatefulSets, Jobs</li>
+      <li><a href="Kubernetes/kubernetes-scheduling.html">Scheduling</a>: which node each pod lands on, and why</li>
       <li><a href="Kubernetes/kubernetes-autoscaling-probes-rollouts.html">Autoscaling, Probes &amp; Rollouts</a>: staying healthy while traffic and code change</li>
       <li><a href="Kubernetes/kubernetes-networking.html">Networking &amp; Services</a>: how traffic reaches pods</li>
       <li><a href="Kubernetes/kubernetes-storage.html">Storage</a>: data that outlives a pod</li>
       <li><a href="Kubernetes/kubernetes-config-security.html">Config, Secrets &amp; Security</a>: settings, secrets, and who may do what</li>
       <li><a href="Kubernetes/kubernetes-helm-observability.html">Helm &amp; Observability</a>: packaging apps and watching them run</li>
+      <li><a href="Kubernetes/kubernetes-troubleshooting.html">Debugging Pods</a>: Pending, CrashLoopBackOff, ImagePullBackOff and the rest</li>
       <li><a href="Kubernetes/kubernetes-gpu-scheduling.html">GPU Scheduling</a>: sharing GPUs and serving LLMs</li>
       <li><a href="DevOps/devops-cicd-mlops.html">CI/CD and MLOps on Kubernetes</a>: shipping code and models automatically</li>
+      <li><a href="DevOps/mlops-tracking-registry-feature-stores.html">Experiment Tracking, Model Registry &amp; Feature Stores</a>: which model runs, and why it acts differently live</li>
     </ol>
   </section>
 
@@ -55,6 +58,7 @@
     <ul>
       <li><a href="Kubernetes/kubernetes-architecture.html"><strong>Kubernetes Architecture</strong></a>  -  control plane, etcd, scheduler, kubelet, kube-proxy, kubectl</li>
       <li><a href="Kubernetes/kubernetes-workloads.html"><strong>Workloads</strong></a>  -  Pods, Deployments, StatefulSets, Jobs, probes, HPA</li>
+      <li><a href="Kubernetes/kubernetes-scheduling.html"><strong>Scheduling</strong></a>  -  allocatable, filter and score with worked numbers, node affinity, taints and tolerations, the 6-minute dead-node timeline, pod anti-affinity, topology spread skew math, priority and preemption, eviction order, reading FailedScheduling</li>
       <li><a href="Kubernetes/kubernetes-autoscaling-probes-rollouts.html"><strong>Autoscaling, Probes &amp; Rollouts</strong></a>  -  probe timing math, maxSurge and maxUnavailable step by step, the pod shutdown sequence, the HPA formula with a calculator, scaling behavior, VPA, Cluster Autoscaler and Karpenter, PodDisruptionBudgets, a traffic-spike timeline</li>
       <li><a href="Kubernetes/kubernetes-networking.html"><strong>Networking &amp; Services</strong></a>  -  Services, Ingress, DNS, NetworkPolicy, CNI</li>
     </ul>
@@ -67,6 +71,7 @@
       <li><a href="Kubernetes/kubernetes-config-security.html"><strong>Config, Secrets &amp; Security</strong></a>  -  ConfigMaps, RBAC, Pod Security, admission</li>
       <li><a href="Kubernetes/kubernetes-helm-observability.html"><strong>Helm &amp; Observability</strong></a>  -  Helm charts, Prometheus, Grafana, logging</li>
       <li><a href="Kubernetes/kubernetes-gpu-scheduling.html"><strong>GPU Scheduling</strong></a>  -  device plugins, GPU Operator, time-slicing, MIG, DRA, gang scheduling with Kueue, serving LLMs</li>
+      <li><a href="Kubernetes/kubernetes-troubleshooting.html"><strong>Debugging Pods</strong></a>  -  the pod lifecycle and where each failure shows, the five commands, ImagePullBackOff messages, CreateContainerConfigError, CrashLoopBackOff back-off math, exit codes, stuck Terminating, kubectl debug, a crash-loop release walkthrough</li>
     </ul>
   </section>
 
@@ -74,6 +79,7 @@
     <h2>DevOps and MLOps</h2>
     <ul>
       <li><a href="DevOps/devops-cicd-mlops.html"><strong>CI/CD and MLOps on Kubernetes</strong></a>  -  GitHub Actions, image tags, GitOps with Argo CD, canary releases, rollbacks, model quality gates, drift monitoring with PSI, a real drift incident walkthrough</li>
+      <li><a href="DevOps/mlops-tracking-registry-feature-stores.html"><strong>Experiment Tracking, Model Registry &amp; Feature Stores</strong></a>  -  reproducible runs, a real MLflow run, versions and aliases, promotion and rollback, training-serving skew, point-in-time joins by hand, offline and online stores with Feast, a skew incident where recall halved while AUC held</li>
     </ul>
   </section>
 

@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Experiment Tracking, Model Registry &amp; Feature Stores | Docker &amp; Kubernetes</title>
+  <meta name="description" content="The MLOps tools that answer which model is running and why it behaves differently in production, from zero with real runs: what makes a training run reproducible, experiment tracking with MLflow, a model registry with versions and aliases, promotion and rollback, training-serving skew, point-in-time joins worked by hand, feature stores with offline and online stores, a real skew incident where recall fell from 0.84 to 0.46 while AUC barely moved, the Kubernetes layout, pitfalls, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; Tracking, Registry &amp; Feature Stores</p>
+  </nav>
+  <h1>Experiment Tracking, Model Registry &amp; Feature Stores</h1>
+  <p>Three questions come up in every ML team. "Which settings and data made this model?" "Which model is running in production right now, and how do we roll it back?" "Why does the model score well offline but badly for real users?" This page explains the three tools that answer them: <strong>experiment tracking</strong>, a <strong>model registry</strong>, and a <strong>feature store</strong>. It goes deeper than the overview in <a href="devops-cicd-mlops.html#mlops">CI/CD and MLOps</a>, and every number comes from a run you can repeat.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why These Tools Exist</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#reproducible">What Makes a Run Reproducible</a></li>
+    <li><a href="#tracking">Experiment Tracking (Real MLflow Run)</a></li>
+    <li><a href="#registry">The Model Registry: Versions and Aliases</a></li>
+    <li><a href="#promotion">Promotion and Rollback, Step by Step</a></li>
+    <li><a href="#skew">Training-Serving Skew</a></li>
+    <li><a href="#point-in-time">Point-in-Time Joins, by Hand</a></li>
+    <li><a href="#feature-store">Feature Stores: Offline and Online</a></li>
+    <li><a href="#scenario">Scenario: the Fraud Model That Missed Half the Fraud</a></li>
+    <li><a href="#kubernetes">How It Fits on Kubernetes</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why These Tools Exist</h2>
+    <p>Normal software has one moving part: code. Git tracks it. An ML system has three moving parts: <strong>code</strong>, <strong>data</strong>, and the <strong>model</strong> (the file that training produces). Git alone tracks only the first.</p>
+    <pre><code>   code (git)  ─┐
+   data         ─┼─► training run ─► model file ─► registry ─► serving
+   settings     ─┘        │                           │            │
+                          ▼                           ▼            ▼
+                 experiment tracking:        "version 7 is      features at request
+                 params, metrics, files      champion"          time must match the
+                                                                features used in training
+                                                                (feature store)</code></pre>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A lab scientist keeps a notebook: what they mixed, how much, at what temperature, and what happened. Without it, a great result cannot be repeated. Experiment tracking is that notebook. The model registry is the shelf of labelled, approved samples. The feature store makes sure the kitchen uses the same recipe as the lab.</p>
+    </div>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Run</strong></td><td>One training attempt, with its settings, results and output files.</td></tr>
+        <tr><td><strong>Experiment</strong></td><td>A named group of runs that try to solve the same problem.</td></tr>
+        <tr><td><strong>Parameter (param)</strong></td><td>A setting you chose for a run, like learning rate or tree depth.</td></tr>
+        <tr><td><strong>Metric</strong></td><td>A number that measures the result, like validation AUC.</td></tr>
+        <tr><td><strong>Artifact</strong></td><td>A file a run produced: the model, a plot, a list of features.</td></tr>
+        <tr><td><strong>Lineage</strong></td><td>The chain that says where something came from: model version 7 came from run X, which used commit Y and data snapshot Z.</td></tr>
+        <tr><td><strong>Registered model / version</strong></td><td>A named model in the registry ("fraud-detector"), with numbered versions 1, 2, 3...</td></tr>
+        <tr><td><strong>Alias</strong></td><td>A movable name tag pointing at one version, like <code>champion</code> or <code>challenger</code>.</td></tr>
+        <tr><td><strong>Feature</strong></td><td>An input number for the model, like "average spend in the last 30 days".</td></tr>
+        <tr><td><strong>Entity</strong></td><td>The thing a feature describes: a user, a card, a product.</td></tr>
+        <tr><td><strong>Training-serving skew</strong></td><td>A feature has a different value (or meaning) in production than it had in training.</td></tr>
+        <tr><td><strong>Point-in-time join</strong></td><td>Attaching to each training example the feature values as they were <em>at that moment</em>, not as they are today.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="reproducible">
+    <h2>3. What Makes a Run Reproducible</h2>
+    <p>To train the same model again, you need five things. Missing any one is a common reason a "great model from last month" cannot be rebuilt.</p>
+    <table>
+      <thead><tr><th>Ingredient</th><th>How to pin it</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Code</td><td>Git commit hash</td><td><code>3f2a9c1</code></td></tr>
+        <tr><td>Data</td><td>A snapshot path plus a content hash, or a data versioning tool (DVC, lakeFS, table snapshots)</td><td><code>s3://ml/fraud/2026-11-01/</code>, sha256 <code>9b1e...</code></td></tr>
+        <tr><td>Settings</td><td>All params logged, config file saved as an artifact</td><td><code>C=1.0</code>, <code>max_iter=1000</code></td></tr>
+        <tr><td>Environment</td><td>A lock file of exact library versions, or a container image digest</td><td><code>scikit-learn==1.9.1</code>, image <code>@sha256:...</code></td></tr>
+        <tr><td>Randomness</td><td>Fixed seeds for splits, initialisation and sampling</td><td><code>random_state=0</code></td></tr>
+      </tbody>
+    </table>
+    <p>Even then, GPU training can differ in the last digits from run to run (the order of floating-point additions changes). Aim for "same metrics within noise", not "same bytes".</p>
+    <p>A content hash is one line of Python:</p>
+    <pre><code class="language-python">import hashlib
+digest = hashlib.sha256(open("train.parquet", "rb").read()).hexdigest()
+# log it with the run, e.g. mlflow.set_tag("data_sha256", digest)</code></pre>
+    <p>If anyone changes one byte of the file, the hash changes, so you can prove two runs used the same data.</p>
+  </section>
+
+  <section id="tracking">
+    <h2>4. Experiment Tracking (Real MLflow Run)</h2>
+    <p><strong>MLflow</strong> is a popular open-source tracker (Weights &amp; Biases and cloud ML platforms do the same job). Your training code calls a few functions, and the tracker stores everything in a database plus file storage, with a web page to compare runs.</p>
+    <p>This script trains three logistic regression models on the breast cancer data (same data as in <a href="../../../AI Engineer/learn/Foundations-and-Architecture/ai-engineering-classical-ml.html">Classical ML from Zero</a>) with different regularisation strengths <code>C</code>, logs each run, registers the best, and loads it back by alias:</p>
+    <pre><code class="language-python">import mlflow
+from mlflow import MlflowClient
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+
+mlflow.set_tracking_uri("sqlite:///mlflow.db")      # a real team uses a shared server
+mlflow.set_experiment("cancer-demo")
+
+X, y = load_breast_cancer(return_X_y=True)
+X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)
+
+best = None
+for C in [0.01, 0.1, 1.0]:
+    with mlflow.start_run(run_name=f"C={C}") as run:
+        model = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=1000))
+        model.fit(X_tr, y_tr)
+        auc = roc_auc_score(y_val, model.predict_proba(X_val)[:, 1])
+        mlflow.log_params({"C": C, "model": "logistic"})
+        mlflow.log_metric("val_auc", auc)
+        mlflow.set_tag("git_commit", "3f2a9c1")
+        info = mlflow.sklearn.log_model(model, name="model")
+        print(f"run {run.info.run_id[:8]}  C={C}  val_auc={auc:.4f}")
+        if best is None or auc &gt; best[0]:
+            best = (auc, info.model_uri, C)
+
+mv = mlflow.register_model(best[1], "cancer-classifier")
+print("registered version", mv.version, "from C =", best[2])
+MlflowClient().set_registered_model_alias("cancer-classifier", "champion", mv.version)
+
+served = mlflow.sklearn.load_model("models:/cancer-classifier@champion")
+print("loaded by alias; first 5 predictions:", served.predict(X_val[:5]))</code></pre>
+    <p>Real output (MLflow 3.18, scikit-learn 1.9.1):</p>
+    <pre><code>run 062ea0a0  C=0.01  val_auc=0.9849
+run 2285bec3  C=0.1  val_auc=0.9929
+run 5fc0b346  C=1.0  val_auc=0.9952
+Successfully registered model 'cancer-classifier'.
+Created version '1' of model 'cancer-classifier'.
+registered version 1 from C = 1.0
+loaded by alias; first 5 predictions: [1 0 0 1 0]</code></pre>
+    <p>What you gain: six months later, anyone can open the tracker, sort runs by <code>val_auc</code>, and see that version 1 came from run <code>5fc0b346</code>, with <code>C=1.0</code>, commit <code>3f2a9c1</code>, and the exact model file.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Choose on validation, report on test.</strong> We picked the best of three runs by validation AUC. That number is now slightly optimistic, because we chose the winner by looking at it. With 3 runs the effect is tiny; with 300 runs it is not. Keep a separate test set, score the chosen model on it once, and report that number.</p>
+    </div>
+    <p>A small real-world catch we hit while writing this page: newer MLflow versions save scikit-learn models in a safer format (skops) and refuse, by default, to save some tree models, asking you to list the types you trust. That is a security feature: loading a model file can run code, so only load models from sources you trust.</p>
+  </section>
+
+  <section id="registry">
+    <h2>5. The Model Registry: Versions and Aliases</h2>
+    <p>The tracker records <em>every</em> run, including failures. The registry holds only the models you might ship, with a clear history:</p>
+    <pre><code>registered model: fraud-detector
+  version 5   from run a81c...   (retired)
+  version 6   from run 3d07...   &lt;── @champion    (production serves this)
+  version 7   from run 5fc0...   &lt;── @challenger  (shadow / canary)</code></pre>
+    <p>Serving code never asks for "the latest version". It asks for an <strong>alias</strong>: <code>models:/fraud-detector@champion</code>. To ship version 7, you move the alias. To roll back, you move it back. No code change and no new image.</p>
+    <p>Older MLflow versions used fixed "stages" (Staging, Production, Archived). These are deprecated in favour of aliases, which are more flexible (you can have <code>champion</code>, <code>challenger</code>, <code>eu-champion</code>...). You will still see stages in older tutorials.</p>
+    <p>Each version should carry, as tags or a description: the run it came from (lineage), the data snapshot, evaluation results on the fixed test set, who approved it, and any known limits ("not tested on users under 18").</p>
+  </section>
+
+  <section id="promotion">
+    <h2>6. Promotion and Rollback, Step by Step</h2>
+    <ol>
+      <li><strong>Train</strong> (a scheduled job or a pipeline). Log the run.</li>
+      <li><strong>Register</strong> the candidate as a new version, for example version 7.</li>
+      <li><strong>Gate</strong>: an automatic check scores it on the fixed test set and compares it with the champion (see <a href="devops-cicd-mlops.html#gate">A Model Quality Gate</a>). Fail = stop here.</li>
+      <li><strong>Set <code>@challenger</code> = 7</strong>. Run it in shadow mode (it sees real traffic, but its answers are only logged) or as a small canary.</li>
+      <li><strong>Compare</strong> live metrics for a few days.</li>
+      <li><strong>Promote</strong>: set <code>@champion</code> = 7. Serving pods load the new version on their next restart or reload.</li>
+      <li><strong>Rollback</strong>, if needed: set <code>@champion</code> = 6 and restart the serving pods.</li>
+    </ol>
+    <pre><code class="language-python">client = MlflowClient()
+client.set_registered_model_alias("fraud-detector", "champion", "7")   # promote
+client.set_registered_model_alias("fraud-detector", "champion", "6")   # roll back
+client.get_model_version_by_alias("fraud-detector", "champion").version</code></pre>
+    <p>One caution: if pods resolve the alias only at start-up, different pods can serve different versions during a change. Log the model version with every prediction, so you always know which model made which decision.</p>
+  </section>
+
+  <section id="skew">
+    <h2>7. Training-Serving Skew</h2>
+    <p>A model learns the link between <em>features as computed in training</em> and the label. If production computes a feature even slightly differently, the model receives numbers that mean something else, and it has no way to know.</p>
+    <p>The usual cause is <strong>two pipelines</strong>: a data scientist computes features in SQL or pandas over history for training, and an engineer rewrites the same features in the serving service (Java, Go, or a different Python code path) for live requests.</p>
+    <pre><code>  TRAINING (batch, over history)                SERVING (live, one request)
+  SQL: AVG(amount) over last 30 days            service code: avg(last N days from cache)
+  missing value -&gt; filled with median           missing value -&gt; filled with 0
+  amounts in rupees                             amounts in paise (from the payments API)
+  timezone: UTC                                 timezone: server local time
+              └──────────── any difference = skew ────────────┘</code></pre>
+    <p>Common kinds:</p>
+    <ul>
+      <li><strong>Logic skew</strong>: different windows, filters, rounding, units, default values, or time zones.</li>
+      <li><strong>Data freshness skew</strong>: training used values computed a day later (with complete data), while serving sees values that are minutes old or still arriving.</li>
+      <li><strong>Leakage skew</strong>: training features accidentally used information from after the prediction moment (next section), so they look better than anything serving can provide.</li>
+    </ul>
+    <p>Skew is different from <a href="devops-cicd-mlops.html#monitoring">drift</a>. Drift means the <em>world</em> changed (users behave differently). Skew means <em>your two code paths</em> disagree. Drift needs retraining; skew needs a bug fix.</p>
+  </section>
+
+  <section id="point-in-time">
+    <h2>8. Point-in-Time Joins, by Hand</h2>
+    <p>To build a training set, you take labelled events ("this transaction turned out to be fraud") and attach feature values. The trap: you must attach the values <strong>as they were at the time of the event</strong>, not today's values.</p>
+    <p><strong>Labelled events</strong> (what we want to learn from):</p>
+    <table>
+      <thead><tr><th>user_id</th><th>event time</th><th>label (fraud?)</th></tr></thead>
+      <tbody>
+        <tr><td>7</td><td>2026-03-02 09:00</td><td>0</td></tr>
+        <tr><td>7</td><td>2026-03-10 14:00</td><td>1</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Feature history</strong> for user 7, "avg_amount_30d", recomputed every night at 00:00:</p>
+    <table>
+      <thead><tr><th>Feature timestamp</th><th>avg_amount_30d (rupees)</th></tr></thead>
+      <tbody>
+        <tr><td>2026-03-02 00:00</td><td>840</td></tr>
+        <tr><td>2026-03-10 00:00</td><td>845</td></tr>
+        <tr><td>2026-03-11 00:00</td><td>2,950 (includes the fraud spree of 10 March)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Wrong (naive) join: take the latest value.</strong> Both rows get 2,950. The model learns "fraud rows have a high average", but that high value only exists <em>because of</em> the fraud. At prediction time, before the spree, the value is 845. This is <a href="../../../AI Engineer/learn/Foundations-and-Architecture/ai-engineering-classical-ml.html#leakage">data leakage</a>: offline scores look great, production scores are poor.</p>
+    <p><strong>Right: point-in-time join.</strong> For each event, take the latest feature value whose timestamp is <em>at or before</em> the event time:</p>
+    <table>
+      <thead><tr><th>Event</th><th>Latest feature value at or before it</th><th>Value used</th></tr></thead>
+      <tbody>
+        <tr><td>2026-03-02 09:00</td><td>2026-03-02 00:00</td><td>840</td></tr>
+        <tr><td>2026-03-10 14:00</td><td>2026-03-10 00:00</td><td>845</td></tr>
+      </tbody>
+    </table>
+    <p>Now the training row looks exactly like what the live model would have seen at 14:00 on 10 March. You can do this yourself with pandas:</p>
+    <pre><code class="language-python">import pandas as pd
+events = pd.DataFrame({"user_id": [7, 7],
+                       "ts": pd.to_datetime(["2026-03-02 09:00", "2026-03-10 14:00"]),
+                       "label": [0, 1]})
+feats = pd.DataFrame({"user_id": [7, 7, 7],
+                      "ts": pd.to_datetime(["2026-03-02", "2026-03-10", "2026-03-11"]),
+                      "avg_amount_30d": [840, 845, 2950]})
+train = pd.merge_asof(events.sort_values("ts"), feats.sort_values("ts"),
+                      on="ts", by="user_id", direction="backward")
+print(train)   # avg_amount_30d: 840 and 845, never 2950</code></pre>
+    <p>Two more details. A feature value can be too old to trust (a user inactive for a year); feature stores let you set a <strong>TTL</strong> (time to live) after which the value counts as missing. And if your nightly job finishes at 02:00, the value stamped 00:00 was not really available until 02:00; stamp features with the time they became <em>available</em>, or events between 00:00 and 02:00 will leak a little.</p>
+  </section>
+
+  <section id="feature-store">
+    <h2>9. Feature Stores: Offline and Online</h2>
+    <p>A <strong>feature store</strong> is a system that lets you define a feature once and then get it in two ways: as history for training, and as the latest value for serving.</p>
+    <pre><code>                    feature definitions (code, in git)
+                                 │
+               ┌─────────────────┴──────────────────┐
+               ▼                                    ▼
+     OFFLINE STORE                         ONLINE STORE
+     (data warehouse / files)              (Redis, DynamoDB, ...)
+     full history with timestamps          only the latest value per entity
+     point-in-time joins for training      millisecond lookups for serving
+               │        "materialize": copy latest     ▲
+               └────────── values offline ─► online ────┘
+               ▼                                    ▼
+        training job                         model server: get features
+                                             for user_id=7 in ~5 ms</code></pre>
+    <p>The key promise: both stores are filled from the <strong>same definition</strong>, so training and serving cannot drift apart through two hand-written versions of the logic. Popular options include Feast (open source), Tecton, Hopsworks, and the feature stores built into cloud ML platforms.</p>
+    <h3>What it looks like in Feast</h3>
+    <p>A sketch of a definition and the two ways to read it (Feast's Python API):</p>
+    <pre><code class="language-python">from datetime import timedelta
+from feast import Entity, FeatureStore, FeatureView, Field, FileSource
+from feast.types import Float32, Int64
+
+user = Entity(name="user", join_keys=["user_id"])
+
+user_stats = FeatureView(
+    name="user_stats",
+    entities=[user],
+    ttl=timedelta(days=2),                       # older values count as missing
+    schema=[Field(name="avg_amount_30d", dtype=Float32),
+            Field(name="txn_count_7d", dtype=Int64)],
+    source=FileSource(path="data/user_stats.parquet", timestamp_field="event_timestamp"),
+)
+
+store = FeatureStore(repo_path=".")           # after `feast apply` registered the definitions
+
+# training: point-in-time join for every (user_id, event_timestamp) row in events_df
+train_df = store.get_historical_features(
+    entity_df=events_df, features=["user_stats:avg_amount_30d", "user_stats:txn_count_7d"]
+).to_df()
+
+# serving: latest values from the online store
+online = store.get_online_features(
+    features=["user_stats:avg_amount_30d", "user_stats:txn_count_7d"],
+    entity_rows=[{"user_id": 7}],
+).to_dict()</code></pre>
+    <p>A scheduled job (on Kubernetes, a CronJob) runs <code>feast materialize-incremental &lt;now&gt;</code> to copy new values into the online store.</p>
+    <h3>Do you need one?</h3>
+    <table>
+      <thead><tr><th>Situation</th><th>Advice</th></tr></thead>
+      <tbody>
+        <tr><td>One model, batch predictions (score everyone nightly)</td><td>No. The same batch code makes training and scoring features. Use point-in-time joins in SQL or pandas.</td></tr>
+        <tr><td>Real-time predictions from features that are simple to compute from the request</td><td>Probably not. Share one feature function (one library) between training and serving.</td></tr>
+        <tr><td>Real-time predictions that need history (aggregates over days), several models sharing features, several teams</td><td>Yes, this is where a feature store pays off.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="scenario">
+    <h2>10. Scenario: the Fraud Model That Missed Half the Fraud</h2>
+    <p>This is a simulation you can run (code at the end of this section). The data is synthetic, but the failure is one of the most common in real ML systems.</p>
+    <h3>The setup</h3>
+    <p>A card-fraud model uses three features per user:</p>
+    <ul>
+      <li><strong>spike_ratio</strong> = log(average daily spend over the last 3 days &divide; average daily spend over the window). Fraudsters often spend much more than usual in a short burst, so this goes up.</li>
+      <li><strong>txn_count_7d</strong>: number of transactions in the last 7 days.</li>
+      <li><strong>log_account_age</strong>: log of account age in days.</li>
+    </ul>
+    <p>In training, the "window" is <strong>30 days</strong> (a SQL query over the warehouse). The model is a logistic regression trained on 40,000 users (about 5% fraud), flagging a user when its score is at least 0.5. Offline results on 20,000 new users are excellent.</p>
+    <p>For serving, an engineer re-implemented the feature in the payments service. The service's cache only kept 7 days of history, so the code used a <strong>7-day window</strong>. Same feature name, same type, different meaning.</p>
+    <h3>What happened in production</h3>
+    <table>
+      <thead><tr><th>Metric (same 20,000 users)</th><th>Offline (30-day window, as trained)</th><th>Online (7-day window, the bug)</th></tr></thead>
+      <tbody>
+        <tr><td>AUC</td><td>0.992</td><td>0.984</td></tr>
+        <tr><td>Precision at 0.5</td><td>0.954</td><td>0.992</td></tr>
+        <tr><td><strong>Recall at 0.5</strong></td><td><strong>0.844</strong></td><td><strong>0.460</strong></td></tr>
+        <tr><td>Share of users flagged</td><td>4.54%</td><td>2.38%</td></tr>
+        <tr><td>Mean spike_ratio</td><td>0.021</td><td>0.010</td></tr>
+      </tbody>
+    </table>
+    <p>The model now catches <strong>46%</strong> of fraud instead of 84%. Why so much? A 7-day average already contains the 3 spike days as a big share (3 of 7 days, instead of 3 of 30), so the average is pulled up and the ratio comes out smaller. Every fraudster looks "less spiky". Their scores fall, and many drop below the 0.5 threshold.</p>
+    <h3>Why the dashboards stayed green</h3>
+    <ul>
+      <li><strong>AUC barely moved</strong> (0.992 to 0.984). AUC measures <em>ranking</em>: are frauds scored above non-frauds? They still mostly are, just all lower. But decisions use a fixed <em>threshold</em>, and the scores slid under it.</li>
+      <li><strong>Precision went up</strong> (0.954 to 0.992). Fewer flags, and the ones left are the most obvious frauds. On a dashboard that looks like an improvement.</li>
+      <li><strong>Feature drift (PSI) on spike_ratio was 0.072</strong>, under the usual 0.1 alert line (see <a href="devops-cicd-mlops.html#monitoring">PSI</a>). Most users are not fraudsters, and for them the 7-day and 30-day averages are similar, so the overall distribution hardly moves.</li>
+      <li>Recall needs labels, and fraud labels (chargebacks) arrive weeks later. So the drop showed up a month late, as a finance report about rising fraud losses.</li>
+    </ul>
+    <h3>The check that catches it on day one</h3>
+    <p>Log the feature values the service actually used for each request. Every night, recompute the same features for the same users and times with the training code, and compare row by row:</p>
+    <pre><code>rows where served value differs from recomputed value by more than 0.01: 92.7%</code></pre>
+    <p>A <strong>row-level skew check</strong> like this fires immediately, even when distribution checks (PSI) and ranking metrics (AUC) look fine. A healthy pipeline is near 0% (small differences from timing are normal; set the alert at, say, 1%).</p>
+    <h3>The fix and the follow-ups</h3>
+    <ol>
+      <li><strong>Hotfix</strong>: the service computes the 30-day window (the cache was extended to 30 days of daily totals, which is small).</li>
+      <li><strong>Root fix</strong>: the feature is defined once, in the feature store, and both training and serving read it from there.</li>
+      <li><strong>Guardrails</strong>: the nightly row-level skew check with an alert; logging of served features plus model version for every prediction; and a monitor on the <em>share of users flagged</em> (it fell from 4.5% to 2.4% on day one, a signal that does not need labels).</li>
+    </ol>
+    <h3>The code</h3>
+    <pre><code class="language-python">import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, precision_score, recall_score
+
+rng = np.random.default_rng(7)
+
+def make(n):                                   # 30 days of daily spend per user
+    age = rng.integers(1, 1500, n)
+    fraud = rng.random(n) &lt; 0.05
+    base = rng.lognormal(6.5, 0.6, n)
+    days = np.tile(base[:, None], (1, 30)) * rng.lognormal(0, 0.3, (n, 30))
+    days[:, -3:] *= np.where(fraud, rng.uniform(1.3, 3.5, n), 1.0)[:, None]  # fraud burst
+    count7 = rng.poisson(np.where(fraud, 6, 4))
+    age = np.where(fraud, rng.integers(1, 600, n), age)
+    return days, count7, age, fraud.astype(int)
+
+def feats(days, count7, age, window):
+    spike_ratio = np.log(days[:, -3:].mean(1) / days[:, -window:].mean(1))
+    return np.c_[spike_ratio, count7, np.log(age)]
+
+d, c, a, y = make(40000)
+model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)).fit(feats(d, c, a, 30), y)
+
+d2, c2, a2, y2 = make(20000)
+for name, X in [("offline, 30-day", feats(d2, c2, a2, 30)), ("online, 7-day", feats(d2, c2, a2, 7))]:
+    p = model.predict_proba(X)[:, 1]; flag = p &gt;= 0.5
+    print(f"{name}: AUC {roc_auc_score(y2, p):.3f} precision {precision_score(y2, flag):.3f} "
+          f"recall {recall_score(y2, flag):.3f} flagged {flag.mean():.2%}")
+
+off, on = feats(d2, c2, a2, 30)[:, 0], feats(d2, c2, a2, 7)[:, 0]
+print(f"row-level skew: {np.mean(np.abs(on - off) &gt; 0.01):.1%} of rows differ")</code></pre>
+  </section>
+
+  <section id="kubernetes">
+    <h2>11. How It Fits on Kubernetes</h2>
+    <pre><code>  ┌───────────── Kubernetes cluster ─────────────────────────────────────────┐
+  │                                                                          │
+  │  CronJob: build-features ─► offline store (warehouse / object storage)   │
+  │  CronJob: materialize    ─► online store (Redis StatefulSet or managed)  │
+  │                                                                          │
+  │  Job: train (GPU or CPU) ─► MLflow tracking server (Deployment)          │
+  │                               ├─ metadata: PostgreSQL                    │
+  │                               └─ artifacts: object storage (S3, GCS)     │
+  │                                                                          │
+  │  CI gate ─► set alias @champion = N                                      │
+  │                                                                          │
+  │  Deployment: model-server  (loads models:/fraud-detector@champion        │
+  │                             at start; reads features from online store;  │
+  │                             logs features + model version per request)   │
+  │                                                                          │
+  │  CronJob: skew-check (recompute features offline, compare, alert)        │
+  └──────────────────────────────────────────────────────────────────────────┘</code></pre>
+    <ul>
+      <li>Run the tracking server as a normal Deployment with a database and object storage behind it; never keep its data on a pod's local disk.</li>
+      <li>Give training Jobs credentials to <em>write</em> to the tracker, and serving pods only to <em>read</em> the registry (see <a href="../Kubernetes/kubernetes-config-security.html">Config, Secrets &amp; Security</a>).</li>
+      <li>To roll out a new champion, change the alias and run <code>kubectl rollout restart deployment/model-server</code>. The rolling update (see <a href="../Kubernetes/kubernetes-autoscaling-probes-rollouts.html#rolling">Rolling Updates</a>) swaps pods without downtime, and the readiness probe should only pass once the model is loaded.</li>
+      <li>For GPU models, see <a href="../Kubernetes/kubernetes-gpu-scheduling.html#inference">Serving an LLM</a> on the GPU Scheduling page.</li>
+    </ul>
+  </section>
+
+  <section id="pitfalls">
+    <h2>12. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Tracking only metrics.</strong> Without the data hash, code commit and environment, you know a run was good but not how to rebuild it.</li>
+      <li><strong>Serving "latest".</strong> A new version appears in the registry and production picks it up without any gate. Always serve an alias that a person or a gate moves on purpose.</li>
+      <li><strong>Two implementations of one feature.</strong> The classic source of skew. One definition, two readers.</li>
+      <li><strong>Joining today's feature values onto old labels.</strong> Leakage. Use point-in-time joins.</li>
+      <li><strong>Feature timestamps = computation start, not availability.</strong> A small, steady leak for events that happened while the job was still running.</li>
+      <li><strong>Watching only AUC and PSI.</strong> As the scenario showed, both can stay calm while recall halves. Add row-level skew checks and a "share flagged" monitor.</li>
+      <li><strong>Not logging served features.</strong> Then you cannot check skew, debug a single bad decision, or build the next training set from real serving data.</li>
+      <li><strong>Loading model files from unknown sources.</strong> Pickle-based model files can run code when loaded. Only load what your own pipeline produced.</li>
+      <li><strong>A feature store for one batch model.</strong> Extra systems to run, for no gain. Start with shared feature code and point-in-time SQL.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>13. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: what is missing?</h3>
+    <p>A run logged the code commit, all parameters and the metrics. A month later, retraining with the same commit and parameters gives AUC 0.91 instead of 0.95. Name two likely missing ingredients.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The <strong>data version</strong> (the table changed since then: new rows, fixed labels) and the <strong>environment</strong> (a library upgrade changed defaults). Seeds are a third candidate, though they usually cause smaller differences.</p>
+    </details>
+    <h3>Problem 2: point-in-time join</h3>
+    <p>Feature "orders_7d" for user 42: 3 at 2026-05-01 00:00, 5 at 2026-05-02 00:00, 9 at 2026-05-03 00:00. Labelled events: 2026-05-02 18:30 and 2026-05-03 00:00. Which value does each event get?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Take the latest value at or before the event. 2026-05-02 18:30 gets <strong>5</strong>. 2026-05-03 00:00 gets <strong>9</strong> (timestamps equal, and "at or before" includes equal). If the 9 was only available at 02:00, its timestamp should say 02:00, and the second event would get 5.</p>
+    </details>
+    <h3>Problem 3: rollback</h3>
+    <p>Version 9 is <code>@champion</code>. Errors rise after the switch from version 8. Write the steps to roll back without building anything.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Set the alias back: <code>set_registered_model_alias("fraud-detector", "champion", "8")</code>. Restart the serving pods so they load it: <code>kubectl rollout restart deployment/model-server</code>. Check the model version in the prediction logs to confirm all pods serve version 8.</p>
+    </details>
+    <h3>Problem 4: skew or drift?</h3>
+    <p>(a) After a festival sale, average order value doubles for two weeks. (b) After a service rewrite, the "account_age_days" feature is in hours. Which one is skew and which is drift, and what is the fix for each?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>(a) is <strong>drift</strong>: the world changed. Monitor, and retrain if the change lasts and hurts quality. (b) is <strong>skew</strong>: your serving code disagrees with training. Fix the code (or move the feature into the shared feature store); retraining would only teach the model the bug.</p>
+    </details>
+    <h3>Problem 5: the threshold effect</h3>
+    <p>Why can AUC stay nearly the same while recall at a fixed threshold drops by half?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>AUC only checks the <em>order</em> of scores (are positives above negatives?). If skew lowers all fraud scores but keeps them mostly above the non-fraud scores, the order, and so AUC, hardly changes. Recall at 0.5 depends on the <em>actual values</em>: lowered scores fall under 0.5 and stop being flagged.</p>
+    </details>
+  <p class="refer-link"><small>Refer: <a href="https://mlflow.org/docs/latest/ml/tracking/" rel="noopener noreferrer">MLflow Tracking</a> &middot; <a href="https://mlflow.org/docs/latest/ml/model-registry/" rel="noopener noreferrer">MLflow Model Registry (aliases)</a> &middot; <a href="https://docs.feast.dev/" rel="noopener noreferrer">Feast documentation</a> &middot; <a href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" rel="noopener noreferrer">Feast: point-in-time joins</a> &middot; <a href="https://pandas.pydata.org/docs/reference/api/pandas.merge_asof.html" rel="noopener noreferrer">pandas.merge_asof</a> &middot; <a href="https://developers.google.com/machine-learning/guides/rules-of-ml" rel="noopener noreferrer">Google: Rules of Machine Learning (training-serving skew)</a> &middot; <a href="https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html" rel="noopener noreferrer">Sculley et al. (2015): Hidden Technical Debt in ML Systems</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="devops-cicd-mlops.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">CI/CD and MLOps on Kubernetes</span></a>
+    <p class="prev-next-step">Page 16 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="devops-cicd-mlops.html">CI/CD and MLOps on Kubernetes</a> &middot; <a href="../../../AI Engineer/learn/Foundations-and-Architecture/ai-engineering-classical-ml.html">Classical ML from Zero</a> &middot; <a href="../../../AI Engineer/learn/Foundations-and-Architecture/ai-engineering-trees-ensembles.html">Trees and Ensembles</a> &middot; <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-llmops-monitoring.html">LLMOps Monitoring</a> &middot; <a href="../../../AI Engineer/learn/Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

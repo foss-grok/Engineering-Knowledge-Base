@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Debugging Pods: Pending, CrashLoopBackOff, ImagePullBackOff | Docker &amp; Kubernetes</title>
+  <meta name="description" content="A beginner's playbook for broken Kubernetes pods: the pod lifecycle and where each failure appears, the five commands that solve most cases, Pending, ContainerCreating, ErrImagePull and ImagePullBackOff, CreateContainerConfigError, CrashLoopBackOff with back-off timing math, exit codes 1, 126, 127, 137, 139 and 143, Running but not Ready, stuck Terminating, kubectl debug, and a full walkthrough of a release stuck in a crash loop, with pitfalls and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; Debugging Pods</p>
+  </nav>
+  <h1>Debugging Pods: Pending, CrashLoopBackOff, ImagePullBackOff</h1>
+  <p>Sooner or later, <code>kubectl get pods</code> shows something other than <code>Running</code>. The good news: there are only a handful of failure states, each one tells you <em>which step</em> of a pod's life failed, and the same five commands solve almost all of them. This page is a playbook. Find your STATUS, follow the steps, fix the cause. It ends with a full walkthrough of a real-style incident.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#lifecycle">A Pod's Life, and Where It Can Break</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#five-commands">The Five Commands</a></li>
+    <li><a href="#map">Find Your STATUS</a></li>
+    <li><a href="#pending">Pending</a></li>
+    <li><a href="#creating">Stuck in ContainerCreating</a></li>
+    <li><a href="#image">ErrImagePull and ImagePullBackOff</a></li>
+    <li><a href="#config-error">CreateContainerConfigError</a></li>
+    <li><a href="#crashloop">CrashLoopBackOff and the Back-off Math</a></li>
+    <li><a href="#exit-codes">Exit Codes, Decoded</a></li>
+    <li><a href="#not-ready">Running but Not Ready</a></li>
+    <li><a href="#terminating">Stuck in Terminating</a></li>
+    <li><a href="#debug">Getting Inside: kubectl debug</a></li>
+    <li><a href="#walkthrough">Walkthrough: a Release Stuck in a Crash Loop</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="lifecycle">
+    <h2>1. A Pod's Life, and Where It Can Break</h2>
+    <p>A pod goes through the same steps every time. Each failure state belongs to one step:</p>
+    <pre><code>  kubectl apply
+       │
+  1. SCHEDULE   scheduler picks a node     ─► fails as: Pending
+       │
+  2. PREPARE    network + volumes set up   ─► fails as: ContainerCreating (stuck)
+       │
+  3. PULL       image downloaded           ─► fails as: ErrImagePull / ImagePullBackOff
+       │
+  4. CONFIGURE  env from ConfigMap/Secret  ─► fails as: CreateContainerConfigError
+       │
+  5. RUN        your process runs          ─► fails as: Error, CrashLoopBackOff, OOMKilled
+       │
+  6. READY      readiness probe passes     ─► fails as: Running but READY 0/1
+       │
+  serving traffic ... later, 7. STOP       ─► fails as: Terminating (stuck)</code></pre>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Debugging a pod is like finding where a parcel got stuck. "Not yet shipped" (Pending), "at the depot" (ContainerCreating), "wrong address" (image not found), "opened and returned" (crash). The status tells you the step, so you only need to look at that step.</p>
+    </div>
+    <p>Steps 1 to 4 fail <em>before your code runs</em>, so your app's logs are empty. The answer is in <strong>events</strong>. Step 5 onward fails <em>in your code</em>, so the answer is usually in the <strong>logs</strong>.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <table>
+      <thead><tr><th>Word</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Phase</strong></td><td>The pod's overall stage: Pending, Running, Succeeded, Failed, or Unknown.</td></tr>
+        <tr><td><strong>Container state</strong></td><td>Each container is Waiting, Running, or Terminated. The <em>reason</em> (like <code>CrashLoopBackOff</code>) is what <code>kubectl get pods</code> shows in STATUS.</td></tr>
+        <tr><td><strong>Event</strong></td><td>A short message Kubernetes records about an object ("pulled image", "back-off restarting"). Kept for about one hour by default.</td></tr>
+        <tr><td><strong>Restart count</strong></td><td>How many times the kubelet restarted a container in this pod.</td></tr>
+        <tr><td><strong>Exit code</strong></td><td>The number a process returns when it ends. 0 means success; anything else is a failure.</td></tr>
+        <tr><td><strong>Back-off</strong></td><td>Waiting longer and longer between retries, so a broken thing is not retried thousands of times a minute.</td></tr>
+        <tr><td><strong>Signal</strong></td><td>A message the operating system sends to a process. SIGTERM means "please stop"; SIGKILL means "stop now" and cannot be ignored.</td></tr>
+        <tr><td><strong>Finalizer</strong></td><td>A "do not delete yet" note on an object. A controller must remove it before the object really goes away.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="five-commands">
+    <h2>3. The Five Commands</h2>
+    <pre><code># 1. What state is it in? (-o wide also shows the node and pod IP)
+kubectl get pods -o wide
+
+# 2. Why? Events at the bottom, container state and last state in the middle
+kubectl describe pod &lt;pod&gt;
+
+# 3. What did the app print? --previous = the container that just crashed
+kubectl logs &lt;pod&gt; --previous
+kubectl logs &lt;pod&gt; -c &lt;container&gt;          # pick a container if there are several
+
+# 4. What happened around it, in time order?
+kubectl get events --sort-by=.lastTimestamp
+
+# 5. Let me look inside
+kubectl debug -it &lt;pod&gt; --image=busybox:1.36 --target=&lt;container&gt;</code></pre>
+    <p>The single most useful habit: when a container keeps restarting, <code>kubectl logs</code> shows the <em>new</em>, maybe empty, container. Add <code>--previous</code> to see the one that crashed.</p>
+  </section>
+
+  <section id="map">
+    <h2>4. Find Your STATUS</h2>
+    <table>
+      <thead><tr><th>STATUS you see</th><th>Step that failed</th><th>Look at</th><th>Go to</th></tr></thead>
+      <tbody>
+        <tr><td><code>Pending</code></td><td>Schedule</td><td>Events: FailedScheduling</td><td><a href="#pending">Section 5</a></td></tr>
+        <tr><td><code>ContainerCreating</code> for minutes</td><td>Prepare</td><td>Events: FailedMount, FailedCreatePodSandBox</td><td><a href="#creating">Section 6</a></td></tr>
+        <tr><td><code>ErrImagePull</code>, <code>ImagePullBackOff</code></td><td>Pull</td><td>Events: Failed to pull image</td><td><a href="#image">Section 7</a></td></tr>
+        <tr><td><code>CreateContainerConfigError</code></td><td>Configure</td><td>Events / describe: missing Secret or key</td><td><a href="#config-error">Section 8</a></td></tr>
+        <tr><td><code>Error</code>, <code>CrashLoopBackOff</code></td><td>Run</td><td><code>logs --previous</code>, Last State, exit code</td><td><a href="#crashloop">Section 9</a></td></tr>
+        <tr><td><code>OOMKilled</code></td><td>Run (memory limit)</td><td>Last State: OOMKilled, exit code 137</td><td><a href="../../../CS-Fundamentals/learn/Scenarios/scenario-pod-oomkilled-memory-leak.html">OOMKilled scenario</a></td></tr>
+        <tr><td><code>Running</code> but READY <code>0/1</code></td><td>Ready</td><td>Events: Readiness probe failed</td><td><a href="#not-ready">Section 11</a></td></tr>
+        <tr><td><code>Terminating</code> for minutes</td><td>Stop</td><td>Finalizers, node health</td><td><a href="#terminating">Section 12</a></td></tr>
+        <tr><td><code>Evicted</code> / <code>Error</code> with reason Evicted</td><td>Node ran short</td><td>describe: "The node was low on resource"</td><td><a href="kubernetes-scheduling.html#eviction">Eviction order</a></td></tr>
+        <tr><td><code>Completed</code></td><td>Nothing failed</td><td>The process exited 0. Normal for Jobs; a bug for a web server (it should not exit)</td><td>-</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="pending">
+    <h2>5. Pending</h2>
+    <p>No node was chosen yet. <code>kubectl describe pod</code> shows a <code>FailedScheduling</code> event that lists why each node was rejected, like <code>0/5 nodes are available: 3 Insufficient cpu, 2 node(s) had untolerated taint</code>. Every phrase in that message is decoded in <a href="kubernetes-scheduling.html#pending">Scheduling: Reading a FailedScheduling Message</a>.</p>
+    <p>One more common cause: the pod uses a PersistentVolumeClaim that is not bound yet. Check with <code>kubectl get pvc</code>; a claim stuck in <code>Pending</code> usually means a wrong <code>storageClassName</code> or no provisioner (see <a href="kubernetes-storage.html">Storage</a>).</p>
+  </section>
+
+  <section id="creating">
+    <h2>6. Stuck in ContainerCreating</h2>
+    <p>The pod has a node, but the kubelet cannot finish setting it up. A short ContainerCreating (seconds) is normal; minutes is not. Look at the events:</p>
+    <table>
+      <thead><tr><th>Event message (shortened)</th><th>Meaning</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>MountVolume.SetUp failed ... secret "db-creds" not found</code></td><td>A volume refers to a Secret or ConfigMap that does not exist in this namespace</td><td>Create it, or fix the name/namespace</td></tr>
+        <tr><td><code>Multi-Attach error for volume ... already used by pod(s)</code></td><td>A ReadWriteOnce disk is still attached to another node (often the old pod during a rollout)</td><td>Use the <code>Recreate</code> strategy for single-disk apps, or a StatefulSet</td></tr>
+        <tr><td><code>FailedCreatePodSandBox ... failed to set up network</code></td><td>The network plugin (CNI) could not give the pod an IP</td><td>Check CNI pods in kube-system; check the node or subnet has free IPs</td></tr>
+        <tr><td><code>Unable to attach or mount volumes: timed out waiting</code></td><td>Cloud disk attach is slow or failing</td><td>Check the CSI driver pods and the disk's zone (it must match the node's zone)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="image">
+    <h2>7. ErrImagePull and ImagePullBackOff</h2>
+    <p><code>ErrImagePull</code> is one failed pull. <code>ImagePullBackOff</code> means "it failed, and I am waiting before I try again". The wait grows (about 10 s, 20 s, 40 s... up to 5 minutes), so after fixing the cause you may wait a while unless you delete the pod to retry at once.</p>
+    <p>The event message tells you which problem you have:</p>
+    <table>
+      <thead><tr><th>Message contains</th><th>Cause</th><th>Check</th></tr></thead>
+      <tbody>
+        <tr><td><code>not found</code> / <code>manifest unknown</code></td><td>The tag does not exist (typo, or CI never pushed it)</td><td>List tags in the registry; compare with the image line in the pod</td></tr>
+        <tr><td><code>unauthorized</code> / <code>pull access denied</code> / <code>403</code></td><td>Private registry, no or wrong credentials</td><td><code>imagePullSecrets</code> on the pod or its ServiceAccount; secret in the same namespace</td></tr>
+        <tr><td><code>toomanyrequests</code></td><td>Registry rate limit (common with anonymous Docker Hub pulls)</td><td>Authenticate, or use a mirror or your own registry</td></tr>
+        <tr><td><code>no match for platform in manifest</code></td><td>Image built for another CPU type (arm64 vs amd64)</td><td>Build multi-arch images (see <a href="../Docker/docker-advanced.html">Advanced Docker</a>)</td></tr>
+        <tr><td><code>i/o timeout</code> / <code>no such host</code></td><td>The node cannot reach the registry (DNS, firewall, proxy)</td><td>Test from a debug pod on that node</td></tr>
+      </tbody>
+    </table>
+    <p>Tip: pin images by digest (<code>image: repo/app@sha256:...</code>) or by a unique tag per build. The tag <code>latest</code> makes it hard to know what is running and why two pods differ.</p>
+  </section>
+
+  <section id="config-error">
+    <h2>8. CreateContainerConfigError</h2>
+    <p>The image is there, but the kubelet cannot build the container's settings. Almost always: an environment variable points to a ConfigMap or Secret (or a key inside one) that does not exist.</p>
+    <pre><code>Warning  Failed  kubelet  Error: couldn't find key DB_PASSWORD in Secret payments/db-creds</code></pre>
+    <p>Fix the name or add the key. The pod starts on its own at the next retry; no restart needed.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Two ways to load config, two different failures.</strong> With <code>valueFrom: configMapKeyRef</code> (one named key), a missing key stops the container from being created: <code>CreateContainerConfigError</code>, and your code never runs. With <code>envFrom: configMapRef</code> (load every key), Kubernetes loads whatever keys exist and does <em>not</em> complain about missing ones; your app starts without the variable and crashes, which you see as <code>CrashLoopBackOff</code>. The walkthrough in section 14 is exactly this case.</p>
+    </div>
+  </section>
+
+  <section id="crashloop">
+    <h2>9. CrashLoopBackOff and the Back-off Math</h2>
+    <p><code>CrashLoopBackOff</code> is not an error by itself. It means: "the container keeps exiting, so I am waiting before I start it again". The real error is in the logs of the crashed container and in its exit code.</p>
+    <h3>How long the waits are</h3>
+    <p>With the default <code>restartPolicy: Always</code>, the kubelet restarts a container that exits. After each crash it waits: 10 s, then 20 s, 40 s, 80 s, 160 s, and then 300 s (5 minutes, the cap) for every later crash. If a container then runs fine for 10 minutes, the wait resets to 10 s. (Newer Kubernetes versions have optional settings to shorten these waits; check your cluster version.)</p>
+    <pre><code>wait before restart n  =  min(10 s &times; 2^(n-1), 300 s)</code></pre>
+    <p><strong>Worked example.</strong> An app crashes 2 seconds after it starts. Times since the first start:</p>
+    <table>
+      <thead><tr><th>Event</th><th>Time</th><th>RESTARTS shown</th></tr></thead>
+      <tbody>
+        <tr><td>Start, crash at 2 s, wait 10 s</td><td>0 to 12 s</td><td>0</td></tr>
+        <tr><td>Restart 1, crash, wait 20 s</td><td>12 to 34 s</td><td>1</td></tr>
+        <tr><td>Restart 2, crash, wait 40 s</td><td>34 to 76 s</td><td>2</td></tr>
+        <tr><td>Restart 3, crash, wait 80 s</td><td>76 to 158 s</td><td>3</td></tr>
+        <tr><td>Restart 4, crash, wait 160 s</td><td>158 to 320 s</td><td>4</td></tr>
+        <tr><td>Restart 5, crash, wait 300 s</td><td>320 to 622 s</td><td>5</td></tr>
+        <tr><td>Then every 302 s or so</td><td>...</td><td>about 12 per hour</td></tr>
+      </tbody>
+    </table>
+    <p>So right after you fix the cause (say, you add a missing Secret), the pod may sit in back-off for up to 5 more minutes. Deleting the pod (its Deployment makes a fresh one) or <code>kubectl rollout restart</code> skips the wait.</p>
+    <h3>The diagnosis steps</h3>
+    <ol>
+      <li><code>kubectl describe pod &lt;pod&gt;</code>: read <strong>Last State</strong> (reason and exit code) and <strong>Restart Count</strong>.</li>
+      <li><code>kubectl logs &lt;pod&gt; --previous</code>: read the last lines the crashed process printed.</li>
+      <li>Match the exit code to the table in section 10.</li>
+      <li>Ask: <em>what changed?</em> A new image, new config, a new dependency, or new limits? Compare with <code>kubectl rollout history deployment/&lt;name&gt;</code>.</li>
+    </ol>
+    <p>Common causes: missing or wrong config, cannot reach a database at start-up and exits instead of retrying, wrong command or arguments, missing file, permission denied (the image expects root but the pod runs as non-root), the liveness probe killing a slow-starting app (exit code 137 or 143, with "Liveness probe failed" in events; fix with a startup probe, see <a href="kubernetes-autoscaling-probes-rollouts.html#probes">Probes</a>), and running out of memory (OOMKilled).</p>
+  </section>
+
+  <section id="exit-codes">
+    <h2>10. Exit Codes, Decoded</h2>
+    <p>Codes from 0 to 127 come from the program itself. Codes above 128 mean "killed by a signal": subtract 128 to get the signal number.</p>
+    <table>
+      <thead><tr><th>Exit code</th><th>Meaning</th><th>Usual cause in Kubernetes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>0</strong></td><td>Success</td><td>Normal for Jobs. For a server, it means the process ended when it should keep running (for example, the main command ran in the background and the shell exited).</td></tr>
+        <tr><td><strong>1</strong></td><td>General error</td><td>The app threw an error: read the logs</td></tr>
+        <tr><td><strong>2</strong></td><td>Misuse of a shell command</td><td>Bad arguments or a shell script syntax error</td></tr>
+        <tr><td><strong>126</strong></td><td>Found but not executable</td><td>File lacks execute permission, or permission denied</td></tr>
+        <tr><td><strong>127</strong></td><td>Command not found</td><td>Typo in <code>command</code>, or a tool missing from a slim image. (If the very first program cannot be started, the runtime may report <code>StartError</code> with "executable file not found in $PATH" instead.)</td></tr>
+        <tr><td><strong>137</strong></td><td>128 + 9 = SIGKILL</td><td>OOMKilled (check the reason), or killed after the grace period, or by a failing liveness probe</td></tr>
+        <tr><td><strong>139</strong></td><td>128 + 11 = SIGSEGV</td><td>The program touched memory it should not (a crash in native code)</td></tr>
+        <tr><td><strong>143</strong></td><td>128 + 15 = SIGTERM</td><td>Asked to stop: normal during shutdown; during start-up it often means a liveness probe restart</td></tr>
+      </tbody>
+    </table>
+    <p>Read the exit code from <code>describe</code>, or directly:</p>
+    <pre><code>kubectl get pod &lt;pod&gt; -o jsonpath='{.status.containerStatuses[0].lastState.terminated}'
+# {"exitCode":1,"reason":"Error","startedAt":"...","finishedAt":"..."}</code></pre>
+  </section>
+
+  <section id="not-ready">
+    <h2>11. Running but Not Ready</h2>
+    <p>The process is running, but the readiness probe fails, so the Service sends it no traffic. Users may see 503 errors if <em>no</em> pod is ready.</p>
+    <pre><code>kubectl describe pod &lt;pod&gt;
+#  Warning  Unhealthy  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 500
+
+kubectl get endpointslices -l kubernetes.io/service-name=&lt;service&gt;   # empty = no ready pods</code></pre>
+    <p>Check, in order: is the probe's path and port right (a common slip is probing 8080 when the app listens on 3000)? Does the app bind to <code>0.0.0.0</code> and not only to <code>127.0.0.1</code>? Does the readiness endpoint depend on something that is down (a database), so that every pod drops out at once? The design of good probe endpoints is covered in <a href="kubernetes-autoscaling-probes-rollouts.html#probes">Autoscaling, Probes &amp; Rollouts</a>.</p>
+  </section>
+
+  <section id="terminating">
+    <h2>12. Stuck in Terminating</h2>
+    <p>A pod being deleted gets SIGTERM, then up to <code>terminationGracePeriodSeconds</code> (default 30 s), then SIGKILL. If it shows <code>Terminating</code> for much longer:</p>
+    <ul>
+      <li><strong>The node is down or unreachable.</strong> The kubelet on it cannot confirm the pod stopped. The API keeps the pod until the node returns or the node object is deleted.</li>
+      <li><strong>A finalizer is waiting.</strong> Check <code>kubectl get pod &lt;pod&gt; -o jsonpath='{.metadata.finalizers}'</code>. The controller that owns the finalizer must finish its cleanup.</li>
+      <li><strong>A long grace period</strong> on purpose (some databases set minutes).</li>
+    </ul>
+    <p><code>kubectl delete pod &lt;pod&gt; --grace-period=0 --force</code> removes the pod from the API <em>without</em> waiting for the node to confirm. If the node is actually still running it, two copies may run at once. For a StatefulSet pod writing to a disk, that can corrupt data. Force delete only when you are sure the node or process is really gone.</p>
+  </section>
+
+  <section id="debug">
+    <h2>13. Getting Inside: kubectl debug</h2>
+    <p>Many production images are "distroless": no shell, no curl, nothing to debug with. <code>kubectl debug</code> solves this.</p>
+    <pre><code># A temporary debug container inside the running pod; --target shares the app's process view
+kubectl debug -it api-7d9c6b5f4-x2k8p --image=busybox:1.36 --target=api
+/ # ps aux                      # see the app's processes
+/ # wget -qO- localhost:8080/ready
+/ # cat /proc/1/environ | tr '\0' '\n'   # the app's environment variables
+
+# Crash-looping pod? Make a copy whose app container runs a shell instead of the app
+# (needs a shell in the image), then start the app by hand and watch it fail
+kubectl debug api-7d9c6b5f4-x2k8p -it --copy-to=api-debug --container=api -- sh
+
+# Debug the node itself (its files are mounted at /host)
+kubectl debug node/worker-1 -it --image=busybox:1.36</code></pre>
+    <p>Ephemeral debug containers cannot be removed from a pod once added; they simply stop when you exit. Delete <code>--copy-to</code> pods when you are done.</p>
+  </section>
+
+  <section id="walkthrough">
+    <h2>14. Walkthrough: a Release Stuck in a Crash Loop</h2>
+    <p><strong>The setup.</strong> The <code>checkout</code> service runs 4 replicas. Its Deployment uses <code>maxSurge: 1</code>, <code>maxUnavailable: 0</code> and loads config with <code>envFrom</code> from the ConfigMap <code>checkout-config</code>. At 14:00 the team ships version 2.3. At 14:12 someone notices the deploy job is still "waiting for rollout".</p>
+    <h3>Step 1: what state is it in?</h3>
+    <pre><code>$ kubectl get pods -l app=checkout
+NAME                        READY   STATUS             RESTARTS      AGE
+checkout-6f8b7c9d5-4lq2m    1/1     Running            0             2d
+checkout-6f8b7c9d5-9xk7w    1/1     Running            0             2d
+checkout-6f8b7c9d5-c2v8n    1/1     Running            0             2d
+checkout-6f8b7c9d5-t5r1z    1/1     Running            0             2d
+checkout-7d9c6b5f4-x2k8p    0/1     CrashLoopBackOff   4 (32s ago)   3m10s</code></pre>
+    <p>Reading it: 4 old pods (hash <code>6f8b7c9d5</code>) are fine. One new pod (hash <code>7d9c6b5f4</code>) is crash-looping. Because <code>maxUnavailable: 0</code>, the rollout will not remove an old pod until a new one is ready, so <strong>users are not affected</strong>. That setting just turned a possible outage into a stuck deploy. (RESTARTS 4 at age 3m10s matches the back-off table in section 9: restarts at 12, 34, 76 and 158 seconds, the last one 32 seconds ago.)</p>
+    <h3>Step 2: why is it crashing?</h3>
+    <pre><code>$ kubectl describe pod checkout-7d9c6b5f4-x2k8p
+...
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    1
+    Restart Count:  4
+...
+Events:
+  Warning  BackOff  kubelet  Back-off restarting failed container checkout in pod checkout-7d9c6b5f4-x2k8p
+
+$ kubectl logs checkout-7d9c6b5f4-x2k8p --previous
+INFO  starting checkout v2.3
+ERROR config: required setting PAYMENTS_URL is not set
+Traceback (most recent call last):
+  ...
+KeyError: 'PAYMENTS_URL'</code></pre>
+    <p>Exit code 1, an application error. The log says exactly what is missing: <code>PAYMENTS_URL</code>.</p>
+    <h3>Step 3: what changed?</h3>
+    <pre><code>$ kubectl get configmap checkout-config -o jsonpath='{.data}' | tr ',' '\n'
+{"DB_HOST":"pg.internal"
+"LOG_LEVEL":"info"
+"PAYMENTS_HOST":"payments.internal"}</code></pre>
+    <p>Version 2.3 replaced the old setting <code>PAYMENTS_HOST</code> with a full <code>PAYMENTS_URL</code>. The developer added the new key to the <em>staging</em> ConfigMap only. Because the Deployment uses <code>envFrom</code>, Kubernetes did not complain about a missing key (section 8); the app started without it and crashed.</p>
+    <h3>Step 4: stop the bleeding, then fix</h3>
+    <p>Two safe options:</p>
+    <ul>
+      <li><strong>Roll back</strong>: <code>kubectl rollout undo deployment/checkout</code>. The crashing pod is removed and you are back to 4 healthy pods. Best when the fix is not obvious.</li>
+      <li><strong>Roll forward</strong>: add the key, then restart the rollout. Environment variables are read only when a container starts, so the new value reaches pods only through new pods.</li>
+    </ul>
+    <pre><code>$ kubectl patch configmap checkout-config --type merge \
+    -p '{"data":{"PAYMENTS_URL":"https://payments.internal:8443"}}'
+$ kubectl rollout restart deployment/checkout      # new pods, no 5-minute back-off wait
+$ kubectl rollout status deployment/checkout
+deployment "checkout" successfully rolled out</code></pre>
+    <p>In a GitOps setup (see <a href="../DevOps/devops-cicd-mlops.html#cd">CD with Argo CD</a>), make the same change in Git instead of with <code>kubectl patch</code>, or the next sync will undo it.</p>
+    <h3>Step 5: what if nobody had noticed?</h3>
+    <p>A Deployment has <code>progressDeadlineSeconds</code> (default 600). After 10 minutes without progress, its status gets the condition <code>Progressing=False, reason ProgressDeadlineExceeded</code>, and <code>kubectl rollout status</code> exits with an error. It does <em>not</em> roll back by itself. Make your deploy job wait on <code>rollout status</code> and fail loudly, or let a tool like Argo Rollouts roll back automatically.</p>
+    <h3>Step 6: make it not happen again</h3>
+    <ul>
+      <li><strong>Fail fast with a clear message.</strong> The app checked its config at start-up and printed the missing name. That made the fix take minutes. Keep it.</li>
+      <li><strong>Check config in CI.</strong> A small test can list the environment variables the code requires and compare them with each environment's ConfigMap.</li>
+      <li><strong>Prefer explicit keys for required settings.</strong> With <code>valueFrom.configMapKeyRef</code>, a missing key blocks the pod before it starts (<code>CreateContainerConfigError</code>), which is clearer than a crash.</li>
+      <li><strong>Keep <code>maxUnavailable: 0</code></strong> for user-facing services. It is why this was a stuck deploy and not an outage.</li>
+      <li><strong>Alert on restarts</strong>, for example when <code>kube_pod_container_status_restarts_total</code> rises by more than 3 in 10 minutes (see <a href="kubernetes-helm-observability.html#prometheus">Prometheus</a>).</li>
+    </ul>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Reading <code>kubectl logs</code> without <code>--previous</code></strong> on a restarting pod, and seeing nothing useful.</li>
+      <li><strong>Looking for logs when the pod never started.</strong> For Pending, ContainerCreating, ImagePullBackOff and CreateContainerConfigError, the answer is in events, not logs.</li>
+      <li><strong>Waiting for events that expired.</strong> Events are kept for about an hour. Ship them to your logging system if you need history.</li>
+      <li><strong>Thinking CrashLoopBackOff is the error.</strong> It is only the waiting. Find the exit code and the last log lines.</li>
+      <li><strong>Changing a ConfigMap and expecting env vars to update.</strong> They do not change in running containers. Restart the pods. (Files mounted from a ConfigMap do update after a short delay, unless mounted with <code>subPath</code>.)</li>
+      <li><strong>Liveness probe checks a dependency.</strong> The database blips and every pod restarts in a loop.</li>
+      <li><strong>Force-deleting StatefulSet pods</strong> on a node that might still be alive.</li>
+      <li><strong>Using the <code>latest</code> tag.</strong> Two pods of the "same" version can run different code.</li>
+      <li><strong>Debugging the wrong namespace.</strong> Add <code>-n &lt;namespace&gt;</code>, or check your context with <code>kubectl config get-contexts</code>.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>16. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: logs or events?</h3>
+    <p>A pod shows <code>ImagePullBackOff</code>. A teammate runs <code>kubectl logs</code> and gets an error. Where should they look, and why?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>In <code>kubectl describe pod</code> (the Events section). The image was never pulled, so no container ever ran, and there are no logs. The event message (not found, unauthorized, rate limit, platform) names the cause.</p>
+    </details>
+    <h3>Problem 2: back-off timing</h3>
+    <p>A container crashes 1 second after it starts, over and over. About how many restarts will the RESTARTS column show after 10 minutes?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Restart times (each run 1 s plus the wait): 11, 32, 73, 154, 315, then 616 s. 616 s is just after 10 minutes (600 s), so about <strong>5 restarts</strong>. After that, roughly one every 5 minutes.</p>
+    </details>
+    <h3>Problem 3: decode the exit code</h3>
+    <p>Last State shows <code>Reason: Error, Exit Code: 143</code>, and events show <code>Liveness probe failed: Get "http://10.0.3.7:8080/healthz": context deadline exceeded</code> about 30 seconds after each start. What is going on?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>143 = 128 + 15 = SIGTERM. The kubelet stopped the container because the liveness probe failed: the app is not answering <code>/healthz</code> in time, likely because it is still starting. Add a <strong>startup probe</strong> with enough budget (or fix slow start-up). Do not just raise the liveness timeouts for the whole life of the pod.</p>
+    </details>
+    <h3>Problem 4: which error will you see?</h3>
+    <p>A Secret <code>api-keys</code> has the key <code>STRIPE</code>. Pod A uses <code>valueFrom.secretKeyRef</code> with key <code>STRIPE_KEY</code>. Pod B uses <code>envFrom.secretRef: api-keys</code> and its code reads <code>STRIPE_KEY</code>. What STATUS does each show?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Pod A: <strong>CreateContainerConfigError</strong> ("couldn't find key STRIPE_KEY in Secret"). Pod B: it starts with an env var named <code>STRIPE</code>, not <code>STRIPE_KEY</code>; if the code requires <code>STRIPE_KEY</code> it exits, and you see <strong>Error</strong> then <strong>CrashLoopBackOff</strong>.</p>
+    </details>
+    <h3>Problem 5: the silent Completed</h3>
+    <p>A web server pod goes <code>Completed</code>, then <code>CrashLoopBackOff</code>, with exit code 0. The Dockerfile ends with <code>CMD ./start.sh</code>, and <code>start.sh</code> runs <code>./server &amp;</code>. What is wrong?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The <code>&amp;</code> runs the server in the background, so the script reaches its end and exits with 0. The container's main process ended, so the container ended. Run the server in the foreground, ideally with <code>exec ./server</code> so it becomes PID 1 and also receives SIGTERM correctly (see <a href="../Docker/containers-under-the-hood.html">How Containers Really Work</a>).</p>
+    </details>
+    <h3>Problem 6: stuck rollout, no alerts</h3>
+    <p>In the walkthrough, which two settings decided that users saw no errors, and which setting would have reported the failure after 10 minutes?</p>
+    <details>
+      <summary>Solution</summary>
+      <p><code>maxUnavailable: 0</code> (no old pod removed before a new one is ready) together with the readiness gate (a crashing pod is never ready, so it never gets traffic). <code>progressDeadlineSeconds: 600</code> marks the rollout as failed (<code>ProgressDeadlineExceeded</code>) after 10 minutes without progress.</p>
+    </details>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>17. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>STATUS</th><th>First command</th><th>Most likely cause</th></tr></thead>
+      <tbody>
+        <tr><td>Pending</td><td><code>kubectl describe pod</code></td><td>No node fits (requests, taints, affinity), PVC unbound</td></tr>
+        <tr><td>ContainerCreating</td><td><code>kubectl describe pod</code></td><td>Volume mount or CNI problem</td></tr>
+        <tr><td>ImagePullBackOff</td><td><code>kubectl describe pod</code></td><td>Wrong tag, no pull secret, rate limit, wrong CPU type</td></tr>
+        <tr><td>CreateContainerConfigError</td><td><code>kubectl describe pod</code></td><td>Missing ConfigMap, Secret, or key</td></tr>
+        <tr><td>CrashLoopBackOff</td><td><code>kubectl logs --previous</code></td><td>App error, bad config, probe kills, OOM</td></tr>
+        <tr><td>Running, 0/1 ready</td><td><code>kubectl describe pod</code></td><td>Readiness probe wrong port or path, dependency down</td></tr>
+        <tr><td>Terminating</td><td><code>kubectl get pod -o yaml</code></td><td>Node gone, finalizer waiting</td></tr>
+      </tbody>
+    </table>
+    <pre><code>kubectl get pods -o wide
+kubectl describe pod &lt;pod&gt;
+kubectl logs &lt;pod&gt; --previous [-c &lt;container&gt;]
+kubectl get events --sort-by=.lastTimestamp
+kubectl get pod &lt;pod&gt; -o jsonpath='{.status.containerStatuses[*].lastState}'
+kubectl rollout status deployment/&lt;name&gt;
+kubectl rollout history deployment/&lt;name&gt;
+kubectl rollout undo deployment/&lt;name&gt;
+kubectl rollout restart deployment/&lt;name&gt;
+kubectl debug -it &lt;pod&gt; --image=busybox:1.36 --target=&lt;container&gt;
+kubectl debug node/&lt;node&gt; -it --image=busybox:1.36</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" rel="noopener noreferrer">Pod lifecycle (restart back-off)</a> &middot; <a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/" rel="noopener noreferrer">Debug pods</a> &middot; <a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/" rel="noopener noreferrer">Debug running pods (kubectl debug)</a> &middot; <a href="https://kubernetes.io/docs/tasks/debug/debug-application/determine-reason-pod-failure/" rel="noopener noreferrer">Determine the reason for pod failure</a> &middot; <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#failed-deployment" rel="noopener noreferrer">Failed deployments (progressDeadlineSeconds)</a> &middot; <a href="https://kubernetes.io/docs/concepts/containers/images/" rel="noopener noreferrer">Images and pull back-off</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="kubernetes-helm-observability.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Helm &amp; Observability</span></a>
+    <a class="prev-next-next" href="kubernetes-gpu-scheduling.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">GPU Scheduling on Kubernetes</span></a>
+    <p class="prev-next-step">Page 13 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="kubernetes-scheduling.html">Scheduling</a> &middot; <a href="kubernetes-autoscaling-probes-rollouts.html">Autoscaling, Probes &amp; Rollouts</a> &middot; <a href="kubernetes-helm-observability.html">Helm &amp; Observability</a> &middot; <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a> &middot; <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-errors-during-deploys.html">Scenario: Errors During Every Deploy</a> &middot; <a href="../../cheatsheets/kubectl-cheatsheet.html">kubectl Cheat Sheet</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>
