@@ -25,6 +25,7 @@ root = Path(__file__).resolve().parent.parent
 TRACKS = {
     "CS-Fundamentals/learn": ("cs-fundamentals-learn.html", [
         "Operating-Systems/os-processes-threads-scheduling.html",
+        "Operating-Systems/os-system-calls.html",
         "Operating-Systems/os-virtual-memory-paging.html",
         "Operating-Systems/os-cpu-caches-memory-hierarchy.html",
         "Operating-Systems/os-file-systems-io.html",
@@ -33,17 +34,20 @@ TRACKS = {
         "Databases/dbms-normalization-schema-design.html",
         "Databases/dbms-transactions-isolation-mvcc.html",
         "Databases/dbms-indexing-btrees-query-plans.html",
+        "Databases/dbms-joins-execution.html",
         "Databases/dbms-replication-sharding-cap.html",
         "Computer-Networks/cn-ip-addressing-subnetting-routing.html",
         "Computer-Networks/cn-tcp-deep-dive.html",
         "Computer-Networks/cn-dns-http.html",
         "Computer-Networks/cn-tls-https-certificates.html",
+        "Computer-Networks/cn-quic-http3.html",
         "Computer-Networks/cn-load-balancing-reverse-proxies.html",
         "Scenarios/scenario-slow-api-debugging.html",
         "Scenarios/scenario-service-cannot-reach-database.html",
         "Scenarios/scenario-database-lock-waits.html",
         "Scenarios/scenario-errors-during-deploys.html",
         "Scenarios/scenario-pod-oomkilled-memory-leak.html",
+        "Scenarios/scenario-retry-storm.html",
     ]),
     "Docker-Kubernetes/learn": ("docker-kubernetes-learn.html", [
         "Docker/docker-fundamentals.html",
@@ -61,6 +65,7 @@ TRACKS = {
         "Kubernetes/kubernetes-troubleshooting.html",
         "Kubernetes/kubernetes-gpu-scheduling.html",
         "DevOps/devops-cicd-mlops.html",
+        "DevOps/devops-infrastructure-as-code.html",
         "DevOps/mlops-tracking-registry-feature-stores.html",
     ]),
 }

@@ -126,7 +126,7 @@ $ cat /proc/$$/maps                   # its memory regions (text, heap, stack, l
     <p>A <strong>context switch</strong> is the act of saving the state of the running process and loading the state of the next one.</p>
     <h3>Step by step</h3>
     <ol>
-      <li>Something gives control to the kernel. Either a <strong>timer interrupt</strong> fires (the time slice is over), or the process makes a <strong>system call</strong> that blocks (for example <code>read()</code> on a socket with no data).</li>
+      <li>Something gives control to the kernel. Either a <strong>timer interrupt</strong> fires (the time slice is over), or the process makes a <strong>system call</strong> that blocks (for example <code>read()</code> on a socket with no data). How a system call works, and what it costs, is on the <a href="os-system-calls.html">system calls</a> page.</li>
       <li>The kernel saves the CPU registers of process A (program counter, stack pointer, general registers) into A's PCB.</li>
       <li>The scheduler picks process B.</li>
       <li>The kernel switches the memory mapping to B's address space (on x86 this means loading a new page table base into the <code>CR3</code> register).</li>
@@ -485,14 +485,14 @@ throttled_usec 612345678     # total time spent throttled</code></pre>
 
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
-    <a class="prev-next-next" href="os-virtual-memory-paging.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Virtual Memory &amp; Paging</span></a>
-    <p class="prev-next-step">Page 1 of 20 in the suggested reading order</p>
+    <a class="prev-next-next" href="os-system-calls.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">System Calls &amp; the Kernel Boundary</span></a>
+    <p class="prev-next-step">Page 1 of 24 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 
   <nav class="page-footer-nav">
     <p>Next in Operating Systems: <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a></p>
-    <p>Related: <a href="os-file-systems-io.html">File Systems &amp; Disk I/O (file descriptors)</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html">Kubernetes Workloads (requests and limits)</a> &middot; <a href="../Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a></p>
+    <p>Related: <a href="os-system-calls.html">System Calls &amp; the Kernel Boundary</a> &middot; <a href="os-file-systems-io.html">File Systems &amp; Disk I/O (file descriptors)</a> &middot; <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-workloads.html">Kubernetes Workloads (requests and limits)</a> &middot; <a href="../Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a></p>
     <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
   </nav>
 </main>

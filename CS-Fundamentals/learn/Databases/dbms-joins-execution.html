@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>SQL Joins &amp; How the Database Executes Them | CS Fundamentals</title>
+  <meta name="description" content="SQL joins from zero: inner, left, right and full joins worked on a tiny table, why a missing ON clause explodes row counts, nested loop, hash and merge joins with measured times (a 2,000 by 10,000 nested loop took 301 ms; the same hash join took 0.79 ms), reading SQLite and PostgreSQL EXPLAIN, and the classic pitfalls of NULLs and accidental many-to-many joins.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; SQL Joins &amp; How the Database Executes Them</p>
+  </nav>
+  <h1>SQL Joins &amp; How the Database Executes Them</h1>
+  <p>Real data is almost never in one table. Customers live in one place, orders in another, items in a third. A <strong>join</strong> is how the database stitches those tables back together, row by row, using a shared key. This page starts with four people and three teams, then shows the three algorithms a database actually uses, with times we measured. It builds on <a href="dbms-normalization-schema-design.html">Normalization &amp; Schema Design</a> (why the data is split) and <a href="dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a> (how a single table is searched).</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why Data Lives in More Than One Table</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#shapes">Four Join Shapes, Worked by Hand</a></li>
+    <li><a href="#cross">Cross Joins: When the Row Count Explodes</a></li>
+    <li><a href="#nested">Algorithm 1: Nested Loop Join</a></li>
+    <li><a href="#hash">Algorithm 2: Hash Join</a></li>
+    <li><a href="#merge">Algorithm 3: Merge Join</a></li>
+    <li><a href="#lab">The Lab: Measured Times</a></li>
+    <li><a href="#explain">Reading the Plan</a></li>
+    <li><a href="#order">Join Order and Many Tables</a></li>
+    <li><a href="#semi">Exists, In, and Anti-Joins</a></li>
+    <li><a href="#nulls">NULL Keys Do Not Match</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why Data Lives in More Than One Table</h2>
+    <p>Suppose you store every order like this:</p>
+    <pre><code>order_id  customer_name  customer_city  product  amount
+1         Ada            Pune           mug      400
+2         Ada            Pune           book     250
+3         Dev            Delhi          mug      400</code></pre>
+    <p>Ada's city is stored twice. If she moves, you must update every row. Miss one, and the same person lives in two cities. That is the update anomaly that <a href="dbms-normalization-schema-design.html">normalization</a> is designed to stop.</p>
+    <p>The usual fix is to split the data and point at it:</p>
+    <pre><code>customers                     orders
+id  name  city                id  customer_id  product  amount
+1   Ada   Pune                1   1            mug      400
+2   Dev   Delhi               2   1            book     250
+                              3   2            mug      400</code></pre>
+    <p>Ada's city now lives in one place. To print "who bought what, and from which city?" the database must <strong>join</strong> the two tables on <code>orders.customer_id = customers.id</code>.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A join is the reverse of a careful split. You split so each fact is stored once. You join so a question that needs two facts can still be answered in one result.</p>
+    </div>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>Join key.</strong> The column (or columns) that say "these two rows belong together." Here, <code>customer_id</code> and <code>id</code>.</li>
+      <li><strong>Inner join.</strong> Keep a result row only when <em>both</em> sides have a match.</li>
+      <li><strong>Left (outer) join.</strong> Keep every row from the left table. If the right side has no match, fill those columns with NULL (a marker that means "unknown / not present").</li>
+      <li><strong>Right join.</strong> The mirror of a left join. Most people write a left join and swap the table order instead.</li>
+      <li><strong>Full (outer) join.</strong> Keep rows from either side, with NULLs where the other side is missing.</li>
+      <li><strong>Cross join.</strong> Every row of A paired with every row of B. Row count is <code>|A| &times; |B|</code>.</li>
+      <li><strong>Cardinality.</strong> How many rows a step produces. A join can shrink a result, or blow it up.</li>
+      <li><strong>Selectivity.</strong> How picky a condition is. "customer_id = 42" is selective. "amount &gt; 0" often is not.</li>
+      <li><strong>Nested loop, hash, and merge join.</strong> The three algorithms the engine uses to actually find matching pairs. The SQL you write does not name them. The planner picks one. You read the choice in <code>EXPLAIN</code>.</li>
+      <li><strong>Build side and probe side.</strong> In a hash join, the engine builds a hash table from one input (usually the smaller one) and probes it with the other.</li>
+    </ul>
+  </section>
+
+  <section id="shapes">
+    <h2>3. Four Join Shapes, Worked by Hand</h2>
+    <p>Here is a tiny company. We will use it for the rest of this section.</p>
+    <pre><code>employees                     teams
+id  name    team_id           id  name
+1   Ada     10                10  Design
+2   Bilal   10                20  Ops
+3   Chen    20                30  Research
+4   Diya    NULL</code></pre>
+    <p>Diya has no team. Research has no people.</p>
+
+    <h3>Inner join</h3>
+    <pre><code>SELECT e.name, t.name AS team
+FROM employees e
+JOIN teams t ON e.team_id = t.id;</code></pre>
+    <p>Walk each employee, look up the team, keep the row only if a team exists:</p>
+    <pre><code>Ada   + 10 -&gt; Design     keep  (Ada, Design)
+Bilal + 10 -&gt; Design     keep  (Bilal, Design)
+Chen  + 20 -&gt; Ops        keep  (Chen, Ops)
+Diya  + NULL -&gt; no match drop</code></pre>
+    <p>Result: three rows. Diya is gone. Research is gone.</p>
+    <p><code>JOIN</code> with no extra word means <code>INNER JOIN</code>. The two spellings are the same.</p>
+
+    <h3>Left join</h3>
+    <pre><code>SELECT e.name, t.name AS team
+FROM employees e
+LEFT JOIN teams t ON e.team_id = t.id;</code></pre>
+    <pre><code>Ada   + Design
+Bilal + Design
+Chen  + Ops
+Diya  + NULL          &lt;- kept, with no team name</code></pre>
+    <p>Four rows. Every employee is there. This is the usual way to ask "list people, and their team if they have one."</p>
+
+    <h3>Right join</h3>
+    <pre><code>SELECT e.name, t.name AS team
+FROM employees e
+RIGHT JOIN teams t ON e.team_id = t.id;</code></pre>
+    <pre><code>Ada   + Design
+Bilal + Design
+Chen  + Ops
+NULL  + Research      &lt;- the team with no people</code></pre>
+    <p>Diya is gone, because she is on the left and this join is driven by the right table. The same result is usually written as a left join with the tables swapped:</p>
+    <pre><code>SELECT e.name, t.name AS team
+FROM teams t
+LEFT JOIN employees e ON e.team_id = t.id;</code></pre>
+
+    <h3>Full join</h3>
+    <pre><code>SELECT e.name, t.name AS team
+FROM employees e
+FULL JOIN teams t ON e.team_id = t.id;</code></pre>
+    <pre><code>Ada   + Design
+Bilal + Design
+Chen  + Ops
+Diya  + NULL
+NULL  + Research</code></pre>
+    <p>Five rows. Nobody and no team is missing. SQLite did not have <code>FULL JOIN</code> until recently; PostgreSQL and most other engines have it. If you need to be portable, you can build it from a left join, a right join, and <code>UNION</code>.</p>
+
+    <div class="callout">
+      <p><strong>Counting check.</strong> After an inner join, every result row has a real key on both sides. After a left join, the number of rows is at least the size of the left table, and is larger when a left row matches more than one right row. If you expected one row per employee and got more, a left row matched several teams. That is usually a sign that the join key is not unique on the right side.</p>
+    </div>
+  </section>
+
+  <section id="cross">
+    <h2>4. Cross Joins: When the Row Count Explodes</h2>
+    <p>A <strong>cross join</strong> pairs every row with every row. There is no <code>ON</code> condition.</p>
+    <pre><code>SELECT * FROM employees CROSS JOIN teams;
+-- same accidental form:
+SELECT * FROM employees, teams;          -- comma join, no WHERE
+SELECT * FROM employees JOIN teams;      -- missing ON (error in most engines)</code></pre>
+    <p>With 4 employees and 3 teams you get 12 rows. That is easy to spot. With real tables it is not:</p>
+    <pre><code>100 rows  &times; 100 rows            =      10,000
+100       &times; 100       &times; 100     =   1,000,000
+1,000     &times; 1,000     &times; 1,000   = 1,000,000,000</code></pre>
+    <p>We ran the 100 &times; 100 &times; 100 case in SQLite. It produced <strong>1,000,000 rows in 8.9 ms</strong> on this machine. The time is not the scary part. The scary part is the next size up: a billion rows, a lot of memory, and a query that looks "almost right" because you only forgot the <code>ON</code> clause or wrote the wrong key.</p>
+    <p>Cross joins are legal and sometimes useful (for example, a calendar of every store and every date). They should be written as <code>CROSS JOIN</code> on purpose, never reached by accident.</p>
+  </section>
+
+  <section id="nested">
+    <h2>5. Algorithm 1: Nested Loop Join</h2>
+    <p>The simplest algorithm has a loop inside a loop:</p>
+    <pre><code>for each row L in the left table:          # the "outer" input
+    for each row R in the right table:     # the "inner" input
+        if L.key == R.key:
+            emit (L, R)</code></pre>
+    <p>For 2,000 outer rows and 10,000 inner rows, this can compare up to 20 million pairs. If the inner key is unique and we stop at the first match, the average number of comparisons is smaller, but it is still proportional to <code>|left| &times; |right|</code> when matches are spread out.</p>
+    <p>That sounds hopeless, and without an index it is. With an index on the inner key, the inner "loop" becomes a lookup:</p>
+    <pre><code>for each row L in the left table:
+    R = index_lookup(right, L.key)     # a B+ tree or hash lookup, not a full scan
+    if R found:
+        emit (L, R)</code></pre>
+    <p>This is an <strong>index nested loop join</strong>. The plan reads as "scan (or search) the outer table, then search the inner table with an index." It is the usual choice when one input is small, or when you want only the first few matching rows (<code>LIMIT</code>), or when the inner table has a useful index and the outer side is already well filtered.</p>
+    <p>Worked on the tiny tables, inner join, no index, Ada first:</p>
+    <pre><code>outer Ada  (team_id=10)
+    compare with Design 10  -&gt; match, emit (Ada, Design)
+    compare with Ops 20     -&gt; no
+    compare with Research 30 -&gt; no
+outer Bilal (team_id=10)
+    ... same three comparisons, one match
+outer Chen  (team_id=20)
+    ... match on Ops
+outer Diya  (team_id=NULL)
+    NULL equals nothing, not even NULL. no match.</code></pre>
+    <p>Twelve comparisons, three results. Add an index on <code>teams.id</code> and each employee does one lookup instead of three scans. On a 200,000-row table the difference is not "three vs one." It is "scan everything vs jump to the right leaf."</p>
+  </section>
+
+  <section id="hash">
+    <h2>6. Algorithm 2: Hash Join</h2>
+    <p>A <strong>hash join</strong> builds a hash table from one input, then probes it with the other. Equality joins love this, because a hash table answers "do you have this key?" in about one step.</p>
+    <pre><code>build:
+    for each row B in the smaller table:
+        put B in hash_table[B.key]
+
+probe:
+    for each row P in the other table:
+        for each B in hash_table[P.key]:   # usually 0 or 1 row
+            emit (P, B)</code></pre>
+    <p>Worked with our teams as the build side:</p>
+    <pre><code>build hash on teams.id:
+    10 -&gt; Design
+    20 -&gt; Ops
+    30 -&gt; Research
+
+probe with employees:
+    Ada  10 -&gt; Design      emit
+    Bilal 10 -&gt; Design     emit
+    Chen  20 -&gt; Ops        emit
+    Diya  NULL -&gt; nothing  skip</code></pre>
+    <p>Cost is roughly <code>|build| + |probe|</code>, plus the memory to hold the hash table. That is why the planner wants the <strong>smaller</strong> input on the build side. If the build side does not fit in memory, the engine spills partitions to disk and the join still works, just more slowly. In PostgreSQL you will see this as a "Hash" node under a "Hash Join," and in <code>EXPLAIN (ANALYZE, BUFFERS)</code> you may see temp writes if it spilled.</p>
+    <p>Hash joins need an equality key (<code>=</code> or a conjunction of equalities). They cannot do <code>&lt;</code>, <code>BETWEEN</code>, or <code>LIKE 'ab%'</code>. For those, the planner uses a nested loop or a merge join, or it filters after a hash join on the equality part of the condition.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A nested loop is looking up a word in a book by flipping every page, or by using the index at the back. A hash join is pouring the smaller list into labeled buckets, then walking the larger list and going straight to the right bucket.</p>
+    </div>
+  </section>
+
+  <section id="merge">
+    <h2>7. Algorithm 3: Merge Join</h2>
+    <p>If both inputs are <strong>sorted on the join key</strong>, you can zip them together like merging two sorted lists:</p>
+    <pre><code>sort employees by team_id (if not already)
+sort teams by id          (if not already)
+i = 0, j = 0
+while both lists have rows:
+    if employees[i].team_id == teams[j].id:
+        emit the pair (and handle extra matches on either side)
+    else if employees[i].team_id &lt; teams[j].id:
+        i += 1
+    else:
+        j += 1</code></pre>
+    <p>Worked, after putting Diya's NULL at the start (NULLs sort first in this picture):</p>
+    <pre><code>employees by team_id:  Diya NULL, Ada 10, Bilal 10, Chen 20
+teams by id:           Design 10, Ops 20, Research 30
+
+Diya  NULL vs 10  -&gt; NULL is not 10, advance Diya
+Ada   10   vs 10  -&gt; match, emit Ada+Design
+Bilal 10   vs 10  -&gt; match, emit Bilal+Design, then advance both
+Chen  20   vs 20  -&gt; match, emit Chen+Ops
+                   teams still have Research 30: no employee left, done</code></pre>
+    <p>If an index already returns rows in key order, the sort can be skipped. That is why a merge join often appears after an index scan. If both sides are large, already sorted (or cheap to sort), and you are joining on equality or a range, merge join is a strong choice. The extra cost is the sort when the inputs are not ordered: you pay for the sort once, then the merge itself is a single pass.</p>
+  </section>
+
+  <section id="lab">
+    <h2>8. The Lab: Measured Times</h2>
+    <p>All numbers in this section were measured on a Linux machine with 8 logical CPUs, using Python 3.13 and SQLite 3.46. The data is 10,000 customers and 200,000 orders. Each order points at a random customer. The join is "give me every order and the customer's name."</p>
+
+    <h3>The three algorithms in Python</h3>
+    <p>First, a smaller slice so a nested loop can finish: 2,000 orders against all 10,000 customers, stopping at the first match (the customer id is unique).</p>
+    <pre><code>def nested_loop(orders, customers):
+    out = []
+    for o in orders:                 # 2,000
+        for c in customers:          # 10,000
+            if o.customer_id == c.id:
+                out.append((o, c))
+                break
+    return out
+
+def hash_join(orders, customers):
+    table = {c.id: c for c in customers}   # build
+    return [(o, table[o.customer_id])      # probe
+            for o in orders]
+
+def merge_join(orders, customers):
+    O = sorted(orders, key=lambda o: o.customer_id)
+    C = sorted(customers, key=lambda c: c.id)
+    # then the zip-together loop from section 7
+    ...</code></pre>
+    <table>
+      <thead>
+        <tr><th>Algorithm</th><th>Inputs</th><th>Time</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Nested loop (no index)</td><td>2,000 &times; 10,000</td><td><strong>301.1 ms</strong></td><td>10,038,338 comparisons</td></tr>
+        <tr><td>Hash join</td><td>same 2,000 &times; 10,000</td><td><strong>0.79 ms</strong></td><td>About <strong>381 times</strong> faster</td></tr>
+        <tr><td>Merge join (includes sort)</td><td>same 2,000 &times; 10,000</td><td><strong>12.37 ms</strong></td><td>Faster than nested, slower than hash here</td></tr>
+        <tr><td>Hash join</td><td>200,000 &times; 10,000</td><td><strong>50.1 ms</strong></td><td>Build 0.41 ms, probe 49.6 ms</td></tr>
+        <tr><td>Merge join</td><td>200,000 &times; 10,000</td><td><strong>149.1 ms</strong></td><td>Sort of orders 48.1 ms, merge 100.7 ms</td></tr>
+      </tbody>
+    </table>
+    <p>A nested loop over all 200,000 orders at the same rate would take about 30 seconds. We did not wait for it. The 2,000-row sample already tells the story: without an index, nested loop is the wrong tool for two large tables.</p>
+
+    <h3>The same join inside SQLite</h3>
+    <p>SQLite has a primary key on <code>customers.id</code>, so it can do an index nested loop: scan every order, look up each customer by id.</p>
+    <pre><code>EXPLAIN QUERY PLAN
+SELECT o.id, c.name, o.amount
+FROM orders o
+JOIN customers c ON o.customer_id = c.id;
+
+-- SCAN o
+-- SEARCH c USING INTEGER PRIMARY KEY (rowid=?)</code></pre>
+    <p>That query returned 200,000 rows in <strong>191 ms</strong>. Adding an index on <code>orders.customer_id</code> did not change this plan. That is correct: we already want every order, so scanning <code>orders</code> and looking up each customer is the natural path. The extra index would help a <em>different</em> question.</p>
+
+    <h3>When the extra index matters</h3>
+    <p>Ask for one customer's orders instead:</p>
+    <pre><code>SELECT o.id, o.amount
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE c.id = 42;</code></pre>
+    <table>
+      <thead>
+        <tr><th>Index on <code>orders.customer_id</code>?</th><th>Plan</th><th>Time (24 rows)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>No</td><td>SEARCH c by primary key, then <strong>SCAN</strong> all 200,000 orders</td><td><strong>6.8 to 8.8 ms</strong></td></tr>
+        <tr><td>Yes</td><td>SEARCH c by primary key, then <strong>SEARCH</strong> o using the index</td><td><strong>0.018 ms</strong></td></tr>
+      </tbody>
+    </table>
+    <p>The index made this query about <strong>380 times</strong> faster (6.79 ms down to 0.018 ms). The plan change is the thing to look for: <code>SCAN o</code> became <code>SEARCH o USING INDEX</code>.</p>
+    <div class="callout">
+      <p><strong>Takeaway.</strong> "I added an index" is not a magic spell. An index helps when the plan can use it to <em>avoid a scan</em>. For a join that already walks the whole table, the useful index is usually on the <em>other</em> table's join key, so each lookup is a search. That is the same idea as the index nested loop above, and the same idea as the B+ tree page.</p>
+    </div>
+  </section>
+
+  <section id="explain">
+    <h2>9. Reading the Plan</h2>
+    <p>SQLite prints a short text plan, as above. PostgreSQL prints a tree. The join algorithms show up as node names.</p>
+    <pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT o.id, c.name, o.amount
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE c.id = 42;</code></pre>
+    <p>A healthy plan for that query often looks like this (times will differ on your machine):</p>
+    <pre><code>Nested Loop
+  -&gt;  Index Scan on customers c
+        Index Cond: (id = 42)
+  -&gt;  Index Scan on orders o
+        Index Cond: (customer_id = 42)</code></pre>
+    <p>Read it from the inside out. First find the one customer. Then, for that customer, find their orders with the index. That is an index nested loop.</p>
+    <p>If you drop the <code>WHERE</code> and join every order to its customer, PostgreSQL will often pick a hash join:</p>
+    <pre><code>Hash Join
+  Hash Cond: (o.customer_id = c.id)
+  -&gt;  Seq Scan on orders o
+  -&gt;  Hash
+        -&gt;  Seq Scan on customers c</code></pre>
+    <p>The inner <code>Hash</code> node is the build side (customers, the smaller table). The outer scan of orders is the probe side. If you see a <code>Seq Scan</code> on a large table and you thought you had a useful index, ask why the planner thought a full read was cheaper. Common reasons: it needs most of the rows anyway, the statistics are stale (<code>ANALYZE</code> the table), or the query is written so the index cannot be used (see the leftmost-prefix rule on the <a href="dbms-indexing-btrees-query-plans.html#composite">indexing page</a>).</p>
+    <p>A merge join looks like this:</p>
+    <pre><code>Merge Join
+  Merge Cond: (o.customer_id = c.id)
+  -&gt;  Index Scan on orders o          -- already in customer_id order
+  -&gt;  Index Scan on customers c       -- already in id order</code></pre>
+    <p>If a <code>Sort</code> node sits above an input, you are paying to create that order.</p>
+    <table>
+      <thead><tr><th>Plan node</th><th>What it is doing</th><th>Usually good when</th></tr></thead>
+      <tbody>
+        <tr><td>Nested Loop</td><td>For each outer row, find inner matches</td><td>Outer side is small, or inner side has a selective index</td></tr>
+        <tr><td>Hash Join</td><td>Build a hash table, probe with the other side</td><td>Equality join, both sides large, enough memory</td></tr>
+        <tr><td>Merge Join</td><td>Walk two ordered inputs together</td><td>Both sides sorted (or indexed) on the join key</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="order">
+    <h2>10. Join Order and Many Tables</h2>
+    <p>With two tables there are two orders (A then B, or B then A). With five tables there are many more. The planner searches this space and picks an order it thinks is cheap. You usually want the most selective table first, so later lookups have less work.</p>
+    <pre><code>-- "orders in Pune for product X in the last day"
+orders
+  JOIN customers  ON customer_id = customers.id
+  JOIN products   ON product_id  = products.id
+WHERE customers.city = 'Pune'
+  AND products.sku   = 'MUG-1'
+  AND orders.created_at &gt;= now() - interval '1 day'</code></pre>
+    <p>If "MUG-1 yesterday" is 80 rows, and "people in Pune" is 200,000 rows, starting from the product (or from yesterday's orders) is much cheaper than starting from every customer in Pune.</p>
+    <p>Help the planner with fresh statistics (<code>ANALYZE</code>) and with the indexes those filters and join keys need. Forcing an order by hand (<code>join_collapse_limit</code>, optimizer hints, or rewriting the query) is a last resort. If you do it, leave a comment about why, and re-check the plan when the data grows.</p>
+    <p>One more rule: <strong>filter early</strong>. A condition like <code>orders.created_at &gt;= ...</code> belongs in <code>WHERE</code> (or in the <code>ON</code> clause of an inner join). If you put a filter on the right table into the <code>WHERE</code> of a <em>left</em> join, you can accidentally turn it into an inner join, because the rows that had a NULL right side fail the filter and disappear. For "keep all orders, and the product if it is a mug," the product filter belongs in the <code>ON</code> clause.</p>
+    <pre><code>-- keeps every order; non-mugs show NULL product columns
+FROM orders o
+LEFT JOIN products p ON p.id = o.product_id AND p.sku = 'MUG-1'
+
+-- accidentally drops orders that are not mugs
+FROM orders o
+LEFT JOIN products p ON p.id = o.product_id
+WHERE p.sku = 'MUG-1'</code></pre>
+  </section>
+
+  <section id="semi">
+    <h2>11. Exists, In, and Anti-Joins</h2>
+    <p>Sometimes you do not want the joined columns at all. You only want to know whether a match exists.</p>
+    <pre><code>-- customers who have at least one order
+SELECT * FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o WHERE o.customer_id = c.id
+);
+
+-- customers with no orders (an anti-join)
+SELECT * FROM customers c
+WHERE NOT EXISTS (
+    SELECT 1 FROM orders o WHERE o.customer_id = c.id
+);
+
+-- same anti-join, written with a left join
+SELECT c.*
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;</code></pre>
+    <p><code>EXISTS</code> can stop at the first match. A join that then uses <code>SELECT DISTINCT</code> to undo row multiplication does extra work. Prefer <code>EXISTS</code> (or <code>IN</code> on a unique column) when you only need a yes or no.</p>
+    <p><code>IN</code> and <code>EXISTS</code> are often planned the same way for a subquery that returns keys. One trap: <code>NOT IN (SELECT team_id FROM ...)</code> is not the same as <code>NOT EXISTS</code> if the subquery can return NULL. If one value is NULL, <code>NOT IN</code> becomes unknown for every row, and the result can be empty. Prefer <code>NOT EXISTS</code> for anti-joins.</p>
+  </section>
+
+  <section id="nulls">
+    <h2>12. NULL Keys Do Not Match</h2>
+    <p>In SQL, <code>NULL = NULL</code> is not true. It is unknown. Join conditions use that same rule, so two NULL keys do not pair up. We checked it: 1,000 orders, 50 of them with <code>customer_id</code> set to NULL.</p>
+    <table>
+      <thead><tr><th>Query</th><th>Row count</th></tr></thead>
+      <tbody>
+        <tr><td>Inner join to <code>customers</code></td><td><strong>950</strong> (the NULL keys vanished)</td></tr>
+        <tr><td>Left join to <code>customers</code></td><td><strong>1,000</strong> (50 rows with a NULL customer)</td></tr>
+      </tbody>
+    </table>
+    <p>That is why Diya disappeared from the inner join in section 3. If you need "unassigned" to be a real group, store a real key (for example team 0, "No team") or use an outer join and treat NULL as its own bucket in the application.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Missing or wrong <code>ON</code> clause.</strong> You get a cross join. Row counts in the millions are the clue. Check <code>COUNT(*)</code> against the sizes you expect.</li>
+      <li><strong>Joining on a non-unique key.</strong> Two orders with the same <code>amount</code> are not related. We joined 2,000 orders to themselves on <code>amount</code> and got <strong>9,888 rows</strong>, a 4.9&times; blow-up. Join on keys, not on "columns that happen to be equal."</li>
+      <li><strong>Filter in <code>WHERE</code> after a left join.</strong> Turns the left join into an inner join. Put filters on the right table in the <code>ON</code> clause.</li>
+      <li><strong>NULL join keys.</strong> They never match. Inner joins drop them.</li>
+      <li><strong><code>NOT IN</code> with NULLs.</strong> Use <code>NOT EXISTS</code>.</li>
+      <li><strong>Selecting <code>*</code> from a join.</strong> You get two <code>id</code> columns and a wide row. Name the columns you need. That is also cheaper.</li>
+      <li><strong>Using <code>DISTINCT</code> to hide a bad join.</strong> Fix the key or use <code>EXISTS</code>.</li>
+      <li><strong>Stale statistics.</strong> The planner picked a nested loop when a hash join would be faster, or the other way around. Run <code>ANALYZE</code>.</li>
+      <li><strong>Index on the wrong table.</strong> For "one customer and their orders," you need an index on <code>orders.customer_id</code>, not another index on <code>customers.id</code> (that one already exists as the primary key).</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <h3>Problem 1: predict the row count</h3>
+    <p>Table <code>a</code> has 100 rows, table <code>b</code> has 200 rows. Every <code>a.id</code> appears exactly twice in <code>b.a_id</code>. How many rows do <code>SELECT * FROM a JOIN b ON b.a_id = a.id</code> and <code>SELECT * FROM a LEFT JOIN b ON b.a_id = a.id</code> return?</p>
+    <p><em>Answer:</em> Both return <strong>200</strong> rows. Every row of <code>a</code> has matches, so the left join does not add extra NULL rows. The inner join already has two result rows per <code>a</code> row.</p>
+
+    <h3>Problem 2: why is this left join dropping rows?</h3>
+    <pre><code>SELECT e.name, t.name
+FROM employees e
+LEFT JOIN teams t ON t.id = e.team_id
+WHERE t.name &lt;&gt; 'Ops';</code></pre>
+    <p>Diya (no team) is missing from the result. Why? How do you keep her, and still hide Ops people?</p>
+    <p><em>Answer:</em> <code>t.name</code> is NULL for Diya, and <code>NULL &lt;&gt; 'Ops'</code> is not true, so the <code>WHERE</code> clause drops her. The left join has been turned into an inner join. Move the filter into the <code>ON</code> clause: <code>LEFT JOIN teams t ON t.id = e.team_id AND t.name &lt;&gt; 'Ops'</code>. Then Diya stays, with a NULL team, and Ops employees also stay but with a NULL team name. If you instead want Ops employees to disappear and Diya to stay, use <code>WHERE t.name &lt;&gt; 'Ops' OR t.name IS NULL</code>.</p>
+
+    <h3>Problem 3: pick the algorithm</h3>
+    <p>You join 5 million fact rows to a 200-row dimension table on an equality key. There is no useful order on either input. Which join algorithm should you expect, and which side is the build side?</p>
+    <p><em>Answer:</em> A <strong>hash join</strong>, with the 200-row table as the <strong>build</strong> side and the 5 million fact rows as the probe side.</p>
+
+    <h3>Problem 4: read this plan</h3>
+    <pre><code>Nested Loop
+  -&gt;  Seq Scan on orders
+  -&gt;  Seq Scan on customers
+        Filter: (customers.id = orders.customer_id)</code></pre>
+    <p>The query is the lab join (200,000 orders, 10,000 customers) without a <code>WHERE</code> clause. What is wrong, and what two changes might fix it?</p>
+    <p><em>Answer:</em> This is a nested loop with a full scan of customers for every order: about 200,000 &times; 10,000 comparisons. Fix 1: make sure <code>customers.id</code> is a primary key (or has an index) so the inner side becomes an index lookup. Fix 2: let the planner use a hash join, which we measured at 50 ms in Python for this size. Running <code>ANALYZE</code> and checking that work_mem is reasonable helps the planner pick it.</p>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Want</th><th>Write</th></tr></thead>
+      <tbody>
+        <tr><td>Only matches</td><td><code>JOIN</code> / <code>INNER JOIN</code></td></tr>
+        <tr><td>All of the left side</td><td><code>LEFT JOIN</code></td></tr>
+        <tr><td>All of either side</td><td><code>FULL JOIN</code></td></tr>
+        <tr><td>Every pairing, on purpose</td><td><code>CROSS JOIN</code></td></tr>
+        <tr><td>Rows with no match</td><td><code>LEFT JOIN ... WHERE right.id IS NULL</code> or <code>NOT EXISTS</code></td></tr>
+        <tr><td>Yes/no, no extra columns</td><td><code>EXISTS</code> / <code>NOT EXISTS</code></td></tr>
+      </tbody>
+    </table>
+    <pre><code>EXPLAIN QUERY PLAN SELECT ...;                 -- SQLite
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;         -- PostgreSQL
+ANALYZE customers;                             -- refresh statistics
+-- useful indexes for the lab query about one customer:
+-- PRIMARY KEY (customers.id) and INDEX (orders.customer_id)</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://www.sqlite.org/eqp.html" rel="noopener noreferrer">SQLite EXPLAIN QUERY PLAN</a> &middot; <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="noopener noreferrer">PostgreSQL using EXPLAIN</a> &middot; <a href="https://www.postgresql.org/docs/current/planner-optimizer.html" rel="noopener noreferrer">PostgreSQL planner</a> &middot; <a href="dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a> &middot; <a href="dbms-normalization-schema-design.html">Normalization &amp; Schema Design</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="dbms-indexing-btrees-query-plans.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Indexing, B+ Trees &amp; Query Plans</span></a>
+    <a class="prev-next-next" href="dbms-replication-sharding-cap.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Replication, Sharding &amp; the CAP Theorem</span></a>
+    <p class="prev-next-step">Page 11 of 24 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a> &middot; <a href="dbms-normalization-schema-design.html">Normalization &amp; Schema Design</a> &middot; <a href="dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Debugging a Slow API</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

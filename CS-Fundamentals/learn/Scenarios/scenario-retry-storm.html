@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scenario: A Retry Storm Takes the Service Down | CS Fundamentals</title>
+  <meta name="description" content="A production scenario: a dependency slows down, clients retry, and the service collapses. Worked math for retry amplification, a lab where success fell from 87.8% with a tight queue cap to 24.5% without one, where 8,805 immediate retries did not help, and where a too-loose cap plus retries dropped success from 55.5% to 35.6%. Fixes: timeouts that match reality, load shedding, retry budgets, jitter, and idempotency.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Scenario: A Retry Storm Takes the Service Down</p>
+  </nav>
+  <h1>Scenario: A Retry Storm Takes the Service Down</h1>
+  <p>A checkout API is fine at 9:00. At 9:12 the payment dependency gets slow. By 9:14 your error rate is near 100%, the dependency's CPU is on the floor, and adding more replicas of your own service makes things worse. This page walks through that incident, with a lab you can run in your head and in Python. It builds on <a href="../Computer-Networks/cn-load-balancing-reverse-proxies.html">timeouts and safe retries</a> and on <a href="scenario-slow-api-debugging.html">debugging a slow API</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#scene">The Incident</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#math">How Retries Amplify Load</a></li>
+    <li><a href="#cascade">Why It Cascades</a></li>
+    <li><a href="#lab">The Lab: A Slowdown at t = 2 s</a></li>
+    <li><a href="#timeout">When the Timeout Is Shorter Than the Work</a></li>
+    <li><a href="#herd">The Thundering Herd</a></li>
+    <li><a href="#fix">The Fixes, in Order</a></li>
+    <li><a href="#see">What to Look at During the Incident</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="scene">
+    <h2>1. The Incident</h2>
+    <p>You run an API with 50 workers. Each request needs 50 ms of work from a payment service, so the chain can handle about 1,000 requests per second. Normal traffic is 400 requests per second. At 9:12 the payment service starts taking 150 ms instead of 50 ms. Its capacity drops to about 333 requests per second, a little under the 400 you are still sending.</p>
+    <p>That should be a mild overflow, not an outage. Instead you see:</p>
+    <ul>
+      <li>Client timeouts (200 ms) start firing.</li>
+      <li>Each timed-out request is retried three times, immediately.</li>
+      <li>The payment service is now offered far more than 400 requests per second, most of them repeats of work it has already started or already finished too late.</li>
+      <li>Your own queue grows. Requests spend so long in the queue that they time out <em>after</em> a worker has picked them up. The worker still finishes the work (abandoned work). The client has already retried, so the work is done twice, or four times, and nobody is happy.</li>
+    </ul>
+    <p>By 9:14, success looks like a floor, not a dip. This is a <strong>retry storm</strong>. The original slowdown was real. The collapse is something you helped build, in the retry policy.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>Timeout.</strong> How long the caller will wait for a response before giving up. If this is shorter than the work plus the queue delay, every request fails, even if the server would have gotten there eventually.</li>
+      <li><strong>Retry.</strong> Sending the same logical request again after a failure or a timeout.</li>
+      <li><strong>Amplification.</strong> How many attempts the server sees for each user request. Three retries plus the original is up to 4&times; if every attempt is sent.</li>
+      <li><strong>Abandoned work.</strong> The server keeps working on a request after the client has given up. The result, when it arrives, has no one waiting, and the worker was not free for a request that still had a chance.</li>
+      <li><strong>Exponential backoff.</strong> Wait 50 ms, then 100 ms, then 200 ms, and so on, between retries, instead of retrying at once.</li>
+      <li><strong>Jitter.</strong> Randomness in that wait, so that a thousand clients do not retry on the same millisecond.</li>
+      <li><strong>Retry budget.</strong> A cap on how many retries the system will start (per second, or as a fraction of live traffic).</li>
+      <li><strong>Circuit breaker.</strong> After enough recent failures, stop sending (or stop retrying) for a short time, so the dependency can recover.</li>
+      <li><strong>Load shedding.</strong> Refuse some work on purpose, early, so the work you do accept can finish inside the timeout.</li>
+      <li><strong>Idempotent.</strong> Doing the request twice has the same effect as doing it once. Safe to retry. A "charge this card" call is not idempotent unless you give it an idempotency key.</li>
+      <li><strong>Thundering herd.</strong> Many clients wake up and retry at the same time, often after a shared outage ends.</li>
+    </ul>
+  </section>
+
+  <section id="math">
+    <h2>3. How Retries Amplify Load</h2>
+    <p>Write the amplification out before you look at a graph.</p>
+    <pre><code>Each user request may become:
+  1 original attempt
+  + up to R retries
+
+If every attempt times out, offered load is (1 + R) &times; user traffic.
+
+User traffic        400 req/s
+R = 3 immediate retries
+Offered load        up to 1,600 req/s
+
+Dependency capacity after the slowdown
+  50 workers &times; (1000 ms / 150 ms)  =  333 req/s</code></pre>
+    <p>1,600 into a 333-capacity service cannot recover. Even 400 into 333 was only a mild overflow. The retries are what turn a queue into a stampede.</p>
+    <p>There is a second multiplier: <strong>layers</strong>. If the mobile app retries, and your API retries, and the service mesh retries, a single user action can become 4 &times; 4 &times; 4 = 64 attempts. The rule is: <strong>retry in one place</strong>, with a budget, and make the other layers fail fast or not retry at all.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A busy shop has one counter and a line. If every person who has waited two minutes leaves, walks back in, and goes to the front, the line is no shorter, and the people who would have been served are now behind a crowd of repeat visits. A retry storm is that crowd. Load shedding is a sign on the door that says "we are full, please come back later," before anyone stands in a line that cannot finish in time.</p>
+    </div>
+  </section>
+
+  <section id="cascade">
+    <h2>4. Why It Cascades</h2>
+    <p>The deadly loop is:</p>
+    <pre><code>dependency slows
+    -&gt; queue delay grows
+        -&gt; more callers hit their timeout
+            -&gt; more retries arrive
+                -&gt; workers are busy with abandoned work and retries
+                    -&gt; queue delay grows again</code></pre>
+    <p>Once queue delay plus service time is larger than the client timeout, almost every started request is abandoned. The workers are busy, the success rate is near zero, and from the outside it looks like "we need more capacity." Adding clients or replicas that all retry with the same policy feeds the loop.</p>
+    <p>This is why the lab below can show a capacity of 333 requests per second and a success rate far below 333 / 400. The missing requests are not "unlucky." They are work that could not finish inside the timeout, plus work that was done for a caller who had already left.</p>
+  </section>
+
+  <section id="lab">
+    <h2>5. The Lab: A Slowdown at t = 2 s</h2>
+    <p>We simulated 10 seconds of traffic on a Linux machine. Arrivals are a Poisson process at 400 requests per second (3,875 users in 10 seconds). There are 50 workers. Service time is 50 ms, then at t = 2 s it steps to 150 ms and stays there. The client timeout is 200 ms. The first two seconds are healthy; the last eight seconds are the incident.</p>
+    <p>Expected, if nothing else goes wrong after the slowdown: about 800 successful requests in the first two seconds, then about 333 per second, so around 3,460 successes (about 89%). That is the ceiling the best policy can hope for, because 400 does not fit into 333. The rest must be shed or they will fail anyway.</p>
+
+    <h3>Retries without a queue cap</h3>
+    <table>
+      <thead>
+        <tr><th>Policy</th><th>Success</th><th>Successful requests</th><th>Retries started</th><th>Max queue</th><th>Abandoned work</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>No retries</td><td>24.5%</td><td>950</td><td>0</td><td>96</td><td>2,513</td></tr>
+        <tr><td>3 immediate retries</td><td>24.3%</td><td>940</td><td><strong>8,805</strong></td><td><strong>357</strong></td><td>2,723</td></tr>
+        <tr><td>3 exponential backoffs</td><td>24.4%</td><td>947</td><td>8,784</td><td>362</td><td>2,831</td></tr>
+        <tr><td>3 exp. backoffs + jitter</td><td>24.3%</td><td>940</td><td>8,805</td><td>361</td><td>2,789</td></tr>
+      </tbody>
+    </table>
+    <p>Retries did not save anyone. Success stayed at about a quarter, which is roughly the healthy first two seconds plus a trickle after that. What retries did do is stretch the queue from 96 to about 360, and send on the order of nine thousand extra attempts. Backoff and jitter, by themselves, could not fix a queue that had already grown past the timeout.</p>
+
+    <h3>The fix that actually moved the number: cap the queue</h3>
+    <p>If a request will not finish inside the 200 ms timeout, it is kinder (and cheaper) to refuse it at the door. The door is a maximum queue length. A rough budget:</p>
+    <pre><code>timeout 200 ms, service 150 ms
+so a request can wait at most about 50 ms in the queue
+50 workers, 150 ms each: a queue of 10 is about
+    10 / 50 &times; 150 ms  =  30 ms of wait
+30 + 150 = 180 ms, which still fits in 200 ms
+
+A queue of 20 is about 60 ms of wait
+60 + 150 = 210 ms, which does not fit</code></pre>
+    <table>
+      <thead>
+        <tr><th>Queue cap (no retries)</th><th>Success</th><th>Successful requests</th><th>Timeouts</th><th>Shed</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>No cap</td><td>24.5%</td><td>950</td><td>2,925</td><td>0</td></tr>
+        <tr><td>Cap 30 (still too loose)</td><td>24.7%</td><td>957</td><td>2,472</td><td>446</td></tr>
+        <tr><td>Cap 20 (just over the budget)</td><td>55.5%</td><td>2,149</td><td>1,270</td><td>456</td></tr>
+        <tr><td>Cap 10 (fits the budget)</td><td><strong>87.8%</strong></td><td><strong>3,404</strong></td><td>0</td><td>471</td></tr>
+        <tr><td>Cap 5</td><td>87.0%</td><td>3,370</td><td>0</td><td>505</td></tr>
+      </tbody>
+    </table>
+    <p>A cap of 10, with no retries, reached <strong>87.8% success</strong> (3,404 of 3,875). That is essentially the ceiling we computed above. Timeouts dropped to zero: every request we accepted finished in time, and the rest were refused quickly. A cap of 20 looked conservative and still let the timeout catch running work, so success fell back to 55.5% and abandoned work came back (1,270 timed-out attempts that a worker still had to finish).</p>
+
+    <h3>Retries can make a weak cap worse</h3>
+    <p>With the too-loose cap of 20, we added a single retry with exponential backoff and jitter.</p>
+    <table>
+      <thead><tr><th>Policy</th><th>Success</th><th>Retries</th><th>Abandoned</th></tr></thead>
+      <tbody>
+        <tr><td>Cap 20, no retries</td><td><strong>55.5%</strong></td><td>0</td><td>1,270</td></tr>
+        <tr><td>Cap 20, 1 retry, exp. backoff + jitter</td><td><strong>35.6%</strong></td><td>1,485</td><td>2,092</td></tr>
+      </tbody>
+    </table>
+    <p>Success dropped from 55.5% to 35.6%. The retries filled the small remaining queue with repeat attempts, crowded out new users, and created more abandoned work. Retries are not "safe as long as you have a cap." The cap has to be tight enough that accepted work finishes, and the retry policy has to respect that cap (a retry budget helps; a retry that goes back into an already-full queue does not).</p>
+    <p>With the tight cap of 5, adding retries changed nothing: every accepted request already succeeded, so no retry was ever started, and success stayed at 87.0%. That is the boring, healthy outcome you want.</p>
+    <div class="callout">
+      <p><strong>The headline.</strong> When the dependency slowed, unbounded queues plus retries left us at about 24% success. Capping the queue so that wait plus service stayed under the timeout lifted success to about <strong>88%</strong>. Immediate retries without that cap used 8,805 extra attempts and did not help. Retries on a sloppy cap made success worse (55.5% down to 35.6%).</p>
+    </div>
+  </section>
+
+  <section id="timeout">
+    <h2>6. When the Timeout Is Shorter Than the Work</h2>
+    <p>We ran the same incident with a harsher slowdown: service time 300 ms, timeout still 200 ms. Now even a request that gets a worker immediately cannot finish in time.</p>
+    <table>
+      <thead><tr><th>Policy</th><th>Success</th><th>Retries</th><th>Max queue</th></tr></thead>
+      <tbody>
+        <tr><td>No retries</td><td>19.4% (753, almost all in the first 2 s)</td><td>0</td><td>99</td></tr>
+        <tr><td>3 immediate retries</td><td>19.4%</td><td><strong>9,366</strong></td><td>358</td></tr>
+        <tr><td>3 exp. backoffs + jitter</td><td>19.4%</td><td>9,366</td><td>364</td></tr>
+      </tbody>
+    </table>
+    <p>9,366 retries, and not one extra user succeeded. The timeout was impossible. Raising the timeout to 1 second, without shedding, only moved success to 25.9% (1,003), because capacity is then 50 &times; 1000/300 &approx; 167 requests per second, and the queue still grew past the new timeout. The same 1-second timeout plus a cap of 10 reached <strong>54.5%</strong> (2,113), with zero timeouts and zero abandoned work: 1762 requests were shed on purpose, and every accepted request finished.</p>
+    <p>If you remember only one check from this page, remember this: <strong>if timeout &lt; service time + honest queue delay, retries cannot work.</strong> You must change the timeout, shed load, or make the work faster. Retrying a 300 ms call with a 200 ms timeout is a guaranteed failure with extra traffic.</p>
+  </section>
+
+  <section id="herd">
+    <h2>7. The Thundering Herd</h2>
+    <p>A related pattern: a dependency is down for a few seconds, then comes back, and every waiting client retries at once. We sent 2,000 retries at 50 workers that each need 50 ms (so 20 requests per worker per second, and 2,000 requests need 2 seconds of full capacity no matter what).</p>
+    <table>
+      <thead><tr><th>How the 2,000 retries arrive</th><th>Peak queue</th><th>p99 wait</th><th>Last request finishes</th></tr></thead>
+      <tbody>
+        <tr><td>All at t = 0 (no jitter)</td><td>1,950</td><td>1,950 ms</td><td>2,000 ms</td></tr>
+        <tr><td>Spread over 200 ms</td><td>1,800</td><td>1,755 ms</td><td>2,004 ms</td></tr>
+        <tr><td>Spread over 1 second</td><td><strong>1,000</strong></td><td><strong>974 ms</strong></td><td>2,023 ms</td></tr>
+      </tbody>
+    </table>
+    <p>Jitter did not shrink the total work: the last request still finished at about 2 seconds, as the capacity math requires. It cut the peak queue and the worst waits roughly in half when the retries were spread over one second. Jitter is how you avoid a second, self-inflicted spike. A retry budget is how you avoid 2,000 retries you cannot take. You usually want both.</p>
+  </section>
+
+  <section id="fix">
+    <h2>8. The Fixes, in Order</h2>
+    <ol>
+      <li><strong>Make sure the timeout can succeed.</strong> Timeout must be larger than typical service time plus a small queue. If the dependency needs 150 ms, a 200 ms timeout only has 50 ms of slack.</li>
+      <li><strong>Shed load when the queue would blow that budget.</strong> A short queue and a fast failure (HTTP 503, with a <code>Retry-After</code> header if you can) is better than a long queue of doomed requests. In the lab, this is what moved success from 24% to 88%.</li>
+      <li><strong>Retry only when it can help</strong>: transient errors (connection reset, 503, 429), not 4xx validation errors, and not when the timeout is already shorter than the work. Prefer retrying on a safe, idempotent operation, with an idempotency key for anything that charges, writes, or sends a message.</li>
+      <li><strong>Cap retries.</strong> One retry is often enough. Three immediate retries is a common default and a common outage cause.</li>
+      <li><strong>Backoff with jitter</strong> so retries do not synchronize. Full jitter (wait a random time between 0 and the current cap) is a simple, good default.</li>
+      <li><strong>Give the system a retry budget</strong> (for example, retries may be at most 10% of current traffic, or at most N per second). When the budget is spent, fail fast.</li>
+      <li><strong>Use a circuit breaker</strong> on a clearly sick dependency, so you stop calling it for a short interval and give it room to recover.</li>
+      <li><strong>Retry in one layer of the stack</strong>, not in the app and the mesh and the client SDK at once.</li>
+      <li><strong>Cancel abandoned work</strong> when you can (a cancellation token, a context, a server that notices the client hung up) so a worker is not stuck finishing a reply nobody will read.</li>
+    </ol>
+    <p>More replicas help only if they add real capacity on the <em>bottleneck</em>. If the payment service is the slow thing, doubling your own API pods doubles the number of clients that can retry into that same bottleneck.</p>
+  </section>
+
+  <section id="see">
+    <h2>9. What to Look at During the Incident</h2>
+    <ul>
+      <li><strong>Compare offered load to user load.</strong> If the server sees 1,600 requests per second and you only have 400 users per second, the extra 1,200 are retries (or a bug). A label or header such as <code>X-Retry-Attempt: 2</code> makes this visible.</li>
+      <li><strong>Timeout rate vs error rate vs latency.</strong> A jump in timeouts together with a jump in latency is this scenario. A jump in 500s with low latency is a different bug.</li>
+      <li><strong>Queue length and worker utilization.</strong> Workers at 100% plus a growing queue plus timeouts means you are doing abandoned work. Workers idle plus timeouts means you are stuck on something else (locks, DNS, a connection pool). The <a href="scenario-slow-api-debugging.html">slow API scenario</a> and the <a href="scenario-database-lock-waits.html">lock-wait scenario</a> cover those paths.</li>
+      <li><strong>The dependency's view.</strong> If its incoming rate is several times yours, you (or a layer in front of you) are amplifying.</li>
+    </ul>
+    <p>A short-term mitigation during the fire: turn retries down or off, shed at the edge, and give the dependency a quieter minute. Then fix the policy so the next slowdown does not light the same fire. After the incident, write down the amplification math with the real numbers from your metrics, the way this page does with the lab.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>10. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Defaulting to three immediate retries</strong> on every HTTP client, including the ones that already sit behind a mesh that retries.</li>
+      <li><strong>A timeout shorter than the work you just rolled out</strong> (a new endpoint takes 300 ms, the client still waits 200 ms).</li>
+      <li><strong>Retrying non-idempotent POSTs</strong> without an idempotency key. You may fix the error rate and double-charge a card. See also 0-RTT replay on the <a href="../Computer-Networks/cn-quic-http3.html#handshake">QUIC page</a>.</li>
+      <li><strong>Unbounded queues</strong>, which turn a small overflow into a timeout collapse.</li>
+      <li><strong>A queue cap that still lets wait + service exceed the timeout</strong> (cap 20 in the lab looked safe and was not).</li>
+      <li><strong>Adding replicas of the caller</strong> when the bottleneck is the callee.</li>
+      <li><strong>No retry marking in metrics</strong>, so a storm looks like "real demand went up 4&times;."</li>
+      <li><strong>Jitter without a budget.</strong> Jitter spreads a spike. It does not reduce work.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>11. Practice Problems</h2>
+    <h3>Problem 1: the amplification</h3>
+    <p>User traffic is 200 requests per second. Each request may be tried once, then retried three more times, all of them sent. What offered load can the dependency see? If the dependency's capacity is 250 requests per second, can retries get you out of an overflow on their own?</p>
+    <p><em>Answer:</em> Up to 200 &times; 4 = <strong>800 req/s</strong>. No. 800 is farther over 250 than 200 was. Retries make an overflow worse unless most attempts succeed the first time (in which case you barely retry).</p>
+
+    <h3>Problem 2: pick a cap</h3>
+    <p>You have 50 workers, service time 150 ms, client timeout 200 ms. What is a safe maximum queue length, roughly, and what happened in the lab at 10 vs 20?</p>
+    <p><em>Answer:</em> Slack is 50 ms. A queue of about <code>50 workers &times; 50 ms / 150 ms &approx; 16</code> is already the theoretical ceiling; staying clearly under it is safer. In the lab, a cap of <strong>10</strong> (about 30 ms of wait) reached 87.8% success and zero timeouts. A cap of <strong>20</strong> (about 60 ms of wait) fell to 55.5% because wait plus service crossed the timeout.</p>
+
+    <h3>Problem 3: is a retry legal?</h3>
+    <p>A handler creates a paid order. The client timed out at 200 ms; the server finished at 250 ms and charged the card. The client retries the same <code>POST</code> with no extra headers. What happens, and what should have been true instead?</p>
+    <p><em>Answer:</em> A second paid order may be created (or a second charge). The request should carry an <strong>idempotency key</strong> so the server returns the original order instead of charging again. It is also a timeout budget bug: the client gave up before the honest work was done, which is how abandoned work begins.</p>
+
+    <h3>Problem 4: read these two rates</h3>
+    <p>Edge traffic is 400 requests per second. The payment service is receiving 1,500 requests per second from your API, and 70% of those are labeled as retries. Success at the edge is 22%. Name the two most useful switches to flip first, based on this page's lab.</p>
+    <p><em>Answer:</em> <strong>Shed load</strong> so accepted work can finish inside the timeout, and <strong>cut retries</strong> (or enforce a tight retry budget) so the payment service sees something close to the 400 real users, not 1,500 attempts. Adding API replicas would likely raise 1,500 even further.</p>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>12. Cheat Sheet</h2>
+    <pre><code># questions
+#   is timeout &gt; service + a small queue?
+#   is offered load several times user load?
+#   are retries happening in more than one layer?
+#   can this POST be retried safely (idempotency key)?
+
+# a safe client starting point
+#   timeout set from measured p99 plus slack
+#   at most 1 retry, only on transient errors
+#   exponential backoff with full jitter
+#   a retry budget (for example 10% of traffic)
+#   a circuit breaker on a sick dependency
+
+# a safe server starting point
+#   cap the queue so wait + service &lt; client timeout
+#   fail fast with 503 (and Retry-After if you can)
+#   cancel work when the caller hangs up
+#   label attempts so metrics can show amplification</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" rel="noopener noreferrer">Timeouts, retries, and backoff with jitter</a> &middot; <a href="../Computer-Networks/cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a> &middot; <a href="scenario-slow-api-debugging.html">Debugging a Slow API</a> &middot; <a href="scenario-errors-during-deploys.html">Errors During Every Deploy</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="scenario-pod-oomkilled-memory-leak.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Scenario: A Pod Keeps Getting OOMKilled</span></a>
+    <p class="prev-next-step">Page 24 of 24 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="scenario-slow-api-debugging.html">Debugging a Slow API</a> &middot; <a href="scenario-errors-during-deploys.html">Errors During Every Deploy</a> &middot; <a href="../Computer-Networks/cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a> &middot; <a href="../Computer-Networks/cn-quic-http3.html">QUIC and HTTP/3</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>QUIC and HTTP/3 | CS Fundamentals</title>
+  <meta name="description" content="QUIC and HTTP/3 from zero: why TCP plus HTTP/2 still head-of-line blocks, how QUIC runs reliable streams over UDP, 1-RTT and 0-RTT handshakes compared with TCP and TLS 1.3, connection IDs that survive a Wi-Fi to mobile change, and a lab where a 2% loss left one HTTP/2 stream waiting 209 ms while the same stream on QUIC finished in 60 ms.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; QUIC and HTTP/3</p>
+  </nav>
+  <h1>QUIC and HTTP/3</h1>
+  <p>The web still speaks HTTP: a method, some headers, a body. <strong>HTTP/3</strong> is the same language on a new transport, <strong>QUIC</strong>, which runs over UDP instead of TCP. This page explains why that change exists, what it fixes, and what it does not. It builds on <a href="cn-tcp-deep-dive.html">TCP</a>, <a href="cn-dns-http.html">DNS &amp; HTTP</a>, and <a href="cn-tls-https-certificates.html">TLS</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">The Problem TCP Does Not Fix</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#hol">Head-of-Line Blocking, Worked by Hand</a></li>
+    <li><a href="#udp">Why QUIC Runs on UDP</a></li>
+    <li><a href="#handshake">1-RTT and 0-RTT Handshakes</a></li>
+    <li><a href="#cid">Connection IDs and a Changing IP</a></li>
+    <li><a href="#streams">Streams, Frames, and Loss</a></li>
+    <li><a href="#lab">The Lab: Four Streams, 2% Loss</a></li>
+    <li><a href="#http3">HTTP/3: The Same Meaning, a New Pipe</a></li>
+    <li><a href="#discover">How a Browser Finds HTTP/3</a></li>
+    <li><a href="#debug">Debugging When UDP Is Blocked</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. The Problem TCP Does Not Fix</h2>
+    <p>TCP gives you a reliable, ordered stream of bytes. HTTP/1.1 used one stream per connection, so a page with many files opened many connections. HTTP/2 put many request/response streams on <em>one</em> TCP connection, which is kinder to the network. But TCP still delivers bytes in order. If packet 5 is lost, packets 6, 7, and 8 wait in the receiver, even if they belong to a completely different image.</p>
+    <p>That wait is <strong>TCP head-of-line (HOL) blocking</strong>. HTTP/2 removed HOL blocking at the HTTP layer (one slow response no longer holds up the next on the same connection), then bumped into it again at the TCP layer.</p>
+    <p>Three other TCP limitations show up on phones and on long paths:</p>
+    <ul>
+      <li><strong>Handshake cost.</strong> A new TCP connection plus TLS 1.3 takes two or three round trips before the first request gets an answer. The <a href="cn-tcp-deep-dive.html#page-load">TCP page</a> budgets this.</li>
+      <li><strong>A new IP address is a new connection.</strong> Move from Wi-Fi to mobile data and the four-tuple (your IP, your port, server IP, server port) changes. TCP cannot follow you. The connection dies, and TLS starts again.</li>
+      <li><strong>The transport headers are in the clear.</strong> A middlebox can see and tinker with sequence numbers and window sizes. That made the internet work in the 1990s. It also made TCP itself hard to change: if you invent a new option, some middlebox may drop the packet.</li>
+    </ul>
+    <p>QUIC's answer: put reliability, streams, and TLS together in user space, carry them over UDP, and encrypt almost everything.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>QUIC.</strong> A transport protocol, standardized as RFC 9000 (with TLS in RFC 9001 and recovery in RFC 9002). It provides reliable, ordered <em>streams</em>, congestion control, and encryption. It runs over UDP, usually on port 443.</li>
+      <li><strong>HTTP/3.</strong> HTTP semantics (methods, headers, status codes, bodies) over QUIC. It is not a new meaning for <code>GET</code>. It is a new mapping of that meaning onto QUIC streams.</li>
+      <li><strong>Stream.</strong> An independent ordered sequence of bytes inside one QUIC connection. One request/response typically gets one stream. Loss on stream 7 does not stall stream 8.</li>
+      <li><strong>Connection ID (CID).</strong> A value in the QUIC packet header that identifies the connection, even if the client's IP or port changes.</li>
+      <li><strong>Round trip time (RTT).</strong> The time for a packet to go to the other side and for a reply to come back. Many "how long does setup take?" answers are just "this many RTTs."</li>
+      <li><strong>0-RTT.</strong> Sending application data (for example an HTTP request) in the first flight of a resumed connection, without waiting for the handshake to finish. Faster, with a replay risk described below.</li>
+      <li><strong>Head-of-line blocking.</strong> A lost piece at the front of a queue holds up everything behind it.</li>
+      <li><strong>Middlebox.</strong> A firewall, NAT, or other device between the two ends that may inspect or drop packets.</li>
+    </ul>
+  </section>
+
+  <section id="hol">
+    <h2>3. Head-of-Line Blocking, Worked by Hand</h2>
+    <p>Two files share one connection. Each file is two packets. Packet 2, which belongs only to file A, is lost. The one-way delay is 40 ms, and a lost packet is retransmitted after one RTO of 160 ms (we use these same numbers in the lab).</p>
+    <pre><code>Send order on the wire (packet, which file):
+  1:A1   2:B1   3:A2   4:B2
+                 ^
+                 this packet is lost
+
+TCP / HTTP/2 (one ordered byte stream):
+  A1 arrives, B1 arrives, B2 arrives... but the TCP stack
+  cannot hand B1 or B2 to HTTP/2 until A2 is retransmitted
+  and placed in order. File B waits for file A's loss.
+
+QUIC / HTTP/3 (two streams):
+  Stream A waits for A2.
+  Stream B delivers B1 and B2 as soon as they arrive.
+  The image in file B can render while A is still recovering.</code></pre>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> TCP is one checkout line at a shop. If the person at the front of the line forgot their wallet, everyone waits. QUIC is one shop with many checkout lines (streams) under one roof (the connection). A delay in one line does not stop the others. The roof still has rules (congestion control) so the shop as a whole does not flood the street.</p>
+    </div>
+    <p>Two honest limits: QUIC does not make the lost stream itself faster. File A still waits for the retransmission. And if the lost packet was the only packet you needed, there is no other stream to save you. The win is when a page or an API call uses several streams at once, which is the common case in a browser.</p>
+  </section>
+
+  <section id="udp">
+    <h2>4. Why QUIC Runs on UDP</h2>
+    <p>Could we have changed TCP instead? In theory, yes. In practice, TCP is implemented in the kernel, and the path between two hosts is full of devices that expect TCP to look a certain way. A new TCP option may be dropped. A new delivery rule may never be deployed to every kernel your users run.</p>
+    <p>UDP is a thin envelope: ports, a length, a checksum, and the payload. Middleboxes have to allow UDP for other things (video, VPNs, games, and now HTTP/3). QUIC puts its own packet format and its own reliability inside that payload, in user space. Browsers and servers can ship a new QUIC version without waiting for an operating-system update.</p>
+    <pre><code>HTTP/2:   HTTP frames  |  TLS  |  TCP  |  IP
+HTTP/3:   HTTP frames  |  QUIC (includes TLS 1.3)  |  UDP  |  IP</code></pre>
+    <p>Because QUIC includes TLS 1.3, there is no "cleartext QUIC" in normal use. Packet numbers, stream data, and most headers are encrypted. A middlebox can still see UDP ports and some connection-ID bytes. It cannot tweak the receive window the way it could with TCP.</p>
+    <p>The cost of using UDP: some office networks and old firewalls still block UDP on port 443, or treat it badly. Browsers then fall back to HTTP/2 over TCP. That is a feature, not a failure, as long as you do not assume every client will complete an HTTP/3 handshake.</p>
+  </section>
+
+  <section id="handshake">
+    <h2>5. 1-RTT and 0-RTT Handshakes</h2>
+    <p>Setup time is measured in round trips. Take an RTT of 80 ms, a long but realistic path between continents, and ignore DNS for a moment (DNS is extra, and is the same for both designs; see the <a href="cn-dns-http.html">DNS page</a>).</p>
+    <pre><code>TCP + TLS 1.3, first visit (no connection reuse):
+  1. TCP SYN -&gt; SYN-ACK -&gt; ACK              1 RTT
+  2. TLS ClientHello -&gt; ServerHello+certs
+     + Finished, then the HTTP request      1 RTT
+  3. HTTP response starts                   1 more RTT
+  Time to first byte of the response:       3 RTT = 240 ms
+
+QUIC + HTTP/3, first visit:
+  1. QUIC Initial + TLS ClientHello -&gt;
+     Server reply (keys, certs) + handshake
+     The HTTP request can go once keys are
+     in place, in this same 1-RTT exchange  1 RTT
+  2. HTTP response starts                   1 RTT
+  Time to first byte:                       2 RTT = 160 ms
+
+QUIC, returning visitor with a session ticket (0-RTT):
+  1. Client sends 0-RTT data (the HTTP request)
+     along with the first handshake flight
+  2. Server answers with the response       1 RTT = 80 ms</code></pre>
+    <p>The first-visit saving is one RTT (80 ms here). The returning-visitor saving can be another RTT, but only if 0-RTT is accepted. TLS 1.3 on a reused TCP connection can also send 0-RTT data; QUIC's extra win on the first visit is that it does not spend a separate RTT on a TCP handshake.</p>
+    <h3>The 0-RTT catch: replay</h3>
+    <p>0-RTT data is sent before the server has proved that this handshake is fresh. An attacker who captured the first flight can send it again. If the request was <code>GET /style.css</code>, a replay is usually harmless. If the request was <code>POST /pay</code> and the server is not careful, a replay could try to pay twice.</p>
+    <p>The safe rule, which the TLS page also uses: <strong>only send idempotent, replay-safe requests as 0-RTT data</strong> (typically <code>GET</code> of public or cacheable resources). Servers should reject 0-RTT for anything with a side effect, or protect those handlers with an idempotency key and replay detection. Browsers already follow this rule for many requests.</p>
+  </section>
+
+  <section id="cid">
+    <h2>6. Connection IDs and a Changing IP</h2>
+    <p>TCP names a connection by the four-tuple of IP addresses and ports. Change one of those, and it is a different connection. QUIC names a connection by a <strong>connection ID</strong> carried in the packet. The client and server can also agree on new IDs during the connection, so an observer cannot follow a user across networks by a single stable ID.</p>
+    <pre><code>on Wi-Fi:   client 192.0.2.10:54123  -&gt;  server 203.0.113.5:443
+            connection ID  a1b2...
+
+switch to mobile data: the client IP becomes 198.51.100.77
+            same connection ID  a1b2...
+            the server keeps the stream state, the TLS keys,
+            and the HTTP requests that were in flight</code></pre>
+    <p>This is why a video or a large download can survive walking out of a building, at least when both ends and the path support the change. NAT and firewalls still have to allow the new UDP flow. Connection migration is a QUIC feature, not a guarantee from the network.</p>
+  </section>
+
+  <section id="streams">
+    <h2>7. Streams, Frames, and Loss</h2>
+    <p>A QUIC packet can carry several <strong>frames</strong>: stream data, acknowledgements, crypto handshake bytes, connection close, and others. Each stream has its own offset, like a private sequence number. If packet 9 is lost and it only held bytes for stream 3, only stream 3 is missing a range. Stream 4's bytes in packet 10 can be delivered as soon as they arrive.</p>
+    <p>Streams are cheap to open. HTTP/3 typically uses:</p>
+    <ul>
+      <li>One bidirectional stream per request/response.</li>
+      <li>A few control streams for settings and QPACK (the HTTP/3 header compressor).</li>
+      <li>Optional unidirectional streams for other control data.</li>
+    </ul>
+    <p>QPACK is designed so a lost header packet does not stall every other request the way HPACK on HTTP/2 could. That was another, quieter form of HOL blocking.</p>
+    <p>Loss recovery and congestion control still exist. QUIC acknowledgements are richer than classic TCP SACK, and the sender can decide to retransmit quickly. Algorithms such as CUBIC or BBR can run on a QUIC connection the same way they run on TCP (the <a href="cn-tcp-deep-dive.html#congestion">TCP congestion section</a> is still the right mental model). QUIC does not magically get more bandwidth. It wastes less of the bandwidth you already have when loss is on a different stream than the one the user is waiting for.</p>
+  </section>
+
+  <section id="lab">
+    <h2>8. The Lab: Four Streams, 2% Loss</h2>
+    <p>We wrote a small discrete-event simulation of four parallel responses. Each response is 50 packets (about 60 KB at 1,200 bytes per packet). Packets are sent in round-robin order across the four streams, 0.1 ms apart. The RTT is 80 ms. A lost packet is retransmitted after an RTO of 160 ms (2 &times; RTT). There is no extra bandwidth limit, on purpose: we wanted to isolate head-of-line blocking, not congestion control.</p>
+    <p>In the TCP / HTTP/2 model, a packet can be delivered to the application only when every earlier packet on the <em>connection</em> has arrived. In the QUIC model, a packet can be delivered when every earlier packet on <em>its own stream</em> has arrived.</p>
+
+    <h3>No loss, both designs agree</h3>
+    <p>With zero loss, every stream finished in <strong>59.6 to 59.9 ms</strong> in both models: one one-way delay (40 ms) plus a little pacing of the 200 packets. There is nothing for QUIC to fix when nothing is lost.</p>
+
+    <h3>One seed at 2% loss, told in full</h3>
+    <p>Seed 27 dropped 4 of the 200 packets: stream 1 packet 5, stream 3 packets 10 and 19, and stream 0 packet 22. Stream 2 lost nothing.</p>
+    <table>
+      <thead><tr><th></th><th>Stream 0</th><th>Stream 1</th><th>Stream 2</th><th>Stream 3</th><th>First stream done</th><th>All done</th></tr></thead>
+      <tbody>
+        <tr><td>TCP / HTTP/2</td><td>208.8 ms</td><td>208.8 ms</td><td>208.8 ms</td><td>208.8 ms</td><td><strong>208.8 ms</strong></td><td>208.8 ms</td></tr>
+        <tr><td>QUIC / HTTP/3</td><td>208.8 ms</td><td>202.1 ms</td><td><strong>59.8 ms</strong></td><td>207.9 ms</td><td><strong>59.8 ms</strong></td><td>208.8 ms</td></tr>
+      </tbody>
+    </table>
+    <p>The last stream finished at the same time in both models, 208.8 ms, because the last lost packet needs the same retransmission wait. QUIC does not rewrite physics. What changed is stream 2: it had no loss, so QUIC delivered it in <strong>59.8 ms</strong>, the no-loss time. Under TCP, stream 2 sat behind the other streams' losses for an extra <strong>149 ms</strong>.</p>
+    <p>If stream 2 was the CSS or the first JSON response the page needed, the user can go forward 149 ms earlier, even though some images are still recovering.</p>
+
+    <h3>Twenty random seeds</h3>
+    <p>We repeated the 2% loss run with 20 different seeds.</p>
+    <table>
+      <thead><tr><th></th><th>TCP first stream (avg)</th><th>QUIC first stream (avg)</th><th>All streams done (avg)</th></tr></thead>
+      <tbody>
+        <tr><td>2% loss</td><td><strong>223.7 ms</strong></td><td><strong>74.0 ms</strong></td><td>223.7 ms (same in both)</td></tr>
+        <tr><td>5% loss</td><td>287.9 ms</td><td>179.3 ms</td><td>287.9 ms (same in both)</td></tr>
+      </tbody>
+    </table>
+    <p>At 2% loss, the first usable stream arrived about <strong>3 times earlier</strong> with QUIC (74 ms vs 224 ms). At 5% loss the gap is still there, but smaller in ratio, because more streams themselves are hit by loss.</p>
+    <div class="callout">
+      <p><strong>What this lab is not.</strong> It is not a speed test of a real browser against a real CDN. It does not model congestion windows, delayed acks, or application-limited senders. It is a microscope on one idea: <em>shared sequence numbers stall everyone; per-stream sequence numbers stall only the victim.</em> The handshake math in section 5 is a separate, real saving that this loss lab does not include.</p>
+    </div>
+  </section>
+
+  <section id="http3">
+    <h2>9. HTTP/3: The Same Meaning, a New Pipe</h2>
+    <p>A <code>GET /index.html</code> still means "give me this resource." Status <code>304 Not Modified</code> still means "your cache is fine." Cookies, authorization headers, and CORS do not change their meaning. If you know HTTP/1.1 text, you already know HTTP/3's vocabulary. The <a href="cn-dns-http.html#http-messages">DNS &amp; HTTP page</a> is the right place for that vocabulary.</p>
+    <p>What changes is how that message is carried:</p>
+    <ul>
+      <li>Headers are compressed with QPACK, not HPACK or gzip of the whole message.</li>
+      <li>Each request lives on its own QUIC stream, not as TCP bytes on a shared connection, and not as a new TCP connection per file.</li>
+      <li>Priorities and server push have a different (and, in practice, more modest) story than early HTTP/2 hopes. Do not plan a product around server push.</li>
+    </ul>
+    <p>For an API you built, "support HTTP/3" usually means "put a load balancer or CDN that speaks HTTP/3 in front, keep your application as HTTP." The application still sees a method, a path, headers, and a body. The <a href="cn-load-balancing-reverse-proxies.html">load balancing page</a> is the next place to read about that front door.</p>
+  </section>
+
+  <section id="discover">
+    <h2>10. How a Browser Finds HTTP/3</h2>
+    <p>The first visit to a site often still starts over TCP. The server then advertises HTTP/3 in one of two ways:</p>
+    <ul>
+      <li>An <code>Alt-Svc</code> header, for example <code>alt-svc: h3=":443"; ma=86400</code>, which says "I also speak HTTP/3 on port 443, remember this for a day."</li>
+      <li>A DNS <code>HTTPS</code> (or <code>SVCB</code>) record that lists <code>alpn=h3,h2</code> up front, so the browser can start with QUIC on the first visit and skip a wasted TCP attempt.</li>
+    </ul>
+    <p>The DNS page shows a real <code>HTTPS</code> record. If HTTP/3 fails (UDP is blocked, a middlebox eats the packets, the handshake times out), a good client falls back to HTTP/2 or HTTP/1.1 and remembers not to keep trying QUIC for a while.</p>
+  </section>
+
+  <section id="debug">
+    <h2>11. Debugging When UDP Is Blocked</h2>
+    <p>When a site "works on my phone and not on the office Wi-Fi," or a client spends a second then falls back, think about UDP.</p>
+    <pre><code># does this host advertise HTTP/3?
+dig +short example.com HTTPS
+curl -sI --http3 https://example.com     # if your curl was built with HTTP/3
+curl -sI --http2 https://example.com     # fallback path
+
+# look for Alt-Svc
+curl -sI https://example.com | grep -i alt-svc
+
+# a packet capture (needs permission): UDP port 443
+# tcpdump -i any udp port 443</code></pre>
+    <p>Signs of trouble: lots of QUIC Initial packets and no reply; a long gap then a TCP connection; a corporate firewall that allows TCP 443 only. qlog (a JSON event log some stacks can emit) is the detailed trace, similar in spirit to a TLS key log plus a TCP dump, but built for QUIC events.</p>
+    <p>Do not block UDP 443 on your own servers if you want HTTP/3 to work. Do keep a TCP listener for the fallback. Health checks should cover both, or you will "prove" the service is up while half of your browsers take the slow path.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>12. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Expecting HTTP/3 to make a single large download much faster on a clean path.</strong> With no loss and a warm connection, TCP and QUIC are often close. The big wins are setup time and loss on multiplexed streams.</li>
+      <li><strong>Sending unsafe 0-RTT requests.</strong> No <code>POST /pay</code> in 0-RTT without replay protection.</li>
+      <li><strong>Forgetting the UDP fallback.</strong> Some networks will always use HTTP/2. Measure both.</li>
+      <li><strong>Assuming a new IP keeps the connection on TCP.</strong> Only QUIC connection IDs do that, and only when migration is allowed.</li>
+      <li><strong>Looking at a TCP dump for HTTP/3.</strong> You will see UDP. Use a QUIC-aware tool or qlog.</li>
+      <li><strong>Turning on HTTP/3 at a load balancer and checking only TCP health.</strong> Test UDP 443 too.</li>
+      <li><strong>Confusing HTTP/3 with a new application protocol.</strong> Your handlers, status codes, and auth headers stay the same.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>13. Practice Problems</h2>
+    <h3>Problem 1: first-byte time</h3>
+    <p>RTT is 40 ms. Ignore DNS and the download itself. How long until the first byte of the response on a first visit with TCP+TLS 1.3, and with QUIC? How about a QUIC 0-RTT resume?</p>
+    <p><em>Answer:</em> TCP+TLS 1.3 first visit: 3 &times; 40 = <strong>120 ms</strong>. QUIC first visit: 2 &times; 40 = <strong>80 ms</strong>. QUIC 0-RTT resume: <strong>40 ms</strong>.</p>
+
+    <h3>Problem 2: who waits?</h3>
+    <p>A page fetches four images on one connection. The packet that holds the middle of image 2 is lost. Under HTTP/2 over TCP, which images can be fully delivered before the retransmission arrives? Under HTTP/3?</p>
+    <p><em>Answer:</em> Under HTTP/2 over TCP, <strong>none</strong> of the later packets can be delivered to HTTP/2 until the lost packet is filled in, so images 2, 3, and 4 all wait (image 1 only finishes if every one of its packets was sent and received before the loss). Under HTTP/3, images 1, 3, and 4 can finish as soon as their own packets have arrived; only image 2 waits for the retransmission.</p>
+
+    <h3>Problem 3: is 0-RTT safe here?</h3>
+    <p>A client wants to retry <code>POST /v1/orders</code> as 0-RTT after a disconnect. The handler creates a paid order. Should the server accept this as 0-RTT data? What should it do instead?</p>
+    <p><em>Answer:</em> <strong>No.</strong> A replay could create a second paid order. Reject 0-RTT for this path (force a 1-RTT handshake) and, separately, require an idempotency key so even a legitimate retry after a lost response does not double-charge. See the <a href="../Scenarios/scenario-retry-storm.html">retry-storm scenario</a> for the wider retry story.</p>
+
+    <h3>Problem 4: the lab's honest limit</h3>
+    <p>In the lab, "all streams done" was the same for TCP and QUIC (208.8 ms on seed 27). Someone says "then QUIC did not help." What did it help, and when would "all done" also improve?</p>
+    <p><em>Answer:</em> It helped the streams that were <em>not</em> hit by the loss (stream 2 finished in 59.8 ms instead of 208.8 ms). "All done" would also improve if the last stream itself had no loss, or if you care about a metric like "time until the first needed resource," not "time until every resource is here." Handshake savings (section 5) improve even a single-stream first visit, which this loss lab does not measure.</p>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>14. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th></th><th>TCP + TLS 1.3 + HTTP/2</th><th>QUIC + HTTP/3</th></tr></thead>
+      <tbody>
+        <tr><td>Runs on</td><td>TCP</td><td>UDP (usually port 443)</td></tr>
+        <tr><td>First-visit setup</td><td>About 3 RTT to first byte</td><td>About 2 RTT</td></tr>
+        <tr><td>Resume</td><td>TLS 0-RTT possible on a reused TCP connection</td><td>0-RTT without a separate TCP handshake</td></tr>
+        <tr><td>Loss with many streams</td><td>One loss stalls the connection</td><td>One loss stalls that stream</td></tr>
+        <tr><td>IP change</td><td>Connection dies</td><td>Can continue with a connection ID</td></tr>
+        <tr><td>Fallback</td><td>-</td><td>Browsers fall back to HTTP/2 if UDP fails</td></tr>
+      </tbody>
+    </table>
+    <pre><code>dig +short example.com HTTPS
+curl -sI https://example.com | grep -i alt-svc
+# time a first request (your curl build may need --http3)
+curl -s -o /dev/null -w '%{http_version} %{time_connect} %{time_starttransfer}\n' https://example.com</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://www.rfc-editor.org/rfc/rfc9000.html" rel="noopener noreferrer">RFC 9000 (QUIC)</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9114.html" rel="noopener noreferrer">RFC 9114 (HTTP/3)</a> &middot; <a href="https://www.rfc-editor.org/rfc/rfc9001.html" rel="noopener noreferrer">RFC 9001 (QUIC + TLS)</a> &middot; <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="cn-tls-https-certificates.html">TLS, HTTPS &amp; Certificates</a> &middot; <a href="cn-dns-http.html">DNS &amp; HTTP</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="cn-tls-https-certificates.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">TLS, HTTPS &amp; Certificates</span></a>
+    <a class="prev-next-next" href="cn-load-balancing-reverse-proxies.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Load Balancing &amp; Reverse Proxies</span></a>
+    <p class="prev-next-step">Page 17 of 24 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="cn-tcp-deep-dive.html">TCP Deep Dive</a> &middot; <a href="cn-tls-https-certificates.html">TLS, HTTPS &amp; Certificates</a> &middot; <a href="cn-dns-http.html">DNS &amp; HTTP</a> &middot; <a href="cn-load-balancing-reverse-proxies.html">Load Balancing &amp; Reverse Proxies</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

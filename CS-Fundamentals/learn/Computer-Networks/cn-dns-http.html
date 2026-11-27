@@ -277,7 +277,7 @@ api.example.com                             -&gt; the real answer</code></pre>
       <li><strong>Body</strong> (optional). The HTML, JSON, image, or form data.</li>
     </ol>
     <p>In HTTP/1.1 this is literally plain text sent over the connection. HTTP/2 and HTTP/3 send the same information in a compact binary form (and header names are lowercase, as above), but the <em>meaning</em> is identical. Learn the text form and you understand all versions. See the <a href="cn-tcp-deep-dive.html#page-load">TCP page</a> for why HTTP/2 and HTTP/3 exist.</p>
-    <p>Notice <code>alt-svc: h3=":443"; ma=86400</code>: the server says "I also speak HTTP/3 on port 443, remember this for a day." The next visit can use HTTP/3.</p>
+    <p>Notice <code>alt-svc: h3=":443"; ma=86400</code>: the server says "I also speak HTTP/3 on port 443, remember this for a day." The next visit can use HTTP/3. See <a href="cn-quic-http3.html">QUIC and HTTP/3</a> for how that transport works, and for the DNS <code>HTTPS</code> record that can advertise it on the first visit.</p>
   </section>
 
   <section id="methods">
@@ -485,7 +485,7 @@ HTTP/2 304</code></pre>
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="cn-tcp-deep-dive.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">TCP Deep Dive: From Handshake to Congestion Control</span></a>
     <a class="prev-next-next" href="cn-tls-https-certificates.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">TLS, HTTPS &amp; Certificates</span></a>
-    <p class="prev-next-step">Page 13 of 20 in the suggested reading order</p>
+    <p class="prev-next-step">Page 15 of 24 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

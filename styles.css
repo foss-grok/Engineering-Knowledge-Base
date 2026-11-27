@@ -617,6 +617,11 @@ footer a:hover {
   text-decoration: underline;
 }
 
+.learn-page nav.article-toc a[aria-current="true"] {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 @media (max-width: 720px) {
   .learn-page nav.article-toc ol {
     grid-template-columns: 1fr;
@@ -1031,6 +1036,7 @@ main:focus {
 
 @media print {
   .back-to-top,
+  .skip-link,
   .learn-page .heading-anchor {
     display: none;
   }

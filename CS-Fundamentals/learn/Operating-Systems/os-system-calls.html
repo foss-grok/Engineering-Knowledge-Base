@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>System Calls &amp; the Kernel Boundary | CS Fundamentals</title>
+  <meta name="description" content="System calls from zero: user space vs kernel space, what happens in a trap, the main syscall families, and a lab that measured 2 million getpid calls at 66 ns each versus 0.28 ns for a userspace add, clock_gettime at 25 ns via the vDSO, and writing 1 MB one byte at a time (260 ms, 4 MB/s) versus one write (0.44 ms, 2,365 MB/s).">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; System Calls &amp; the Kernel Boundary</p>
+  </nav>
+  <h1>System Calls &amp; the Kernel Boundary</h1>
+  <p>Your program cannot talk to the disk, the network, or even the clock by itself. It has to ask the operating system. That ask is a <strong>system call</strong> (syscall). This page explains the two worlds a program lives in, what a syscall costs, and why writing one megabyte as a million tiny writes can be hundreds of times slower than writing it once. It builds on <a href="os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#two-worlds">Two Worlds: User Space and Kernel Space</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#trap">What Happens During a System Call</a></li>
+    <li><a href="#families">The Main Families</a></li>
+    <li><a href="#lab">The Lab: Measuring the Cost</a></li>
+    <li><a href="#vdso">The vDSO: Some Calls Never Enter the Kernel</a></li>
+    <li><a href="#strace">Watching a Program Talk to the Kernel</a></li>
+    <li><a href="#amplification">Too Many Syscalls: The N+1 I/O Problem</a></li>
+    <li><a href="#errors">How Errors Come Back</a></li>
+    <li><a href="#seccomp">Containers Can Limit Which Calls You Make</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="two-worlds">
+    <h2>1. Two Worlds: User Space and Kernel Space</h2>
+    <p>A CPU has a privilege switch. In everyday language: some instructions are allowed only for the operating system. The usual names are <strong>user mode</strong> (also called ring 3 on x86) and <strong>kernel mode</strong> (ring 0).</p>
+    <pre><code>user space                         kernel space
++---------------------------+      +------------------------------+
+| your process              |      | the operating system         |
+|  - your code and data     |      |  - talks to devices          |
+|  - libraries (libc)       |      |  - owns files, memory, net   |
+|  - cannot talk to disks   |      |  - switches between processes|
+|    or change page tables  |      |  - enforces permissions      |
++--------------+------------+      +--------------^---------------+
+               |                                  |
+               |  system call (a controlled door) |
+               +----------------------------------+</code></pre>
+    <p>This split is not a fashion. If every program could write any sector on the disk, or change any other process's memory, a bug in a calculator could wipe the machine. The kernel sits in the middle and allows only well-defined requests: "read this file," "send these bytes," "give me more memory."</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Think of a bank. You cannot walk into the vault. You fill in a form at the counter (the system call). The teller (the kernel) checks your identity, does the work, and hands back a result or an error. The form is standardized. You cannot invent a new form that says "give me everyone else's money."</p>
+    </div>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>System call (syscall).</strong> A request from a program to the kernel. On Linux, examples are <code>read</code>, <code>write</code>, <code>open</code>, <code>mmap</code>, <code>fork</code>, <code>clone</code>, <code>poll</code>, and <code>getpid</code>.</li>
+      <li><strong>User space.</strong> The memory and mode your process runs in. It cannot run privileged instructions.</li>
+      <li><strong>Kernel space.</strong> The memory and mode the operating system runs in.</li>
+      <li><strong>Trap (or exception, or software interrupt).</strong> The CPU event that switches from user mode to kernel mode in a controlled way. Modern x86-64 Linux uses the <code>syscall</code> instruction for this.</li>
+      <li><strong>ABI (application binary interface).</strong> The contract for how arguments are passed (which registers, which numbers identify which call) and how results come back.</li>
+      <li><strong>libc.</strong> The C library (on Linux often glibc or musl). Your Python or Go or Java program usually does not issue the raw instruction itself. A library wraps the syscall and gives you a function like <code>open()</code> or <code>os.read()</code>.</li>
+      <li><strong>vDSO (virtual dynamic shared object).</strong> A small page of kernel-provided code mapped into every process. A few "syscalls" run there, in user space, with no mode switch. <code>clock_gettime</code> is the usual example.</li>
+      <li><strong>Context switch.</strong> The kernel stops one thread and starts another. A syscall is not always a context switch to another process. Many syscalls run in the kernel and return to the same thread. A blocking syscall (wait for disk, wait for the network) often does cause a context switch, because the thread has nothing to do until the event arrives.</li>
+      <li><strong>File descriptor (fd).</strong> A small integer the kernel gives your process to refer to an open file, socket, or other object. See <a href="os-file-systems-io.html">File Systems &amp; Disk I/O</a>.</li>
+    </ul>
+  </section>
+
+  <section id="trap">
+    <h2>3. What Happens During a System Call</h2>
+    <p>Suppose your program calls <code>write(fd, buf, 13)</code> to send <code>hello, world\n</code>. Under the hood, roughly this happens:</p>
+    <pre><code>1. libc puts the syscall number for write in a register
+   (on x86-64 Linux, rax = 1) and the arguments in others
+   (rdi = fd, rsi = pointer to the bytes, rdx = 13).
+2. It runs the syscall instruction.
+3. The CPU switches to kernel mode, and jumps to a kernel
+   entry point. User registers are saved.
+4. The kernel checks the number, copies (or looks at) the
+   arguments, checks permissions, and does the work:
+   find the file, copy bytes toward the destination.
+5. It puts the result in rax: 13 on success, or a negative
+   error code on failure.
+6. The CPU switches back to user mode and returns to libc.
+7. libc turns a negative code into errno and a -1 return,
+   or returns 13 to your program.</code></pre>
+    <p>Two costs matter. The first is the <strong>mode switch</strong> itself: save state, change privilege, look up the call, come back. That is a few tens of nanoseconds on a modern machine, not millions, but it is still tens to hundreds of times a normal add. The second is the <strong>work of the call</strong>: writing a byte to a disk is much heavier than asking for the process id.</p>
+    <p>If the data is not ready (a read from a socket with no incoming bytes), the kernel puts the thread to sleep and runs something else. That is the link to <a href="os-io-models-event-loops.html">I/O models and event loops</a>: a blocking syscall waits, a non-blocking one comes back at once with "try again," and <code>epoll</code> is itself a syscall that waits for many file descriptors at once.</p>
+  </section>
+
+  <section id="families">
+    <h2>4. The Main Families</h2>
+    <p>Linux has hundreds of syscalls. Almost all of the ones you meet fall into a few groups.</p>
+    <table>
+      <thead><tr><th>Family</th><th>Examples</th><th>What you are asking</th></tr></thead>
+      <tbody>
+        <tr><td>Files and directories</td><td><code>openat</code>, <code>read</code>, <code>write</code>, <code>close</code>, <code>lseek</code>, <code>fsync</code>, <code>statx</code>, <code>mkdir</code>, <code>unlink</code></td><td>Create, read, write, and remove files</td></tr>
+        <tr><td>Memory</td><td><code>mmap</code>, <code>munmap</code>, <code>brk</code>, <code>mprotect</code>, <code>madvise</code></td><td>Give me address space, change permissions</td></tr>
+        <tr><td>Processes and threads</td><td><code>clone</code>, <code>fork</code>, <code>execve</code>, <code>exit</code>, <code>wait4</code>, <code>kill</code>, <code>getpid</code></td><td>Start, stop, wait, signal</td></tr>
+        <tr><td>Time</td><td><code>clock_gettime</code>, <code>nanosleep</code></td><td>What time is it? Sleep until then.</td></tr>
+        <tr><td>Network</td><td><code>socket</code>, <code>bind</code>, <code>listen</code>, <code>accept</code>, <code>connect</code>, <code>sendto</code>, <code>recvfrom</code></td><td>Talk to the network</td></tr>
+        <tr><td>I/O readiness</td><td><code>poll</code>, <code>epoll_wait</code>, <code>io_uring_enter</code></td><td>Which fds are ready? Submit a batch of I/O.</td></tr>
+        <tr><td>Identity and permissions</td><td><code>getuid</code>, <code>setuid</code>, <code>capset</code>, <code>prctl</code></td><td>Who am I, and what am I allowed to do?</td></tr>
+      </tbody>
+    </table>
+    <p>You rarely pick the syscall by name in a high-level language. You call <code>f.write(...)</code> or <code>socket.send(...)</code>, and the runtime decides whether to make one syscall or many. That decision is the difference between a fast program and a slow one, which the lab below measures.</p>
+  </section>
+
+  <section id="lab">
+    <h2>5. The Lab: Measuring the Cost</h2>
+    <p>We compiled a small C program with <code>-O2</code> and ran it on a Linux machine with 8 logical CPUs. Each figure below is from a representative run. A second run was within a few percent.</p>
+
+    <h3>A userspace add vs getpid vs the clock</h3>
+    <pre><code>const int N = 2000000;
+volatile int x = 0;
+for (int i = 0; i &lt; N; i++) x += 1;          /* userspace add */
+for (int i = 0; i &lt; N; i++) (void) getpid(); /* real syscall */
+for (int i = 0; i &lt; N; i++) clock_gettime(CLOCK_MONOTONIC, &amp;ts);</code></pre>
+    <table>
+      <thead><tr><th>Operation, 2,000,000 times</th><th>Total</th><th>Time each</th></tr></thead>
+      <tbody>
+        <tr><td>Userspace add (<code>x += 1</code>)</td><td>0.55 ms</td><td><strong>0.28 ns</strong></td></tr>
+        <tr><td><code>getpid()</code> (enters the kernel)</td><td>132 ms</td><td><strong>66 ns</strong></td></tr>
+        <tr><td><code>clock_gettime</code> (vDSO, see next section)</td><td>50 ms</td><td><strong>25 ns</strong></td></tr>
+      </tbody>
+    </table>
+    <p>On this machine, <code>getpid</code> is about <strong>240 times</strong> slower than a single add. It is still fast in human terms: you can do about 15 million <code>getpid</code> calls in a second. The trouble starts when you do a heavier syscall, or when you do a cheap one once per byte.</p>
+
+    <h3>Writing one megabyte, three ways</h3>
+    <p>We opened a file and wrote 1,048,576 bytes (1 MiB) of the letter <code>A</code>.</p>
+    <table>
+      <thead><tr><th>How</th><th>Syscalls</th><th>Time</th><th>Throughput</th></tr></thead>
+      <tbody>
+        <tr><td>One <code>write()</code> of 1 byte, 1,048,576 times</td><td>1,048,576</td><td><strong>260 ms</strong></td><td>4.0 MB/s</td></tr>
+        <tr><td>One <code>write()</code> of 4 KB, 256 times</td><td>256</td><td><strong>0.56 ms</strong></td><td>1,862 MB/s</td></tr>
+        <tr><td>One <code>write()</code> of the whole megabyte</td><td>1</td><td><strong>0.44 ms</strong></td><td>2,365 MB/s</td></tr>
+      </tbody>
+    </table>
+    <p>The one-byte loop was about <strong>590 times</strong> slower than a single write (260 ms vs 0.44 ms). Almost all of that gap is the syscall boundary, not the disk: these writes hit the page cache (see <a href="os-file-systems-io.html#page-cache">File Systems &amp; Disk I/O</a>). Going from 4 KB writes to one large write only shaved a little more off, because 256 calls is already a small number.</p>
+
+    <h3>Open and close vs reuse</h3>
+    <p>Opening a file 50,000 times and closing it each time took <strong>35 ms</strong> (0.69 &micro;s each). Reusing one file descriptor, seeking to the start, and reading one byte 50,000 times took <strong>11 ms</strong> (0.23 &micro;s each). Open and close are not free. Long-running servers keep files and sockets open and reuse them.</p>
+
+    <h3>The same lesson in Python</h3>
+    <p>Python is slower per operation because of the interpreter, but the syscall count is still visible. Linux exposes it in <code>/proc/self/io</code> as <code>syscw</code> (write syscalls) and <code>syscr</code> (read syscalls).</p>
+    <pre><code>with open(path, "wb", buffering=0) as f:   # unbuffered
+    for i in range(1 &lt;&lt; 20):
+        f.write(b"A")
+# 421 ms, 1,048,576 write syscalls
+
+with open(path, "wb") as f:                # default buffered
+    for i in range(1 &lt;&lt; 20):
+        f.write(b"A")
+# 74 ms, 256 write syscalls
+
+with open(path, "wb") as f:
+    f.write(b"A" * (1 &lt;&lt; 20))              # one write
+# 1.5 ms, 1 write syscall</code></pre>
+    <p>The default buffered writer already did the important fix: it turned a million calls into 256. One write of the whole buffer was faster still. This is why <code>print</code> in a tight loop, or logging one line per request without buffering, can show up as a hot syscall in production.</p>
+  </section>
+
+  <section id="vdso">
+    <h2>6. The vDSO: Some Calls Never Enter the Kernel</h2>
+    <p>Look back at the lab: <code>clock_gettime</code> was <strong>25 ns</strong>, and <code>getpid</code> was <strong>66 ns</strong>. Both look like system calls in the manual. Why is the clock faster?</p>
+    <p>The kernel maps a tiny shared page, the <strong>vDSO</strong>, into every process. For a few functions, libc jumps to that page instead of running the <code>syscall</code> instruction. The page holds data the kernel updates (such as the current time) and a short function that reads it. There is no mode switch.</p>
+    <p><code>gettimeofday</code> and <code>clock_gettime</code> with the usual clocks take this path on modern Linux. <code>getpid</code> does not: it still enters the kernel (the kernel is the authority on which process you are). The 25 ns vs 66 ns gap we measured is that difference.</p>
+    <p>You usually do not need to think about the vDSO, except for this: <strong>do not assume every function in section 2 of the manual pays a full syscall.</strong> If you are counting entries with <code>strace</code>, <code>clock_gettime</code> may barely appear, while <code>read</code> and <code>write</code> will.</p>
+  </section>
+
+  <section id="strace">
+    <h2>7. Watching a Program Talk to the Kernel</h2>
+    <p><code>strace</code> (and <code>ltrace</code> for library calls, and <code>bpftrace</code> / <code>perf</code> for lower overhead) is how you see the conversation. We did not have <code>strace</code> on the lab machine; these are the commands you run on yours, and the kind of output they produce.</p>
+    <pre><code># follow every syscall of a command (noisy, slow)
+strace -o /tmp/trace.txt ls /tmp
+
+# count syscalls and time spent, then print a summary
+strace -c python3 -c 'open("/tmp/x","w").write("a"*1000000)'
+
+# a typical summary line (your counts will differ):
+#   % time     seconds  usecs/call     calls    errors syscall
+# ------ ----------- ----------- --------- --------- ----------------
+#   40.00    0.000120          12        10           openat
+#   25.00    0.000075          75         1           write
+#   ...</code></pre>
+    <p>Useful flags:</p>
+    <ul>
+      <li><code>-f</code> follows children (needed for programs that start workers).</li>
+      <li><code>-p PID</code> attaches to a process that is already running.</li>
+      <li><code>-e trace=file</code> or <code>-e write,read,openat</code> keeps only the calls you care about.</li>
+      <li><code>-c</code> counts instead of printing every call. Start here. A full trace of a busy server is huge and will slow the process down.</li>
+    </ul>
+    <p>When a service is "mysteriously slow" and CPU is low, a syscall count is often the missing picture: millions of tiny <code>read</code>s, a <code>stat</code> per request on the same config file, or a process that <code>open</code>s and <code>close</code>s a connection every time instead of reusing it.</p>
+    <p>Linux also lets you read counts without <code>strace</code>:</p>
+    <pre><code>cat /proc/$(pidof yourapp)/io     # syscr, syscw, bytes
+cat /proc/$(pidof yourapp)/status | grep ctxt   # voluntary / nonvoluntary context switches</code></pre>
+  </section>
+
+  <section id="amplification">
+    <h2>8. Too Many Syscalls: The N+1 I/O Problem</h2>
+    <p>The one-byte write loop is a small case of a general bug: <strong>doing a syscall once per item, instead of once per batch.</strong></p>
+    <ul>
+      <li>Reading a file line by line with unbuffered 1-byte reads.</li>
+      <li>Querying a database once per row of a web page (the classic N+1 query, which is the same idea one layer up; see <a href="../Databases/dbms-joins-execution.html">SQL Joins</a>).</li>
+      <li>A server that <code>getaddrinfo</code>s the same hostname on every request, instead of caching the result (and honoring DNS TTLs; see <a href="../Computer-Networks/cn-dns-http.html">DNS &amp; HTTP</a>).</li>
+      <li>Logging with a flush after every line on a hot path.</li>
+    </ul>
+    <p>The fix is almost always buffering, batching, or reuse:</p>
+    <ul>
+      <li>Let the standard library buffer, or write in chunks of 4 KB or more.</li>
+      <li>Reuse file descriptors, HTTP connections, and database connections.</li>
+      <li>Use <code>sendfile</code> or <code>splice</code> to copy data without pulling it into user space, when you are just moving bytes from a file to a socket.</li>
+      <li>For many tiny I/O operations, look at <code>io_uring</code>, which lets you submit a batch of requests in one syscall. The <a href="os-io-models-event-loops.html">event loop page</a> has the wider picture.</li>
+    </ul>
+  </section>
+
+  <section id="errors">
+    <h2>9. How Errors Come Back</h2>
+    <p>On success, most syscalls return a useful number: bytes written, a new file descriptor, 0. On failure, the kernel returns a negative error code. libc stores the positive version in <code>errno</code> and returns <code>-1</code> from the wrapper. Python turns those into exceptions such as <code>FileNotFoundError</code> or <code>PermissionError</code>.</p>
+    <table>
+      <thead><tr><th>Code</th><th>Name</th><th>Typical meaning</th></tr></thead>
+      <tbody>
+        <tr><td>EPERM, EACCES</td><td>1, 13</td><td>You are not allowed to do that</td></tr>
+        <tr><td>ENOENT</td><td>2</td><td>No such file or directory</td></tr>
+        <tr><td>EINTR</td><td>4</td><td>A signal arrived; retry the call (good libraries do this for you)</td></tr>
+        <tr><td>EAGAIN / EWOULDBLOCK</td><td>11 / 11</td><td>Non-blocking I/O, nothing is ready yet</td></tr>
+        <tr><td>EPIPE</td><td>32</td><td>The other end of the pipe or socket is gone</td></tr>
+        <tr><td>ECANCELED</td><td>125</td><td>The request was cancelled (common with <code>io_uring</code>)</td></tr>
+      </tbody>
+    </table>
+    <p><code>man 2 write</code> documents the syscall. <code>man 3 write</code> documents the libc wrapper. The numbers are in <code>man errno</code>. You do not need to memorize them. You do need to know that a short write (<code>write</code> returned 4 when you asked to write 13) is not an error: you must write the rest. Network sockets do this often.</p>
+  </section>
+
+  <section id="seccomp">
+    <h2>10. Containers Can Limit Which Calls You Make</h2>
+    <p>The kernel can filter syscalls with <strong>seccomp</strong> (secure computing). A process provides a short program (a BPF filter) that says "allow," "deny," or "kill" for each syscall number. Docker and Kubernetes apply a default profile that blocks rare and dangerous calls. Your own profile can be tighter.</p>
+    <p>If a container fails with "operation not permitted" on something that works on your laptop, a syscall filter is one of the first places to look, along with capabilities and AppArmor or SELinux. The page on <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html">how containers really work</a> walks through the other walls around a container (namespaces, cgroups, capabilities).</p>
+    <p>This is the same door as section 1, just with a narrower opening: the process may still enter the kernel, but only for the calls the filter allows.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>11. Common Pitfalls</h2>
+    <ul>
+      <li><strong>One syscall per byte (or per row, or per request).</strong> Buffer, batch, or reuse. The lab: 260 ms vs 0.44 ms for the same megabyte.</li>
+      <li><strong>Ignoring short reads and short writes.</strong> Loop until you have all the bytes, or use a library that does.</li>
+      <li><strong>Treating every man-page "syscall" as a mode switch.</strong> <code>clock_gettime</code> may be a vDSO call. Measure if it matters.</li>
+      <li><strong>Running <code>strace -p</code> on a hot process in production for a long time.</strong> It slows the process. Start with <code>-c</code>, or use <code>perf</code> / eBPF.</li>
+      <li><strong>Forgetting <code>-f</code></strong> when the work happens in a child process. The parent looks idle.</li>
+      <li><strong>Busy-looping on <code>EAGAIN</code></strong> without waiting with <code>poll</code> / <code>epoll</code>. You will burn a core. See the <a href="os-io-models-event-loops.html">event loop page</a>.</li>
+      <li><strong>Not checking errors.</strong> A failed <code>close</code> or <code>fsync</code> can mean the last write never hit durable storage.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>12. Practice Problems</h2>
+    <h3>Problem 1: roughly how much slower?</h3>
+    <p>Using the lab numbers (0.28 ns per add, 66 ns per <code>getpid</code>), how many userspace adds can you do in the time of one <code>getpid</code>?</p>
+    <p><em>Answer:</em> 66 / 0.28 &approx; <strong>236</strong> adds (we rounded this to about 240 in the lab write-up).</p>
+
+    <h3>Problem 2: why is this log line expensive?</h3>
+    <pre><code>def handle(request):
+    with open("/var/log/app.log", "a") as f:
+        f.write(json.dumps(request) + "\n")
+        f.flush()</code></pre>
+    <p>The handler runs 20,000 times per second. Which syscalls are you paying for on each request, and what is a cheaper shape?</p>
+    <p><em>Answer:</em> Each request at least <code>openat</code>, <code>write</code> (maybe more than one), <code>flush</code> (which may call <code>write</code> again), and <code>close</code>. At 20,000 requests per second that is tens of thousands of open/close pairs. Open a logger once at startup (or use the standard logging library with a buffered handler), write to the same fd, and flush on a timer or when the buffer fills, not on every line, unless you have a hard durability requirement.</p>
+
+    <h3>Problem 3: read the counts</h3>
+    <p>A Python script writes 1 MB with default buffering and <code>/proc/self/io</code> reports <code>syscw: 256</code>. About how many bytes did each write syscall carry, and what would <code>syscw</code> be if the script passed <code>buffering=0</code>?</p>
+    <p><em>Answer:</em> 1,048,576 / 256 = <strong>4,096 bytes</strong> per write. Unbuffered, <code>syscw</code> would be about <strong>1,048,576</strong>, as in the lab (421 ms vs 74 ms).</p>
+
+    <h3>Problem 4: blocking or not?</h3>
+    <p>A thread calls <code>read</code> on a socket and sits there for 80 ms until a packet arrives. Did this syscall also cause a context switch? Why does that matter for a server with 10,000 waiting clients?</p>
+    <p><em>Answer:</em> Yes, almost certainly: the thread had nothing to do, so the kernel ran another thread (or went idle). 10,000 threads each blocked in <code>read</code> means 10,000 stacks and many context switches when data arrives. An event loop uses one (or a few) threads and one <code>epoll_wait</code> (or similar) to wait on all of those sockets at once. That is the subject of the <a href="os-io-models-event-loops.html">I/O models page</a>.</p>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>13. Cheat Sheet</h2>
+    <pre><code>strace -c &lt;cmd&gt;                 # count syscalls for a command
+strace -f -c -p &lt;pid&gt;           # attach, include children, summarize
+cat /proc/&lt;pid&gt;/io              # syscr / syscw and byte counts
+man 2 write                     # the syscall
+man 3 write                     # the libc wrapper
+man errno                       # error names
+
+# C: one write of a whole buffer, not one write per byte
+write(fd, buf, len);
+
+# Python: let buffering work, or write a large chunk
+open(path, "wb").write(data)
+# unbuffered (usually not what you want on a hot path):
+open(path, "wb", buffering=0)</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://man7.org/linux/man-pages/man2/syscalls.2.html" rel="noopener noreferrer">syscalls(2)</a> &middot; <a href="https://man7.org/linux/man-pages/man2/syscall.2.html" rel="noopener noreferrer">syscall(2)</a> &middot; <a href="https://man7.org/linux/man-pages/man7/vdso.7.html" rel="noopener noreferrer">vdso(7)</a> &middot; <a href="https://man7.org/linux/man-pages/man1/strace.1.html" rel="noopener noreferrer">strace(1)</a> &middot; <a href="os-processes-threads-scheduling.html">Processes &amp; Threads</a> &middot; <a href="os-io-models-event-loops.html">I/O Models &amp; Event Loops</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="os-processes-threads-scheduling.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Processes, Threads &amp; CPU Scheduling</span></a>
+    <a class="prev-next-next" href="os-virtual-memory-paging.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Virtual Memory &amp; Paging</span></a>
+    <p class="prev-next-step">Page 2 of 24 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a> &middot; <a href="os-file-systems-io.html">File Systems &amp; Disk I/O</a> &middot; <a href="os-io-models-event-loops.html">I/O Models &amp; Event Loops</a> &middot; <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html">How Containers Really Work</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -250,7 +250,7 @@ dns=0.001378 connect=0.001902 tls=0.024213 ttfb=0.039511 total=0.039601</code></
     <ul>
       <li><strong>HTTP/1.1:</strong> one request at a time per connection, so browsers open about 6 connections per host.</li>
       <li><strong>HTTP/2:</strong> many requests multiplexed as streams on one TCP connection. But one lost TCP segment stalls <em>all</em> streams until it is retransmitted, because TCP delivers bytes strictly in order. This is <strong>head-of-line blocking</strong> at the transport layer.</li>
-      <li><strong>HTTP/3:</strong> runs over <strong>QUIC</strong> on UDP. QUIC handles streams itself, so a loss only stalls the stream it belongs to. It also encrypts transport headers and lets connections survive IP changes (WiFi to mobile) via connection IDs.</li>
+      <li><strong>HTTP/3:</strong> runs over <strong>QUIC</strong> on UDP. QUIC handles streams itself, so a loss only stalls the stream it belongs to. It also encrypts transport headers and lets connections survive IP changes (WiFi to mobile) via connection IDs. The <a href="cn-quic-http3.html">QUIC and HTTP/3</a> page walks through the handshake math and a loss lab with measured times.</li>
     </ul>
   </section>
 
@@ -314,7 +314,7 @@ dns=0.001378 connect=0.001902 tls=0.024213 ttfb=0.039511 total=0.039601</code></
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="cn-ip-addressing-subnetting-routing.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">IP Addressing, Subnetting &amp; Routing</span></a>
     <a class="prev-next-next" href="cn-dns-http.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">DNS &amp; HTTP: From a Name to a Web Page</span></a>
-    <p class="prev-next-step">Page 12 of 20 in the suggested reading order</p>
+    <p class="prev-next-step">Page 14 of 24 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

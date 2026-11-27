@@ -18,12 +18,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Search index is up to date
+      - name: Search index, sitemap, and robots.txt are up to date
         run: |
           python3 scripts/build-search-index.py
-          if ! git diff --quiet -- assets/search-index.json assets/search-index.js; then
-            echo "::error::Search index is stale. Run: python3 scripts/build-search-index.py and commit the result."
-            git diff --stat -- assets/search-index.json assets/search-index.js
+          if ! git diff --quiet -- assets/search-index.json assets/search-index.js sitemap.xml robots.txt; then
+            echo "::error::Generated site files are stale. Run: python3 scripts/build-search-index.py and commit the result."
+            git diff --stat -- assets/search-index.json assets/search-index.js sitemap.xml robots.txt
             exit 1
           fi
 
