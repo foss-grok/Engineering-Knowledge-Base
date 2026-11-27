@@ -295,7 +295,7 @@ WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 20;
     <p>Do the math. If most requests time out and each is tried up to 4 times in total (1 + 3 retries):</p>
     <pre><code>  real user demand:            400 requests/s
   worst case with retries:     400 &times; 4 = 1,600 requests/s</code></pre>
-    <p>The system was already over capacity at 400. Retries pushed even more work onto the busiest part, which made more requests fail, which caused more retries. This loop is called a <strong>retry storm</strong>. It can keep a system down even after the original cause is gone.</p>
+    <p>The system was already over capacity at 400. Retries pushed even more work onto the busiest part, which made more requests fail, which caused more retries. This loop is called a <strong>retry storm</strong>. It can keep a system down even after the original cause is gone. The <a href="scenario-retry-storm.html">retry-storm scenario</a> runs this loop in a lab, with measured success rates for backoff, jitter, and load shedding.</p>
     <p>Safe retries follow four rules:</p>
     <ol>
       <li><strong>Exponential backoff:</strong> wait longer before each try (for example 100 ms, 200 ms, 400 ms).</li>
@@ -418,7 +418,7 @@ Actions:    [x] Add index                           (done)
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="../Computer-Networks/cn-load-balancing-reverse-proxies.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Load Balancing &amp; Reverse Proxies</span></a>
     <a class="prev-next-next" href="scenario-service-cannot-reach-database.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Scenario: A Service Cannot Reach Its Database</span></a>
-    <p class="prev-next-step">Page 16 of 20 in the suggested reading order</p>
+    <p class="prev-next-step">Page 19 of 24 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

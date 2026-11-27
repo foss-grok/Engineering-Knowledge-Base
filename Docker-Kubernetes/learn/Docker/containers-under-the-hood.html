@@ -445,7 +445,7 @@ $ tar tzf layer.tgz | wc -l
       <thead><tr><th>Layer</th><th>What it does</th><th>Default in Docker</th></tr></thead>
       <tbody>
         <tr><td><strong>Capabilities</strong></td><td>Root's powers are split into about 40 pieces (for example <code>CAP_NET_ADMIN</code>, <code>CAP_SYS_ADMIN</code>). A container gets only a small set.</td><td>About 14 kept; dangerous ones like <code>CAP_SYS_ADMIN</code> dropped</td></tr>
-        <tr><td><strong>seccomp</strong></td><td>A filter on system calls. Calls the app should never need (like loading kernel modules) are refused.</td><td>A default profile blocks dozens of risky calls</td></tr>
+        <tr><td><strong>seccomp</strong></td><td>A filter on system calls. Calls the app should never need (like loading kernel modules) are refused. See <a href="../../../CS-Fundamentals/learn/Operating-Systems/os-system-calls.html#seccomp">System Calls</a> for the kernel side of this door.</td><td>A default profile blocks dozens of risky calls</td></tr>
         <tr><td><strong>AppArmor / SELinux</strong></td><td>Rules on which files and resources a process may touch.</td><td>On if the host supports it</td></tr>
         <tr><td><strong>User namespaces</strong></td><td>"root" inside maps to an unprivileged user outside, so an escape lands as nobody.</td><td>Off by default; on in rootless Docker and Podman</td></tr>
         <tr><td><strong>Read-only root filesystem</strong></td><td>The container cannot change its own files.</td><td>Off; use <code>--read-only</code> or <code>readOnlyRootFilesystem: true</code></td></tr>
@@ -551,7 +551,7 @@ PID   USER     TIME  COMMAND
     <nav class="prev-next" aria-label="Reading order">
       <a class="prev-next-prev" href="docker-fundamentals.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Docker Fundamentals</span></a>
       <a class="prev-next-next" href="docker-compose.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Docker Compose</span></a>
-      <p class="prev-next-step">Page 2 of 16 in the suggested reading order</p>
+      <p class="prev-next-step">Page 2 of 17 in the suggested reading order</p>
     </nav>
     <!-- prev-next:end -->
 

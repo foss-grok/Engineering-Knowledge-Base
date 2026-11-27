@@ -246,7 +246,7 @@ healthy_threshold   2      # 2 successes in a row: add it back</code></pre>
       <li><strong>Error after the request was sent</strong> (reset, read timeout): the backend may have done the work. Retry only if the request is <strong>idempotent</strong> (doing it twice has the same effect as once: <code>GET</code>, <code>PUT</code>, <code>DELETE</code>), or if it carries an idempotency key. See <a href="cn-dns-http.html#methods">HTTP methods and idempotency</a>.</li>
     </ul>
     <h3>Retry storms</h3>
-    <p>Retries multiply load. Suppose the client retries 3 times, the load balancer retries 3 times, and the app retries its database call 3 times. One user request can become 3 &times; 3 &times; 3 = <strong>27</strong> database calls, exactly when the database is struggling. Rules: retry at <strong>one</strong> layer, add random delay between tries (jitter), and use a <strong>retry budget</strong> (for example, retries may add at most 10% extra traffic). The <a href="../Scenarios/scenario-slow-api-debugging.html#retries">slow API scenario</a> shows a storm in action.</p>
+    <p>Retries multiply load. Suppose the client retries 3 times, the load balancer retries 3 times, and the app retries its database call 3 times. One user request can become 3 &times; 3 &times; 3 = <strong>27</strong> database calls, exactly when the database is struggling. Rules: retry at <strong>one</strong> layer, add random delay between tries (jitter), and use a <strong>retry budget</strong> (for example, retries may add at most 10% extra traffic). The <a href="../Scenarios/scenario-slow-api-debugging.html#retries">slow API scenario</a> shows a storm in action, and the <a href="../Scenarios/scenario-retry-storm.html">retry-storm scenario</a> measures how a queue cap and a retry policy change the success rate.</p>
   </section>
 
   <section id="sticky">
@@ -413,9 +413,9 @@ kubectl get endpointslices -l kubernetes.io/service-name=orders   # which pods a
 
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
-    <a class="prev-next-prev" href="cn-tls-https-certificates.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">TLS, HTTPS &amp; Certificates</span></a>
+    <a class="prev-next-prev" href="cn-quic-http3.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">QUIC and HTTP/3</span></a>
     <a class="prev-next-next" href="../Scenarios/scenario-slow-api-debugging.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Scenario: Debugging a Slow API End to End</span></a>
-    <p class="prev-next-step">Page 15 of 20 in the suggested reading order</p>
+    <p class="prev-next-step">Page 18 of 24 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

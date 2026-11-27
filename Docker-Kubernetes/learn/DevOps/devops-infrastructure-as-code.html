@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Infrastructure as Code | Docker &amp; Kubernetes</title>
+  <meta name="description" content="Infrastructure as Code from zero: desired state vs actual state, why console clicks drift, a runnable reconciler that planned 2 updates and 1 delete to fix a leaked firewall rule, Terraform plan/apply/state, modules, secrets, and how to review a plan in CI before anything is applied.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; Infrastructure as Code</p>
+  </nav>
+  <h1>Infrastructure as Code</h1>
+  <p>Servers, networks, and databases can be described in files, stored in git, reviewed like application code, and applied by a tool. That idea is <strong>infrastructure as code</strong> (IaC). This page starts with a leaky firewall rule made by a console click, then shows a small reconciler you can run, and only then walks through Terraform's plan, apply, and state file. It sits next to <a href="devops-cicd-mlops.html">CI/CD and MLOps</a>: CI is how the files get applied safely.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">The Problem with Clicking in a Console</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#declarative">Imperative vs Declarative</a></li>
+    <li><a href="#lab">The Lab: A Tiny Reconciler</a></li>
+    <li><a href="#terraform">Terraform: Plan, Apply, State</a></li>
+    <li><a href="#state">The State File Is Precious</a></li>
+    <li><a href="#modules">Modules, Workspaces, and Blast Radius</a></li>
+    <li><a href="#secrets">Secrets Do Not Belong in the File</a></li>
+    <li><a href="#tools">Terraform, Pulumi, Ansible, and Kubernetes</a></li>
+    <li><a href="#ci">Plan on the Pull Request, Apply on Merge</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. The Problem with Clicking in a Console</h2>
+    <p>A team has a database that should only accept connections from the web subnet, <code>10.0.1.0/24</code>, on port 5432. On Monday someone debugs a laptop connection and, in the cloud console, adds a rule: allow <code>0.0.0.0/0</code> on 5432. The bug is fixed. The rule stays. Nobody reviews it, because there is no diff. Three months later a scan finds a database on the public internet.</p>
+    <p>The same story happens in quieter ways:</p>
+    <ul>
+      <li>Two environments, "staging" and "production," started the same and slowly stopped matching, because each change was clicked only in one of them.</li>
+      <li>A machine was created by hand, never recorded, and was missed by a backup policy.</li>
+      <li>After an incident, nobody can answer "what did we change last Thursday?"</li>
+    </ul>
+    <p>Infrastructure as code treats the desired shape of the system as a set of files. A tool compares that shape to what really exists, shows a <strong>plan</strong> (create, update, delete), and only then <strong>applies</strong> it. The files go through the same review as application code.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> A console is a conversation you cannot replay. A file is a recipe. If the cake comes out wrong, you can read the recipe, see the last change, and bake it again the same way in another kitchen.</p>
+    </div>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>Desired state.</strong> What you said you want: three web servers on image <code>app:1.4</code>, a database, a tight firewall.</li>
+      <li><strong>Actual state.</strong> What exists right now in the cloud or in the cluster.</li>
+      <li><strong>Drift.</strong> The two states do not match. Someone clicked, a process failed halfway, or an auto-scaler changed a count.</li>
+      <li><strong>Reconcile.</strong> Compute the difference and take the actions that make actual state match desired state.</li>
+      <li><strong>Plan.</strong> A preview of those actions, without doing them yet.</li>
+      <li><strong>Apply.</strong> Carry out the plan.</li>
+      <li><strong>State file.</strong> The tool's own record of what it created and which real objects map to which resources in the files. Terraform's <code>terraform.tfstate</code> is the usual example.</li>
+      <li><strong>Idempotent apply.</strong> Running apply twice with no changes the second time. The second plan is empty.</li>
+      <li><strong>Provider.</strong> The plugin that talks to a particular API (one cloud, DNS, Kubernetes, and so on).</li>
+    </ul>
+  </section>
+
+  <section id="declarative">
+    <h2>3. Imperative vs Declarative</h2>
+    <p>An <strong>imperative</strong> script says <em>how</em> to do the work, step by step:</p>
+    <pre><code>create_vpc()
+create_subnet()
+create_vm(count=3)
+# if you run this again, it may try to create a second VPC
+# and fail, or worse, create a duplicate</code></pre>
+    <p>A <strong>declarative</strong> file says <em>what</em> you want, and leaves the how to the tool:</p>
+    <pre><code>web: { count: 3, image: "app:1.4" }</code></pre>
+    <p>If three servers already exist with that image, the tool does nothing. If two exist, it creates one. If the image is old, it updates them. Kubernetes manifests, Terraform configurations, and the lab below are declarative. Ansible can be used either way; many playbooks are a mix (declarative modules called in an imperative order).</p>
+    <p>Declarative does not mean "no danger." A file that says <code>count: 0</code> will delete everything that used to be there. The plan is how you see that before it happens.</p>
+  </section>
+
+  <section id="lab">
+    <h2>4. The Lab: A Tiny Reconciler</h2>
+    <p>You do not need a cloud account to see the idea. We wrote a small Python program that treats dictionaries as "the infrastructure." Desired state is the file you would keep in git. Actual state is what we found after a week of console clicks.</p>
+    <pre><code>desired = {
+    "vpc":             {"cidr": "10.0.0.0/16"},
+    "subnet-public":   {"cidr": "10.0.1.0/24", "in": "vpc"},
+    "subnet-private":  {"cidr": "10.0.2.0/24", "in": "vpc"},
+    "web":             {"count": 3, "image": "app:1.4",
+                        "subnet": "subnet-public", "cpu_milli": 200},
+    "db":              {"count": 1, "image": "postgres:16",
+                        "subnet": "subnet-private", "cpu_milli": 500,
+                        "disk_gb": 50},
+    "firewall":        {"allow": ["10.0.1.0/24:5432"],
+                        "deny":  ["0.0.0.0/0:5432"]},
+}
+
+# after a week of clicks:
+#   - only 2 web servers, still on the old image
+#   - the database port is open to the world
+#   - a forgotten "old-worker" machine is still running
+actual = {
+    "vpc":             {"cidr": "10.0.0.0/16"},
+    "subnet-public":   {"cidr": "10.0.1.0/24", "in": "vpc"},
+    "subnet-private":  {"cidr": "10.0.2.0/24", "in": "vpc"},
+    "web":             {"count": 2, "image": "app:1.3",
+                        "subnet": "subnet-public", "cpu_milli": 200},
+    "db":              {"count": 1, "image": "postgres:16",
+                        "subnet": "subnet-private", "cpu_milli": 500,
+                        "disk_gb": 50},
+    "firewall":        {"allow": ["0.0.0.0/0:5432"], "deny": []},
+    "old-worker":      {"count": 1, "image": "app:0.9",
+                        "subnet": "subnet-public", "cpu_milli": 100},
+}
+
+def plan(desired, actual):
+    creates, updates, deletes, same = [], [], [], []
+    for name, spec in desired.items():
+        if name not in actual:
+            creates.append((name, spec))
+        elif actual[name] != spec:
+            updates.append((name, actual[name], spec))
+        else:
+            same.append(name)
+    for name, spec in actual.items():
+        if name not in desired:
+            deletes.append((name, spec))
+    return creates, updates, deletes, same</code></pre>
+    <p>We ran <code>plan(desired, actual)</code>. This is what it printed:</p>
+    <pre><code>create:   (none)
+update:   web       count 2 -&gt; 3, image app:1.3 -&gt; app:1.4
+          firewall  allow 0.0.0.0/0:5432  -&gt;  only 10.0.1.0/24:5432
+                    deny  []              -&gt;  0.0.0.0/0:5432
+delete:   old-worker
+unchanged: vpc, subnet-public, subnet-private, db</code></pre>
+    <p>Three facts, all in one reviewable plan:</p>
+    <ol>
+      <li>The web tier has drifted (wrong count, old image).</li>
+      <li>The firewall rule that was meant to be private is open to the world. This is the Monday debug rule from section 1, still sitting there.</li>
+      <li>A machine that is not in the desired file still exists. The tool will delete it, which is what you want if the file is the source of truth, and dangerous if someone created it on purpose and never added it to the file.</li>
+    </ol>
+    <p>We then applied the plan (copy desired values into actual, drop the extra resource). A second plan was empty: <strong>no creates, no updates, no deletes</strong>. That empty second plan is the test you want in real life too. If apply is not idempotent, the tool is not safe to run from CI.</p>
+    <div class="callout">
+      <p><strong>What the lab is not.</strong> A real provider also has to deal with APIs that fail halfway, with delays ("the VM is still booting"), and with objects that other tools own. The comparison itself, though, is the same comparison Terraform makes when you run <code>terraform plan</code>.</p>
+    </div>
+  </section>
+
+  <section id="terraform">
+    <h2>5. Terraform: Plan, Apply, State</h2>
+    <p>Terraform is the most common language for this kind of file when the resources live in a cloud API. A configuration looks like this (a sketch, not a full project):</p>
+    <pre><code>resource "aws_security_group" "db" {
+  name   = "db"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    description = "Postgres from the web subnet only"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = [aws_subnet.public.cidr_block]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}</code></pre>
+    <p>The usual commands:</p>
+    <pre><code>terraform init     # download providers, set up the backend
+terraform fmt      # rewrite the files in the standard style
+terraform validate # catch syntax and some type errors
+terraform plan     # show the diff, write a plan file if you ask
+terraform apply    # carry out the plan (prefer: apply the saved plan)
+terraform destroy  # tear down the resources in this configuration</code></pre>
+    <p>A careful apply in a shared environment is two steps, not one:</p>
+    <pre><code>terraform plan  -out=tfplan
+# review the plan in the pull request
+terraform apply tfplan</code></pre>
+    <p>That way the apply cannot pick up a new change that landed between the review and the click. The plan file is the reviewed artifact, the same way a container image digest is the reviewed artifact in <a href="devops-cicd-mlops.html">CI/CD</a>.</p>
+    <p>Read a plan the way you read a code review: creates are usually easy, updates need a check for downtime (will this replace a database?), and deletes need a slow look. Terraform marks some updates as <strong>force new</strong>: it will destroy the object and create a replacement, because the cloud API cannot change that field in place. A force-new on a database is a migration, not a tidy metadata edit.</p>
+  </section>
+
+  <section id="state">
+    <h2>6. The State File Is Precious</h2>
+    <p>Terraform maps each resource block to a real ID (a volume, a group, a DNS record) in a <strong>state file</strong>. Without state, the next plan cannot tell a resource it already created from a resource it still needs to create. That is how you get duplicates, or a plan that wants to build the world again from scratch.</p>
+    <p>Rules that prevent a bad day:</p>
+    <ul>
+      <li><strong>Store state remotely</strong>, with locking (for example an object store plus a lock table, or Terraform Cloud, or another backend that supports locks). Two applies at once on local state will corrupt it or double-create resources.</li>
+      <li><strong>Do not commit state to git</strong> if it can contain secrets (and it often can: database passwords, private keys, attributes a provider wrote back). Remote state still needs tight access control.</li>
+      <li><strong>Never hand-edit the state file</strong> to "fix" a plan, except with <code>terraform state</code> commands, and even then only when you understand the mapping you are changing.</li>
+      <li>If someone created an object in the console and you now want the file to own it, <code>terraform import</code> attaches the existing object to a resource block. If you skip import and just write the block, the next apply may create a second object, or fail, or (in a worse setup) replace the original.</li>
+      <li>If you delete a block from the file, the next apply will <em>destroy</em> the real object, unless you first remove it from state with <code>terraform state rm</code> (when you want to keep the object and stop managing it).</li>
+    </ul>
+    <p>Drift can also be found with <code>terraform plan</code> when nobody has changed the files: the plan shows updates that bring the world back to the file. Some teams run that plan on a schedule and open a review if it is not empty. That is how the leaked firewall rule in the lab would have been caught, even if no one remembered the Monday click.</p>
+  </section>
+
+  <section id="modules">
+    <h2>7. Modules, Workspaces, and Blast Radius</h2>
+    <p>A <strong>module</strong> is a reusable folder of Terraform files with input variables and outputs. "A private database in this network" can be a module used by staging and by production, with different sizes. Modules are good when they hide repetition. They are bad when a single apply walks a module that can touch every environment at once.</p>
+    <p><strong>Blast radius</strong> is the question: if this apply is wrong, how much can it break? Smaller states (one per environment, or even one per service) shrink the radius. One giant state for the whole company means a typo in a test resource can show up next to a production database in the same plan, and a lock on that state blocks everyone else.</p>
+    <p>Workspaces (named states for the same files) can separate environments, but they make it easy to run apply in the wrong one. Many teams prefer a separate directory or a separate pipeline for production, with a required review, rather than a workspace switch on a laptop.</p>
+  </section>
+
+  <section id="secrets">
+    <h2>8. Secrets Do Not Belong in the File</h2>
+    <p>A password in a <code>.tf</code> file will end up in git, in the plan output, and often in state. Prefer:</p>
+    <ul>
+      <li>A secret manager, and a data source that reads the secret at apply time.</li>
+      <li>Environment variables or a short-lived token for the provider itself.</li>
+      <li>Writing secrets into a store that the application reads, not into the repo.</li>
+    </ul>
+    <p>Plans are also logs. A CI system that prints the full plan can leak a secret that a provider marked as sensitive, if you have not marked it yourself. Treat plan output as carefully as you treat build logs.</p>
+  </section>
+
+  <section id="tools">
+    <h2>9. Terraform, Pulumi, Ansible, and Kubernetes</h2>
+    <table>
+      <thead><tr><th>Tool</th><th>You write</th><th>Good for</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td>Terraform / OpenTofu</td><td>Declarative HCL (or JSON)</td><td>Cloud resources, DNS, many providers</td><td>State files, force-new replacements</td></tr>
+        <tr><td>Pulumi</td><td>TypeScript, Python, Go, and others</td><td>The same kind of work, with general-purpose language tools</td><td>The same state problem, plus the temptation to hide side effects in ordinary code</td></tr>
+        <tr><td>Ansible</td><td>YAML playbooks, often step by step</td><td>Configuring servers, one-off operations, mixed fleets</td><td>Scripts that are not idempotent; less native "plan" than Terraform</td></tr>
+        <tr><td>Kubernetes manifests / Helm / Kustomize</td><td>Declarative YAML</td><td>Workloads already inside a cluster</td><td>Does not, by itself, create the cluster and the cloud around it</td></tr>
+        <tr><td>Crossplane and similar</td><td>Kubernetes resources that represent cloud objects</td><td>Teams that already live in the cluster API</td><td>Yet another control loop to understand and secure</td></tr>
+      </tbody>
+    </table>
+    <p>These tools combine. A common shape: Terraform (or similar) creates the cluster, the networks, and the databases. Helm or Kustomize describes the workloads. The CI pipeline in the <a href="devops-cicd-mlops.html">CI/CD page</a> glues the two together. Kubernetes itself is already a reconciler: you write a Deployment, the control plane keeps that many Pods running. The idea in section 3 is the same idea.</p>
+  </section>
+
+  <section id="ci">
+    <h2>10. Plan on the Pull Request, Apply on Merge</h2>
+    <p>A safe pipeline looks like this:</p>
+    <pre><code>on pull request:
+  terraform fmt -check
+  terraform validate
+  terraform plan -out=tfplan
+  attach the plan to the review (or a bot comment)
+
+on merge to the main branch (protected, required review):
+  terraform apply tfplan     # the same plan, or a freshly made
+                             # plan that is compared to the review</code></pre>
+    <p>Production applies should need a human approval, and should use credentials that are not a developer's laptop. A laptop apply with admin rights is how "I only changed a tag" becomes "I destroyed a bucket," because the local files were on the wrong branch, or the wrong workspace was selected.</p>
+    <p>After a production incident, a temporary console change is sometimes the fastest mitigation. The follow-up, before the incident is closed, is to put that change in the file, review it, and apply it, so the next plan does not revert the fix. The lab's leaked firewall rule is what happens when that follow-up never comes.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>11. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Applying without reading the plan.</strong> Especially deletes and force-new replacements.</li>
+      <li><strong>Local state, no lock.</strong> Two people apply, state goes wrong, resources are duplicated or orphaned.</li>
+      <li><strong>Secrets in git or in unsanitized plan logs.</strong></li>
+      <li><strong>One enormous state file.</strong> Huge blast radius, constant lock fights.</li>
+      <li><strong>Changing the console and never importing or updating the file.</strong> The next apply may undo the fix, or the leak stays forever.</li>
+      <li><strong>Using <code>terraform destroy</code> in production as a reflex.</strong> It means what it says.</li>
+      <li><strong>A module default that is fine in staging and fatal in production</strong> (public IP, tiny backup window, open CIDR).</li>
+      <li><strong>Ignoring a failed apply.</strong> Actual state and the state file may now disagree. The next plan is the start of the repair, not a second wild apply.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>12. Practice Problems</h2>
+    <h3>Problem 1: read this plan</h3>
+    <p>A plan says: update <code>firewall</code> (allow list changes from <code>10.0.1.0/24:5432</code> to <code>0.0.0.0/0:5432</code>), no other changes. The pull request title is "open Postgres for a debug session." Do you approve? What would you ask for instead?</p>
+    <p><em>Answer:</em> Do not approve a permanent public allow-list for a database. If a temporary opening is truly needed, prefer a short-lived, IP-specific rule, a jump host, or a tunnel, and put a time limit or a follow-up task in the same review so the next apply is guaranteed to close it. The lab in section 4 is this change, left to rot.</p>
+
+    <h3>Problem 2: empty second plan</h3>
+    <p>You apply a configuration. You immediately run plan again, with no file changes. The second plan still wants to update a tag on a resource, every time. What is going on?</p>
+    <p><em>Answer:</em> The apply is not idempotent. Common causes: a tag or attribute the provider recomputes (a timestamp, a computed fingerprint), a default you did not set in the file, or a bug in the provider. Until the second plan is empty, CI will always look "dirty," and you cannot trust drift detection.</p>
+
+    <h3>Problem 3: an object the file does not mention</h3>
+    <p>In the lab, <code>old-worker</code> is in actual state but not in desired state, so the plan deletes it. When is that correct, and when is it a disaster? What command would you use if you want Terraform to forget the object but leave it running?</p>
+    <p><em>Answer:</em> It is correct if the file is the source of truth and the machine is leftover waste. It is a disaster if the machine holds data and was never added to the file. If you want to keep it and stop managing it, remove it from state (<code>terraform state rm</code> in Terraform) and do <em>not</em> leave a resource block for it. If you want to keep it and start managing it, add a block and <code>terraform import</code> it.</p>
+
+    <h3>Problem 4: which tool?</h3>
+    <p>You need to create a Kubernetes cluster, a managed database, and DNS records, then deploy a stateless web app that already has a Helm chart. Which tool would you use for which part, and why not one tool for all of it?</p>
+    <p><em>Answer:</em> A cloud IaC tool (Terraform or similar) for the cluster, the database, and DNS. Helm (or raw manifests) for the app, because that is already the native description of in-cluster workloads. You can do everything in one tool, but you then fight either "Helm trying to own the database" or "Terraform trying to own every Deployment," and the blast radius of a single apply gets large. A clean split, glued by CI, is the usual design.</p>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>13. Cheat Sheet</h2>
+    <pre><code>terraform init
+terraform fmt -check
+terraform validate
+terraform plan  -out=tfplan
+terraform apply tfplan
+terraform state list
+terraform import &lt;resource.address&gt; &lt;real-id&gt;
+
+# questions to ask of every plan
+#   any deletes?
+#   any force-new (destroy + create) on a stateful resource?
+#   any 0.0.0.0/0 on a private port?
+#   is the second plan, right after apply, empty?</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://developer.hashicorp.com/terraform/language" rel="noopener noreferrer">Terraform language docs</a> &middot; <a href="https://opentofu.org/docs/" rel="noopener noreferrer">OpenTofu docs</a> &middot; <a href="devops-cicd-mlops.html">CI/CD and MLOps on Kubernetes</a> &middot; <a href="../Kubernetes/kubernetes-workloads.html">Kubernetes Workloads</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="devops-cicd-mlops.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">CI/CD and MLOps on Kubernetes</span></a>
+    <a class="prev-next-next" href="mlops-tracking-registry-feature-stores.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Experiment Tracking, Model Registry &amp; Feature Stores</span></a>
+    <p class="prev-next-step">Page 16 of 17 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="devops-cicd-mlops.html">CI/CD and MLOps on Kubernetes</a> &middot; <a href="../Kubernetes/kubernetes-config-security.html">Config, Secrets &amp; Security</a> &middot; <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-ip-addressing-subnetting-routing.html">IP Addressing &amp; Subnetting</a> &middot; <a href="../../../CS-Fundamentals/learn/Scenarios/scenario-errors-during-deploys.html">Errors During Every Deploy</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -213,7 +213,7 @@ SELECT level AS root_level FROM bt_metap('orders_customer_idx');
         <tr><td>Prefix (<code>LIKE 'ab%'</code>)</td><td>Yes</td><td>No</td></tr>
       </tbody>
     </table>
-    <p>Because a B+ tree is almost as fast for equality and can also do ranges and sorting, it is the default. Hash indexes are mostly used inside the database engine, for example in <strong>hash joins</strong> (a way to join two tables by building a temporary hash table) and in key-value stores like Redis.</p>
+    <p>Because a B+ tree is almost as fast for equality and can also do ranges and sorting, it is the default. Hash indexes are mostly used inside the database engine, for example in <strong>hash joins</strong> (a way to join two tables by building a temporary hash table) and in key-value stores like Redis. Nested loop, hash, and merge joins are walked through, with measured times, on the <a href="dbms-joins-execution.html">SQL Joins</a> page.</p>
     <p>Other index types you will meet: <strong>GIN</strong> (for searching inside arrays, JSON, and full text), <strong>GiST</strong> (for geometry and ranges), <strong>BRIN</strong> (tiny indexes for huge tables whose rows are naturally in order, such as logs by time), and <strong>vector indexes</strong> like HNSW for finding similar embeddings. See <a href="../../../AI Engineer/learn/Prompting-and-Retrieval/ai-engineering-vector-databases.html">Vector Databases</a> for that last one.</p>
   </section>
 
@@ -384,7 +384,7 @@ EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 4242;
         <tr><td>Index Only Scan</td><td>Answer from the index alone</td></tr>
         <tr><td>Bitmap Index Scan + Bitmap Heap Scan</td><td>Collect TIDs, then read heap pages in order</td></tr>
         <tr><td>Sort</td><td>Sort rows (watch for "external merge Disk", meaning it spilled to disk)</td></tr>
-        <tr><td>Nested Loop / Hash Join / Merge Join</td><td>Three ways to join two tables</td></tr>
+        <tr><td>Nested Loop / Hash Join / Merge Join</td><td>Three ways to join two tables (see <a href="dbms-joins-execution.html">SQL Joins</a>)</td></tr>
         <tr><td>Limit</td><td>Stop after N rows</td></tr>
       </tbody>
     </table>
@@ -503,8 +503,8 @@ FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 5;</code></pre>
   <!-- prev-next:start -->
   <nav class="prev-next" aria-label="Reading order">
     <a class="prev-next-prev" href="dbms-transactions-isolation-mvcc.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Transactions, Isolation Levels &amp; MVCC</span></a>
-    <a class="prev-next-next" href="dbms-replication-sharding-cap.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Replication, Sharding &amp; the CAP Theorem</span></a>
-    <p class="prev-next-step">Page 9 of 20 in the suggested reading order</p>
+    <a class="prev-next-next" href="dbms-joins-execution.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">SQL Joins &amp; How the Database Executes Them</span></a>
+    <p class="prev-next-step">Page 10 of 24 in the suggested reading order</p>
   </nav>
   <!-- prev-next:end -->
 

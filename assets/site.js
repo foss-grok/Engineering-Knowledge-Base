@@ -223,7 +223,8 @@
     btn.setAttribute('aria-label', 'Back to top of page');
     btn.hidden = true;
     btn.addEventListener('click', function () {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
     });
     document.body.appendChild(btn);
     var ticking = false;
@@ -337,5 +338,55 @@
     document.addEventListener('DOMContentLoaded', addSkipLink);
   } else {
     addSkipLink();
+  }
+})();
+
+// Learn pages: highlight the table-of-contents entry for the section that is
+// currently in view, and mark it with aria-current so screen readers hear it.
+(function () {
+  'use strict';
+
+  function initTocSpy() {
+    var toc = document.querySelector('.learn-page nav.article-toc');
+    if (!toc) return;
+    var links = Array.prototype.slice.call(toc.querySelectorAll('a[href^="#"]'));
+    var sections = [];
+    links.forEach(function (a) {
+      var id = a.getAttribute('href').slice(1);
+      var el = id ? document.getElementById(id) : null;
+      if (el) sections.push({ id: id, el: el, link: a });
+    });
+    if (!sections.length) return;
+
+    var currentId = null;
+    function setCurrent(id) {
+      if (id === currentId) return;
+      currentId = id;
+      sections.forEach(function (s) {
+        if (s.id === id) s.link.setAttribute('aria-current', 'true');
+        else s.link.removeAttribute('aria-current');
+      });
+    }
+
+    function update() {
+      var mark = 120;
+      var current = sections[0].id;
+      for (var i = 0; i < sections.length; i++) {
+        if (sections[i].el.getBoundingClientRect().top <= mark) {
+          current = sections[i].id;
+        }
+      }
+      setCurrent(current);
+    }
+
+    window.addEventListener('scroll', update, { passive: true });
+    window.addEventListener('resize', update);
+    update();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initTocSpy);
+  } else {
+    initTocSpy();
   }
 })();
