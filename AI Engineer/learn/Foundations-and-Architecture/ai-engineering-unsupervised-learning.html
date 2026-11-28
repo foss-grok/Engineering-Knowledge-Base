@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Unsupervised Learning: Clustering, PCA &amp; Anomaly Detection | AI Engineering</title>
+  <meta name="description" content="Learning from data with no labels, from zero with real runs: k-means worked by hand on six points, inertia, choosing k with the elbow and silhouette (k=4 scored 0.811), why k-means++ beats random starts (100/100 vs 58/100 good runs), why scaling matters (ARI -0.002 vs 1.0), DBSCAN for odd shapes, PCA worked by hand, PCA on handwritten digits (21 of 64 dimensions keep 90%), anomaly detection with Isolation Forest, clustering LLM embeddings, pitfalls, and practice problems.">
+  <link rel="stylesheet" href="../../../styles.css">
+  <script src="../../../assets/mathjax.js"></script>
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../ai-engineering.html">AI Engineering</a> &rsaquo; <a href="../ai-engineering-learn.html">Learn</a> &rsaquo; Unsupervised Learning</p>
+  </nav>
+  <h1>Unsupervised Learning: Clustering, PCA &amp; Anomaly Detection</h1>
+  <p>Most data in the real world has no labels. Nobody has marked which customers are "bargain hunters", which support tickets are about the same bug, or which server log line is the strange one. Unsupervised learning finds structure in data with no answers given. This page builds the three workhorse tools from zero: k-means clustering, PCA, and anomaly detection. It continues from <a href="ai-engineering-classical-ml.html">Classical ML from Zero</a> and <a href="ai-engineering-trees-ensembles.html">Trees &amp; Ensembles</a>, and every number comes from a run you can repeat (scikit-learn 1.9, NumPy 2.5).</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#idea">The Idea: Finding Shape With No Answers</a></li>
+    <li><a href="#words">The Words, in Plain English</a></li>
+    <li><a href="#kmeans">K-Means, Worked by Hand</a></li>
+    <li><a href="#choose-k">How Many Clusters? Elbow and Silhouette</a></li>
+    <li><a href="#init">Starting Points Matter: k-means++</a></li>
+    <li><a href="#scaling">Scale Your Features First</a></li>
+    <li><a href="#shapes">When K-Means Fails: DBSCAN</a></li>
+    <li><a href="#pca">PCA: Squeezing Many Columns Into Few</a></li>
+    <li><a href="#pca-hand">PCA, Worked by Hand</a></li>
+    <li><a href="#pca-digits">Real Run: PCA on Handwritten Digits</a></li>
+    <li><a href="#anomaly">Anomaly Detection</a></li>
+    <li><a href="#embeddings">Today's Big Use: Clustering Embeddings</a></li>
+    <li><a href="#code">The Full Recipe in Code</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems (with Solutions)</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="idea">
+    <h2>1. The Idea: Finding Shape With No Answers</h2>
+    <p>In <a href="ai-engineering-classical-ml.html">supervised learning</a>, every training row has an answer (a <strong>label</strong>): "this email is spam", "this house sold for 80 lakh". The model learns to predict the answer.</p>
+    <p>In <strong>unsupervised learning</strong>, there are no answers. You only have the rows. The goal is to find useful structure:</p>
+    <ul>
+      <li><strong>Clustering:</strong> which rows are alike? (Group customers by behavior. Group news articles by topic.)</li>
+      <li><strong>Dimensionality reduction:</strong> can we describe each row with fewer numbers and lose little? (Draw 64-column data on a 2D chart. Speed up later models.)</li>
+      <li><strong>Anomaly detection:</strong> which rows do not fit in? (Fraud. Broken sensors. Attacks.)</li>
+    </ul>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> Pour a bag of mixed buttons on a table. Nobody tells you the categories, but you can still sort them into piles by size and color (clustering), notice that size and weight tell you almost the same thing so you only need one of them (dimensionality reduction), and spot the one coin that got mixed in (anomaly detection).</p>
+    </div>
+    <p>The hard part: with no labels, there is no simple "accuracy" to check. You need other ways to judge the result, and in the end a human must decide if the groups make sense.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. The Words, in Plain English</h2>
+    <ul>
+      <li><strong>Feature.</strong> One column of input, like age or income.</li>
+      <li><strong>Point.</strong> One row, seen as a dot in space. Two features make a 2D point; 64 features make a 64D point.</li>
+      <li><strong>Distance.</strong> How far apart two points are. Usually straight-line (<strong>Euclidean</strong>) distance: for (1,1) and (4,5) it is \(\sqrt{3^2+4^2}=5\).</li>
+      <li><strong>Cluster.</strong> A group of points that are close to each other.</li>
+      <li><strong>Centroid.</strong> The center of a cluster: the average of its points, column by column.</li>
+      <li><strong>Inertia</strong> (or within-cluster sum of squares). For every point, take the squared distance to its own centroid, and add them all up. Smaller means tighter clusters.</li>
+      <li><strong>Variance.</strong> How spread out a column is: the average squared distance from its mean.</li>
+      <li><strong>Component</strong> (in PCA). A new axis, made by mixing the old columns, chosen to capture as much spread as possible.</li>
+      <li><strong>ARI</strong> (adjusted Rand index). A score for comparing a clustering with true labels when we happen to have them, used here only to check our work. 1.0 is a perfect match; about 0 is no better than random.</li>
+    </ul>
+  </section>
+
+  <section id="kmeans">
+    <h2>3. K-Means, Worked by Hand</h2>
+    <p>K-means splits the data into <strong>k</strong> clusters. You choose k. The algorithm is only four steps:</p>
+    <ol>
+      <li>Pick k starting centroids.</li>
+      <li><strong>Assign:</strong> put each point in the cluster of its nearest centroid.</li>
+      <li><strong>Update:</strong> move each centroid to the average of its points.</li>
+      <li>Repeat steps 2 and 3 until nothing changes.</li>
+    </ol>
+    <p>It is trying to make the inertia as small as possible:</p>
+    <p>\[ \text{inertia} = \sum_{i=1}^{n} \lVert x_i - \mu_{c(i)} \rVert^2 \]</p>
+    <p>where \(x_i\) is point i, \(c(i)\) is its cluster, and \(\mu_{c(i)}\) is that cluster's centroid.</p>
+
+    <h3>Six points, k = 2</h3>
+    <pre><code>y
+9 |                      F(8,9)
+8 |                      D(8,8)  E(9,8)
+  |
+2 |  C(1,2)
+1 |  A(1,1)  B(2,1)
+  +----------------------------------- x
+     1    2               8    9</code></pre>
+    <p>Any person sees two groups. To show that k-means can recover from a bad start, we start both centroids in the bottom-left corner: <strong>c1 = (1,1)</strong> and <strong>c2 = (2,1)</strong>.</p>
+    <p><strong>Round 1, assign.</strong> Squared distance to each centroid (we skip the square root; the nearest one is the same either way):</p>
+    <table>
+      <thead><tr><th>Point</th><th>to c1 (1,1)</th><th>to c2 (2,1)</th><th>Goes to</th></tr></thead>
+      <tbody>
+        <tr><td>A (1,1)</td><td>0</td><td>1</td><td>c1</td></tr>
+        <tr><td>B (2,1)</td><td>1</td><td>0</td><td>c2</td></tr>
+        <tr><td>C (1,2)</td><td>1</td><td>1 + 1 = 2</td><td>c1</td></tr>
+        <tr><td>D (8,8)</td><td>49 + 49 = 98</td><td>36 + 49 = 85</td><td>c2</td></tr>
+        <tr><td>E (9,8)</td><td>64 + 49 = 113</td><td>49 + 49 = 98</td><td>c2</td></tr>
+        <tr><td>F (8,9)</td><td>49 + 64 = 113</td><td>36 + 64 = 100</td><td>c2</td></tr>
+      </tbody>
+    </table>
+    <p>Inertia = 0 + 0 + 1 + 85 + 98 + 100 = <strong>284</strong>. Bad: B is grouped with the far corner.</p>
+    <p><strong>Round 1, update.</strong> c1 = average of A and C = ((1+1)/2, (1+2)/2) = <strong>(1, 1.5)</strong>. c2 = average of B, D, E, F = ((2+8+9+8)/4, (1+8+8+9)/4) = <strong>(6.75, 6.5)</strong>. The second centroid jumped most of the way to the top-right group.</p>
+    <p><strong>Round 2, assign.</strong> B is now 1.25 from c1 and about 52.8 from c2, so B moves to c1. D, E, F stay with c2. Inertia = <strong>20.69</strong>.</p>
+    <p><strong>Round 2, update.</strong> c1 = average of A, B, C = <strong>(1.33, 1.33)</strong>. c2 = average of D, E, F = <strong>(8.33, 8.33)</strong>.</p>
+    <p><strong>Round 3.</strong> Nobody changes cluster, so the centroids do not move. Done. Final inertia = <strong>2.67</strong>. Our code got exactly these numbers: 284, then 20.688, then 2.667, then "converged".</p>
+    <p>Each round can only lower the inertia or keep it the same: assigning to the nearest centroid cannot make a point's distance worse, and the average is the point that minimizes squared distance to a group. So k-means always stops. But it may stop at a <em>local</em> best, not the best possible split. Section 5 deals with that.</p>
+  </section>
+
+  <section id="choose-k">
+    <h2>4. How Many Clusters? Elbow and Silhouette</h2>
+    <p>K-means needs k up front. More clusters always lower inertia (with k = number of points, inertia is 0), so you cannot just pick the k with the lowest inertia. Two common checks:</p>
+    <ul>
+      <li><strong>Elbow:</strong> plot inertia against k. It drops fast while each new cluster splits a real group, then flattens. The bend (the "elbow") is a good k.</li>
+      <li><strong>Silhouette:</strong> for each point, let a = its average distance to points in its own cluster, and b = its average distance to points in the nearest <em>other</em> cluster. Its score is \(s = \frac{b - a}{\max(a, b)}\). Near 1: well inside its cluster. Near 0: on a border. Below 0: probably in the wrong cluster. Average over all points; higher is better.</li>
+    </ul>
+    <h3>Real run: 600 points from 4 blobs</h3>
+    <p>We made 600 points around 4 hidden centers (<code>make_blobs</code>, random_state=7) and ran k-means for k = 1 to 7:</p>
+    <table>
+      <thead><tr><th>k</th><th>Inertia</th><th>Silhouette</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>44,493</td><td>(needs 2+ clusters)</td></tr>
+        <tr><td>2</td><td>18,363</td><td>0.588</td></tr>
+        <tr><td>3</td><td>5,241</td><td>0.762</td></tr>
+        <tr><td><strong>4</strong></td><td><strong>1,127</strong></td><td><strong>0.811</strong></td></tr>
+        <tr><td>5</td><td>1,020</td><td>0.680</td></tr>
+        <tr><td>6</td><td>921</td><td>0.577</td></tr>
+        <tr><td>7</td><td>814</td><td>0.446</td></tr>
+      </tbody>
+    </table>
+    <pre><code>inertia
+44k |*
+    |
+18k |   *
+    |
+ 5k |      *
+ 1k |         *----*----*----*      &lt;- elbow at k = 4, then nearly flat
+    +---------------------------- k
+     1   2    3    4    5    6    7</code></pre>
+    <p>Both checks agree: from 3 to 4 clusters, inertia falls by almost 80% (5,241 to 1,127). From 4 to 5 it falls by only 9%. Silhouette peaks at k = 4. That matches the 4 hidden centers.</p>
+    <p>Real data is rarely this clean. Often the elbow is soft and silhouette prefers a small k. Then let the use decide: a marketing team may only be able to act on 5 segments, whatever the math says.</p>
+  </section>
+
+  <section id="init">
+    <h2>5. Starting Points Matter: k-means++</h2>
+    <p>If two starting centroids land in the same real group, k-means may split that group in two and merge two others, then get stuck. The fix used everywhere today is <strong>k-means++</strong>: pick the first centroid at random from the data, then pick each next one with a chance that grows with its squared distance from the centroids chosen so far. Far-away points are likely picks, so the starts spread out.</p>
+    <p>We ran k-means on the same 600 points with k = 4, one start each, 100 different random seeds:</p>
+    <table>
+      <thead><tr><th>Start method</th><th>Runs within 1% of the best inertia (1,127)</th><th>Worst inertia</th></tr></thead>
+      <tbody>
+        <tr><td>Random points</td><td>58 / 100</td><td>14,161</td></tr>
+        <tr><td>k-means++</td><td><strong>100 / 100</strong></td><td>1,127</td></tr>
+      </tbody>
+    </table>
+    <p>With random starts, 42 runs out of 100 got stuck in a worse answer, the worst one 12 times worse. scikit-learn uses k-means++ by default and also runs several starts (<code>n_init</code>) and keeps the best. Keep both on.</p>
+  </section>
+
+  <section id="scaling">
+    <h2>6. Scale Your Features First</h2>
+    <p>K-means uses distance, and distance is ruled by the column with the biggest numbers. We made 400 people: half aged about 25, half aged about 55. Income is random noise around 60,000 (spread 15,000) and has nothing to do with the groups.</p>
+    <pre><code>person   age   income       distance between two people is about
+  1       24   71,200       sqrt( (age diff)^2 + (income diff)^2 )
+  2       57   58,900       sqrt( 33^2 + 12,300^2 )  =  about 12,300
+                            the age difference barely counts</code></pre>
+    <table>
+      <thead><tr><th>Input to k-means (k = 2)</th><th>ARI against the true age groups</th></tr></thead>
+      <tbody>
+        <tr><td>Raw age and income</td><td><strong>-0.002</strong> (no better than random)</td></tr>
+        <tr><td>Both standardized (mean 0, spread 1)</td><td><strong>1.000</strong> (perfect)</td></tr>
+      </tbody>
+    </table>
+    <p>Without scaling, k-means split people by meaningless income noise. After <code>StandardScaler</code> (subtract each column's mean, divide by its standard deviation), age could finally count, and the split was perfect. Always scale before k-means, PCA, or anything that uses distance. (Tree models do not need it; see <a href="ai-engineering-classical-ml.html#scaling">feature scaling</a>.)</p>
+  </section>
+
+  <section id="shapes">
+    <h2>7. When K-Means Fails: DBSCAN</h2>
+    <p>K-means assumes clusters are round blobs of similar size, because each point simply joins its nearest center. Data shaped like two interlocking crescent moons breaks it:</p>
+    <pre><code>   . . . .                      k-means draws a straight border
+ .         .                    through the middle, cutting
+.     A     .     . . . .       each moon in half
+             .  .         .
+              ..     B     .
+                 . . . .</code></pre>
+    <p><strong>DBSCAN</strong> (density-based clustering) works differently. It says: a point is in a dense area if at least <code>min_samples</code> points lie within distance <code>eps</code> of it. Dense points that are close chain together into one cluster, whatever its shape. Points in no dense area are labeled <strong>noise</strong> (cluster -1). You do not choose k; DBSCAN finds it.</p>
+    <table>
+      <thead><tr><th>400 points in two moons</th><th>ARI</th><th>Clusters found</th></tr></thead>
+      <tbody>
+        <tr><td>k-means, k = 2</td><td>0.274</td><td>2 (wrong split)</td></tr>
+        <tr><td>DBSCAN, eps = 0.2, min_samples = 5</td><td><strong>1.000</strong></td><td>2, with 0 noise points</td></tr>
+      </tbody>
+    </table>
+    <p>The cost: you must pick <code>eps</code>, and one <code>eps</code> fails when clusters have very different densities. HDBSCAN (in scikit-learn as <code>HDBSCAN</code>) tries many densities at once and is often the better default for messy real data.</p>
+  </section>
+
+  <section id="pca">
+    <h2>8. PCA: Squeezing Many Columns Into Few</h2>
+    <p>Many data sets have far more columns than they need. A tiny 8&times;8 picture of a digit has 64 pixel columns, but neighboring pixels move together. Height in cm and height in inches are the same information twice.</p>
+    <p><strong>PCA</strong> (principal component analysis) finds new axes that follow the data's spread:</p>
+    <ul>
+      <li>The <strong>first component</strong> (PC1) is the direction in which the points are most spread out.</li>
+      <li>The <strong>second</strong> (PC2) is the most spread-out direction at a right angle to PC1. And so on.</li>
+      <li>Keep only the first few components and throw away the rest. You lose the directions with little spread, which are often just noise.</li>
+    </ul>
+    <pre><code>  y                                     the cloud is long and thin
+  |              . .  .                 PC1 runs along its length
+  |          . .  . .     PC1 ---&gt;      PC2 runs across it
+  |      . .  . .                       keeping only PC1 turns each
+  |   . .  .                            2D point into one number, and
+  |  .  .        PC2 (short)            loses only the small sideways
+  +-------------------------- x         wiggle</code></pre>
+    <p>Each component comes with an <strong>explained variance ratio</strong>: the share of the total spread it captures. If the first 2 components explain 95%, a 2D chart shows almost everything.</p>
+  </section>
+
+  <section id="pca-hand">
+    <h2>9. PCA, Worked by Hand</h2>
+    <p>Five points: (2,1), (3,4), (4,3), (5,6), (6,5).</p>
+    <p><strong>Step 1: center.</strong> The mean is (4, 3.8). Subtract it: (-2,-2.8), (-1,0.2), (0,-0.8), (1,2.2), (2,1.2).</p>
+    <p><strong>Step 2: covariance matrix.</strong> Variance of x = (4+1+0+1+4)/4 = 2.5. Variance of y = (7.84+0.04+0.64+4.84+1.44)/4 = 3.7. Covariance (how x and y move together) = ((-2)(-2.8) + (-1)(0.2) + 0 + (1)(2.2) + (2)(1.2))/4 = (5.6 - 0.2 + 2.2 + 2.4)/4 = 2.5. (We divide by n - 1 = 4, the usual sample formula.)</p>
+    <p>\[ C = \begin{pmatrix} 2.5 &amp; 2.5 \\ 2.5 &amp; 3.7 \end{pmatrix} \]</p>
+    <p><strong>Step 3: eigenvalues.</strong> The components are the <strong>eigenvectors</strong> of C: directions that C only stretches, never turns. The stretch amounts (<strong>eigenvalues</strong>) are the variance along each direction. For a 2&times;2 matrix, solve \(\lambda^2 - (\text{trace})\lambda + \det = 0\). Trace = 2.5 + 3.7 = 6.2. Determinant = 2.5 &times; 3.7 - 2.5 &times; 2.5 = 3.0.</p>
+    <p>\[ \lambda = \frac{6.2 \pm \sqrt{6.2^2 - 4 \times 3.0}}{2} = \frac{6.2 \pm 5.142}{2} \;\Rightarrow\; \lambda_1 = 5.671,\; \lambda_2 = 0.529 \]</p>
+    <p><strong>Step 4: explained variance.</strong> PC1 explains 5.671 / (5.671 + 0.529) = <strong>91.5%</strong>. PC2 explains 8.5%.</p>
+    <p><strong>Step 5: direction of PC1.</strong> Solve \((C - 5.671 I)v = 0\): the first row gives \(-3.171 v_x + 2.5 v_y = 0\), so \(v_y = 1.268 v_x\). Scale to length 1: <strong>v = (0.619, 0.785)</strong>. It points up and to the right, along the cloud.</p>
+    <p><strong>Step 6: project.</strong> Each point's new single number is its dot product with v. For (-2, -2.8): 0.619 &times; (-2) + 0.785 &times; (-2.8) = <strong>-3.437</strong>. All five: -3.437, -0.462, -0.628, 2.347, 2.181. We went from 2 numbers per point to 1 and kept 91.5% of the spread. NumPy's <code>eigh</code> gave exactly these values.</p>
+  </section>
+
+  <section id="pca-digits">
+    <h2>10. Real Run: PCA on Handwritten Digits</h2>
+    <p>scikit-learn's <code>load_digits</code> has 1,797 images of digits 0 to 9, each 8&times;8 = 64 pixel columns. How many components do we need?</p>
+    <table>
+      <thead><tr><th>Components kept</th><th>Share of variance kept</th></tr></thead>
+      <tbody>
+        <tr><td>2</td><td>28.5%</td></tr>
+        <tr><td>10</td><td>73.8%</td></tr>
+        <tr><td>20</td><td>89.4%</td></tr>
+        <tr><td><strong>21</strong></td><td><strong>90% reached</strong></td></tr>
+        <tr><td><strong>29</strong></td><td><strong>95% reached</strong></td></tr>
+        <tr><td>40</td><td>98.8%</td></tr>
+      </tbody>
+    </table>
+    <p>Less than a third of the columns keep 90% of the information. Now cluster the digits with k-means (k = 10) and compare to the true digit labels:</p>
+    <table>
+      <thead><tr><th>Input to k-means</th><th>ARI</th></tr></thead>
+      <tbody>
+        <tr><td>All 64 pixels</td><td>0.666</td></tr>
+        <tr><td>First 20 components</td><td><strong>0.668</strong></td></tr>
+        <tr><td>First 2 components</td><td>0.393</td></tr>
+      </tbody>
+    </table>
+    <p>With 20 components, clustering is just as good as with 64, on less than a third of the data, so it runs faster. With only 2 components (28.5% of the variance), too much was thrown away and the score fell to 0.393. A 2D picture is great for <em>looking</em>; it is often too lossy for <em>modeling</em>.</p>
+    <p>For pictures of high-dimensional data, <strong>t-SNE</strong> and <strong>UMAP</strong> usually show clusters more clearly than PCA, because they keep near neighbors near. But distances between far-apart clusters in those pictures mean little, and cluster sizes can be misleading. Use them to look, not to measure.</p>
+  </section>
+
+  <section id="anomaly">
+    <h2>11. Anomaly Detection</h2>
+    <p>An <strong>anomaly</strong> (or outlier) is a point that does not look like the rest. Three ways to find them, from simplest to strongest:</p>
+    <ul>
+      <li><strong>Z-score per column.</strong> How many standard deviations from the mean? A request that took 9 seconds when the mean is 0.2 s and the standard deviation is 0.1 s has z = (9 - 0.2) / 0.1 = 88. Flag anything above, say, 4. Simple, but it looks at one column at a time and is fooled by data that is not bell-shaped.</li>
+      <li><strong>Distance to the nearest cluster.</strong> Run k-means; points far from every centroid are odd.</li>
+      <li><strong>Isolation Forest.</strong> Build many random trees that split the data at random places. A normal point sits in a crowd and needs many splits to be cut off alone. An odd point is cut off in just a few splits. A short average path means "anomaly". It works on many columns at once and scales well.</li>
+    </ul>
+    <h3>Real run</h3>
+    <p>500 normal points in 3 blobs, plus 10 random points spread over a wide square. Isolation Forest with <code>contamination=0.02</code> (we expect about 2% anomalies):</p>
+    <table>
+      <thead><tr><th>Flagged</th><th>True anomalies among them</th><th>Missed</th></tr></thead>
+      <tbody>
+        <tr><td>11</td><td>9 of 10</td><td>1</td></tr>
+      </tbody>
+    </table>
+    <p>It caught 9 of the 10 planted points and wrongly flagged 2 normal ones on the edges of blobs. The missed point was random; one that happens to land near a blob looks normal to any method. In real systems, anomaly scores are a <em>ranking</em> for a human to review, not a final verdict. <code>contamination</code> just sets where the cut-off goes.</p>
+  </section>
+
+  <section id="embeddings">
+    <h2>12. Today's Big Use: Clustering Embeddings</h2>
+    <p>An <a href="../Prompting-and-Retrieval/ai-engineering-embeddings.html">embedding</a> turns text (or an image) into a list of numbers, often 384 to 3,072 of them, so that similar meanings get nearby vectors. Put that together with this page and you get some of the most common jobs in AI teams today:</p>
+    <ul>
+      <li><strong>Topic discovery.</strong> Embed 50,000 support tickets, cluster them, and read 10 examples from each cluster. You find "password reset loop" and "invoice in wrong currency" without anyone labeling anything. Tools like BERTopic do exactly this: embeddings, then UMAP to shrink the dimensions, then HDBSCAN to cluster.</li>
+      <li><strong>Cleaning training data.</strong> Near-duplicate prompts in an LLM fine-tuning set make the model memorize. Cluster the embeddings and keep a few examples per tight cluster.</li>
+      <li><strong>Choosing evaluation cases.</strong> Cluster real user questions and sample from every cluster, so your eval set covers rare kinds of questions too (see <a href="../Inference-Deployment-Operations/ai-engineering-evaluation.html">Evaluation</a>).</li>
+      <li><strong>Spotting drift.</strong> If many new queries fall far from every existing cluster, users are asking about something new, and your RAG index or prompts may not cover it.</li>
+    </ul>
+    <p>Two practical rules for embeddings. First, most embedding models are meant to be compared with <strong>cosine similarity</strong> (the angle between vectors). If you scale every vector to length 1 first, plain Euclidean k-means gives the same grouping as clustering by cosine. Second, with hundreds of dimensions, it often helps to reduce with PCA or UMAP before clustering.</p>
+  </section>
+
+  <section id="code">
+    <h2>13. The Full Recipe in Code</h2>
+    <pre><code class="language-python">import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+X = load_my_table()                       # rows x numeric columns, no labels
+
+# 1. scale (distance-based methods need it)
+Xs = StandardScaler().fit_transform(X)
+
+# 2. reduce: keep enough components for 90% of the variance
+pca = PCA(n_components=0.90, random_state=0).fit(Xs)
+Z = pca.transform(Xs)
+print("components kept:", pca.n_components_)
+
+# 3. try several k, look at silhouette (and at the elbow of inertia)
+for k in range(2, 11):
+    km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(Z)
+    print(k, round(km.inertia_), round(silhouette_score(Z, km.labels_), 3))
+
+# 4. fit the chosen k, then LOOK at examples from each cluster
+km = KMeans(n_clusters=5, n_init=10, random_state=0).fit(Z)
+for c in range(5):
+    print(c, np.sum(km.labels_ == c), "rows")
+    # print a few raw rows from cluster c and name the cluster yourself</code></pre>
+    <p>Step 4 is not optional. The algorithm gives numbered groups; only a person looking at examples can say "cluster 3 is weekend shoppers who only buy on discount".</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Not scaling.</strong> The biggest-number column decides everything (ARI -0.002 in our run).</li>
+      <li><strong>Choosing k by lowest inertia.</strong> Inertia always falls as k grows. Use the elbow, silhouette, and what the business can act on.</li>
+      <li><strong>One random start.</strong> 42 of 100 random starts got stuck. Use k-means++ and several starts.</li>
+      <li><strong>Using k-means on odd shapes.</strong> It only finds round-ish blobs. Try DBSCAN or HDBSCAN.</li>
+      <li><strong>Feeding categories as numbers.</strong> City codes 1, 2, 3 are not "distances". One-hot encode them, or use a method built for categories.</li>
+      <li><strong>Reading too much into a 2D picture.</strong> 2 PCA components kept only 28.5% of the digits' variance. t-SNE and UMAP distort distances.</li>
+      <li><strong>Fitting the scaler or PCA on all data, then evaluating a model on part of it.</strong> When unsupervised steps feed a supervised model, fit them on the training split only, or you leak test data (see <a href="ai-engineering-classical-ml.html#leakage">data leakage</a>).</li>
+      <li><strong>Trusting clusters without looking.</strong> A clean silhouette can still mean "split by country", which you already knew.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>15. Practice Problems (with Solutions)</h2>
+    <h3>Problem 1: one k-means round</h3>
+    <p>Points on a line: 1, 2, 3, 10, 11, 20. k = 2, starting centroids 1 and 20. Do one assign and one update. Then finish.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Assign: 1, 2, 3, 10 are closer to 1 (10 is 9 from 1 and 10 from 20). 11 and 20 go to 20 (11 is 10 from 1, 9 from 20). Update: c1 = (1+2+3+10)/4 = 4, c2 = (11+20)/2 = 15.5. Assign again: 10 is 6 from 4 and 5.5 from 15.5, so it moves to c2. Now c1 = 2, c2 = (10+11+20)/3 = 13.67. Assign again: 1, 2, 3 stay with 2; 10, 11, 20 stay with 13.67. Done: {1, 2, 3} and {10, 11, 20}.</p>
+    </details>
+    <h3>Problem 2: inertia</h3>
+    <p>Compute the final inertia from Problem 1.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Cluster 1 (centroid 2): 1 + 0 + 1 = 2. Cluster 2 (centroid 13.67): 3.67^2 + 2.67^2 + 6.33^2 = 13.44 + 7.11 + 40.11 = 60.67. Total about <strong>62.7</strong>.</p>
+    </details>
+    <h3>Problem 3: silhouette for one point</h3>
+    <p>A point's average distance to its own cluster is 2. Its average distance to the nearest other cluster is 8. What is its silhouette? What if the numbers were swapped?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>s = (8 - 2) / 8 = <strong>0.75</strong>: well placed. Swapped: s = (2 - 8) / 8 = <strong>-0.75</strong>: it is much closer to another cluster and is probably in the wrong one.</p>
+    </details>
+    <h3>Problem 4: PCA eigenvalues</h3>
+    <p>A centered data set has covariance matrix [[4, 0], [0, 1]]. What are the components and how much variance does PC1 explain?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The matrix is already diagonal: x and y do not move together. The components are just the x axis (variance 4) and the y axis (variance 1). PC1 = x axis, explaining 4 / (4 + 1) = <strong>80%</strong>.</p>
+    </details>
+    <h3>Problem 5: how many components</h3>
+    <p>The explained variance ratios of a PCA are 0.50, 0.20, 0.12, 0.08, 0.05, 0.03, 0.02. How many components do you need for 90%? For 95%?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Running totals: 0.50, 0.70, 0.82, 0.90, 0.95, 0.98, 1.00. <strong>4</strong> components for 90%, <strong>5</strong> for 95%.</p>
+    </details>
+    <h3>Problem 6: choose a method</h3>
+    <p>For each, pick k-means, DBSCAN/HDBSCAN, PCA, or Isolation Forest: (a) find unusual logins among millions of rows with 12 numeric features; (b) a delivery company wants exactly 8 service zones from customer coordinates; (c) GPS points of taxi pickups that form long, curvy clusters along roads plus lots of scattered noise; (d) a model is slow because it has 900 strongly related sensor columns.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>(a) <strong>Isolation Forest</strong>: anomaly ranking over many features. (b) <strong>k-means</strong> with k = 8: you need a fixed number of compact zones, and each centroid is a natural depot spot. (c) <strong>DBSCAN or HDBSCAN</strong>: odd shapes and noise. (d) <strong>PCA</strong>: replace 900 related columns with the few components that keep most of the variance.</p>
+    </details>
+    <p class="refer-link"><small>Refer: <a href="https://scikit-learn.org/stable/modules/clustering.html" rel="noopener noreferrer">scikit-learn: Clustering</a> &middot; <a href="https://scikit-learn.org/stable/modules/decomposition.html#pca" rel="noopener noreferrer">scikit-learn: PCA</a> &middot; <a href="https://scikit-learn.org/stable/modules/outlier_detection.html" rel="noopener noreferrer">scikit-learn: Outlier detection</a> &middot; <a href="https://theory.stanford.edu/~sergei/papers/kMeansPP-soda.pdf" rel="noopener noreferrer">Arthur &amp; Vassilvitskii (2007): k-means++</a> &middot; <a href="https://cdn.aaai.org/KDD/1996/KDD96-037.pdf" rel="noopener noreferrer">Ester et al. (1996): DBSCAN</a> &middot; <a href="https://doi.org/10.1109/ICDM.2008.17" rel="noopener noreferrer">Liu, Ting &amp; Zhou (2008): Isolation Forest</a> &middot; <a href="https://maartengr.github.io/BERTopic/" rel="noopener noreferrer">BERTopic documentation</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="ai-engineering-trees-ensembles.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Decision Trees, Random Forests &amp; Gradient Boosting</span></a>
+    <a class="prev-next-next" href="ai-engineering-foundations.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Neural Network and Deep Learning Foundations</span></a>
+    <p class="prev-next-step">Page 3 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Next: <a href="ai-engineering-foundations.html">Foundations (neural networks)</a> &middot; Related: <a href="ai-engineering-classical-ml.html">Classical ML from Zero</a> &middot; <a href="ai-engineering-trees-ensembles.html">Trees &amp; Ensembles</a> &middot; <a href="../Prompting-and-Retrieval/ai-engineering-embeddings.html">Embeddings</a> &middot; <a href="../Prompting-and-Retrieval/ai-engineering-vector-databases.html">Vector Databases</a></p>
+    <p><a href="../ai-engineering-learn.html">Back to AI Engineering Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../ai-engineering.html">Back to AI Engineering</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

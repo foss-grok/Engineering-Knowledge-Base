@@ -27,6 +27,7 @@
       <li><a href="Operating-Systems/os-processes-threads-scheduling.html">Processes, Threads &amp; CPU Scheduling</a>: what a running program is</li>
       <li><a href="Operating-Systems/os-system-calls.html">System Calls &amp; the Kernel Boundary</a>: how a program asks the operating system for help</li>
       <li><a href="Operating-Systems/os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a>: how programs see memory</li>
+      <li><a href="Operating-Systems/os-memory-allocation-gc.html">Memory Allocation &amp; Garbage Collection</a>: who hands out memory, and who gives it back</li>
       <li><a href="Operating-Systems/os-cpu-caches-memory-hierarchy.html">CPU Caches &amp; the Memory Hierarchy</a>: why some memory is fast and some is slow</li>
       <li><a href="Operating-Systems/os-file-systems-io.html">File Systems &amp; Disk I/O</a>: how data is saved, and when it is really safe</li>
       <li><a href="Operating-Systems/os-io-models-event-loops.html">I/O Models &amp; Event Loops</a>: why one slow read can stall many clients</li>
@@ -35,6 +36,7 @@
       <li><a href="Databases/dbms-transactions-isolation-mvcc.html">Transactions, Isolation Levels &amp; MVCC</a>: the same problems inside a database</li>
       <li><a href="Databases/dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a>: how databases find data fast</li>
       <li><a href="Databases/dbms-joins-execution.html">SQL Joins &amp; How the Database Executes Them</a>: how tables are stitched back together, and how the engine does it</li>
+      <li><a href="Databases/dbms-sql-aggregation-window-functions.html">SQL Aggregation, GROUP BY &amp; Window Functions</a>: turning many rows into answers</li>
       <li><a href="Databases/dbms-replication-sharding-cap.html">Replication, Sharding &amp; the CAP Theorem</a>: when one database server is not enough</li>
       <li><a href="Computer-Networks/cn-ip-addressing-subnetting-routing.html">IP Addressing, Subnetting &amp; Routing</a>: how packets find their way</li>
       <li><a href="Computer-Networks/cn-tcp-deep-dive.html">TCP Deep Dive</a>: how bytes cross the network reliably</li>
@@ -48,6 +50,7 @@
       <li><a href="Scenarios/scenario-errors-during-deploys.html">Scenario: Errors During Every Deploy</a>: why releases cause 502s, measured and fixed</li>
       <li><a href="Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a>: a memory leak found and fixed, from the kill to the cause</li>
       <li><a href="Scenarios/scenario-retry-storm.html">Scenario: A Retry Storm Takes the Service Down</a>: a dependency slows, clients retry, and load shedding is the fix</li>
+      <li><a href="Scenarios/scenario-disk-full.html">Scenario: The Disk Is Full</a>: deleted files that still use space, inodes, logs, and WAL</li>
     </ol>
   </section>
 
@@ -58,6 +61,7 @@
       <li><a href="Operating-Systems/os-system-calls.html"><strong>System Calls &amp; the Kernel Boundary</strong></a>  -  user space vs kernel space, the trap, syscall families, a lab (getpid at 66 ns vs a 0.28 ns add; writing 1 MB one byte at a time took 260 ms, one write took 0.44 ms), the vDSO, strace, N+1 I/O, seccomp</li>
       <li><a href="Operating-Systems/os-io-models-event-loops.html"><strong>I/O Models &amp; Event Loops</strong></a>  -  blocking vs non-blocking, thread per client vs event loop, select, poll and epoll, level vs edge triggering, an event loop by hand, async/await, a lab with 200 clients (20 s vs 0.16 s), blocking the loop by mistake, backpressure</li>
       <li><a href="Operating-Systems/os-virtual-memory-paging.html"><strong>Virtual Memory &amp; Paging</strong></a>  -  address translation in hex, multi-level page tables, TLBs, page faults, FIFO/LRU/OPT traced step by step, thrashing, huge pages, OOM kills</li>
+      <li><a href="Operating-Systems/os-memory-allocation-gc.html"><strong>Memory Allocation &amp; Garbage Collection</strong></a>  -  stack frames traced by hand, malloc chunks and free lists, fragmentation (freeing half the data gave back 0 KB), memory bugs, reference counting, mark and sweep by hand, generational GC, a GC pause lab, heap settings for containers</li>
       <li><a href="Operating-Systems/os-cpu-caches-memory-hierarchy.html"><strong>CPU Caches &amp; the Memory Hierarchy</strong></a>  -  latency numbers measured by pointer chasing, 64-byte cache lines, tag, set and offset by hand, set-associative caches, the three kinds of misses, AMAT, write-back, a 10x loop-order speedup, MESI coherence, a 5x false-sharing slowdown and its fix, NUMA</li>
       <li><a href="Operating-Systems/os-file-systems-io.html"><strong>File Systems &amp; Disk I/O</strong></a>  -  file descriptors, inodes and links, block pointer math, extents, the page cache, write vs fsync and the safe-save pattern, journaling, epoll and io_uring, container overlay layers, debugging full and slow disks</li>
       <li><a href="Operating-Systems/os-concurrency-synchronization-deadlocks.html"><strong>Concurrency, Synchronization &amp; Deadlocks</strong></a>  -  race conditions, mutexes, semaphores, condition variables, producer-consumer, deadlock conditions, Banker's algorithm, priority inversion</li>
@@ -71,6 +75,7 @@
       <li><a href="Databases/dbms-transactions-isolation-mvcc.html"><strong>Transactions, Isolation Levels &amp; MVCC</strong></a>  -  ACID, write-ahead logging, anomalies as timelines, PostgreSQL vs MySQL isolation, MVCC internals, locking and deadlocks, a hands-on lab</li>
       <li><a href="Databases/dbms-indexing-btrees-query-plans.html"><strong>Indexing, B+ Trees &amp; Query Plans</strong></a>  -  pages and full scans, B+ trees built by hand with splits, tree height math, hash, clustered and covering indexes, the leftmost-prefix rule, reading real PostgreSQL EXPLAIN output, write cost, LSM trees</li>
       <li><a href="Databases/dbms-joins-execution.html"><strong>SQL Joins &amp; How the Database Executes Them</strong></a>  -  inner, left, right and full joins by hand, cross-join blow-ups, nested loop, hash and merge joins, a lab (301 ms vs 0.79 ms for the same 2,000 by 10,000 join; an index made one-customer lookups 380 times faster), reading EXPLAIN, NULL keys, anti-joins</li>
+      <li><a href="Databases/dbms-sql-aggregation-window-functions.html"><strong>SQL Aggregation, GROUP BY &amp; Window Functions</strong></a>  -  NULL rules for COUNT, SUM and AVG, GROUP BY as buckets, WHERE vs HAVING and query order, ROW_NUMBER vs RANK vs DENSE_RANK, running totals, LAG, the ROWS vs RANGE trap, top-N per group, hash vs sort aggregation, a lab (77 s correlated subquery vs 34 ms window function)</li>
       <li><a href="Databases/dbms-replication-sharding-cap.html"><strong>Replication, Sharding &amp; the CAP Theorem</strong></a>  -  leaders and followers, sync vs async commits, replication lag and stale reads, failover and split brain, quorums (W + R &gt; N), range and hash sharding, a consistent hashing experiment, hot keys, CAP and PACELC</li>
     </ul>
   </section>
@@ -96,6 +101,7 @@
       <li><a href="Scenarios/scenario-errors-during-deploys.html"><strong>Errors During Every Deploy</strong></a>  -  502 vs 503 vs 504, the race between SIGTERM and load balancer updates, a runnable lab measuring four fixes, graceful shutdown, keep-alive timeout races, safe retries and idempotency keys, a deploy check for CI</li>
       <li><a href="Scenarios/scenario-pod-oomkilled-memory-leak.html"><strong>A Pod Keeps Getting OOMKilled</strong></a>  -  OOMKilled vs evicted vs grace-period kills, RSS, working set, anon and page cache, requests, limits and oom_score_adj, leak-rate math, a real OOM kill under a cgroup limit, tracemalloc, JVM, Go and Node heap settings, right-sizing, alerts</li>
       <li><a href="Scenarios/scenario-retry-storm.html"><strong>A Retry Storm Takes the Service Down</strong></a>  -  retry amplification math, abandoned work, a lab where a tight queue cap lifted success from 24.5% to 87.8%, 8,805 immediate retries that did not help, a sloppy cap plus retries that dropped success from 55.5% to 35.6%, jitter vs a thundering herd, retry budgets and idempotency</li>
+      <li><a href="Scenarios/scenario-disk-full.html"><strong>The Disk Is Full</strong></a>  -  the first five minutes, a lab where deleting a 64 MB log freed nothing until the process let go, inode exhaustion with 57 MB free, reserved blocks and hidden mounts, log rotation, journald, Docker and Kubernetes disk eviction, a PostgreSQL slot holding WAL, time-to-full alerts</li>
     </ul>
   </section>
 

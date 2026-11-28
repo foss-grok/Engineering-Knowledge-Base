@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Operators &amp; Custom Resources | Docker &amp; Kubernetes</title>
+  <meta name="description" content="Kubernetes operators from zero: what a controller is, the reconcile loop, watches, informers and work queues, level vs edge triggering, writing a CustomResourceDefinition with a schema, status and printer columns, a toy operator lab that heals drift, survives missed events and runs a finalizer, owner references and cascading delete, finalizers stuck in Terminating, status conditions and observedGeneration, a real operator in Python with kopf, RBAC, real operators like cert-manager, CloudNativePG and KubeRay, and when not to write one.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../docker-kubernetes.html">Docker &amp; Kubernetes</a> &rsaquo; <a href="../docker-kubernetes-learn.html">Learn</a> &rsaquo; Operators &amp; Custom Resources</p>
+  </nav>
+  <h1>Operators &amp; Custom Resources</h1>
+  <p>Kubernetes knows how to run a Deployment. It does not know how to run a PostgreSQL cluster with backups and failover, or a Ray cluster for training a model. An <strong>operator</strong> teaches it. You add a new kind of object (a <strong>custom resource</strong>), and a program (a <strong>controller</strong>) that keeps the real world matching it. This page builds that idea from zero, runs a toy operator you can read in one sitting, and then shows the real tools. It builds on <a href="kubernetes-architecture.html#reconciliation">the reconciliation loop</a> and <a href="kubernetes-workloads.html">Workloads</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#idea">The Idea: a Robot That Keeps Things True</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#controllers">How Built-In Controllers Work</a></li>
+    <li><a href="#level">Level-Triggered, Not Edge-Triggered</a></li>
+    <li><a href="#crd">Adding a New Kind: the CRD</a></li>
+    <li><a href="#lab">Lab: A Toy Operator</a></li>
+    <li><a href="#owners">Owner References and Cascading Delete</a></li>
+    <li><a href="#finalizers">Finalizers, and Objects Stuck in Terminating</a></li>
+    <li><a href="#status">Status, Conditions and observedGeneration</a></li>
+    <li><a href="#real">A Real Operator in Python (kopf)</a></li>
+    <li><a href="#production">Running an Operator Safely</a></li>
+    <li><a href="#examples">Operators You Will Meet</a></li>
+    <li><a href="#when-not">When Not to Write One</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="idea">
+    <h2>1. The Idea: a Robot That Keeps Things True</h2>
+    <p>Think of a thermostat. You set the <em>desired</em> temperature: 22&deg;C. The thermostat keeps reading the <em>actual</em> temperature. If it is too cold, it turns on the heater. If it is too warm, it turns it off. It never stops checking. You never tell it "heat for 10 minutes"; you only say what you want.</p>
+    <p>Kubernetes is built from many small thermostats called <strong>controllers</strong>. You write "I want 3 copies of this pod" in YAML. The ReplicaSet controller keeps counting pods and creating or deleting them until there are 3.</p>
+    <p>An <strong>operator</strong> is the same idea for something Kubernetes does not know about. You write:</p>
+    <pre><code class="language-yaml">apiVersion: db.example.com/v1
+kind: Database
+metadata:
+  name: orders-db
+spec:
+  replicas: 3
+  version: "17"
+  backupSchedule: "0 2 * * *"</code></pre>
+    <p>and a program you install in the cluster turns that into pods, services, volumes, a backup CronJob, and a failover plan, and keeps them right forever. It encodes what a human database admin would do, which is where the name comes from: it replaces a human <em>operator</em>.</p>
+    <pre><code>  you write:                     the operator does, again and again:
+  +-----------------+            +-----------------------------------+
+  | kind: Database  |  watch     | read desired state (spec)         |
+  | replicas: 3     | ---------&gt; | read actual state (pods, PVCs...) |
+  +-----------------+            | make one step toward desired      |
+          ^                      | write what it saw into status     |
+          |   status: ready 3/3  +-----------------------------------+
+          +-------------------------------------|</code></pre>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>Resource.</strong> A kind of object the API server stores, like Pod or Service. Each object has <code>spec</code> (what you want) and usually <code>status</code> (what is true now).</li>
+      <li><strong>Controller.</strong> A program that watches some resources and acts to make actual state match desired state.</li>
+      <li><strong>Reconcile.</strong> One pass of "compare desired with actual, then fix the difference". The function that does it is the <strong>reconciler</strong>.</li>
+      <li><strong>CRD</strong> (CustomResourceDefinition). An object that tells the API server about a brand new resource kind, like <code>Database</code>. After it is created, you can <code>kubectl get databases</code>.</li>
+      <li><strong>Custom resource</strong> (CR). One object of that new kind, like <code>orders-db</code>.</li>
+      <li><strong>Operator.</strong> CRDs plus a controller that manages them. Usually it carries expert knowledge about one piece of software.</li>
+      <li><strong>Watch.</strong> A long-lived request to the API server that streams every change to a set of objects.</li>
+      <li><strong>Idempotent.</strong> Doing it twice has the same effect as doing it once. A reconciler must be idempotent.</li>
+      <li><strong>Owner reference.</strong> A note on an object that says "I belong to that other object". Used for automatic cleanup.</li>
+      <li><strong>Finalizer.</strong> A label-like string on an object that blocks its deletion until a controller has done its cleanup and removed the string.</li>
+    </ul>
+  </section>
+
+  <section id="controllers">
+    <h2>3. How Built-In Controllers Work</h2>
+    <p>When you scale a Deployment from 3 to 5, nobody sends "create 2 pods" anywhere. Here is the chain:</p>
+    <pre><code>kubectl scale deploy web --replicas=5
+   |
+   v
+API server stores Deployment web: spec.replicas = 5      (in etcd)
+   |  watch event
+   v
+Deployment controller: "web wants 5; its ReplicaSet says 3"
+   -&gt; updates ReplicaSet web-7d9f: spec.replicas = 5
+   |  watch event
+   v
+ReplicaSet controller: "web-7d9f wants 5; I see 3 pods with its labels"
+   -&gt; creates 2 Pod objects (no node yet)
+   |  watch event
+   v
+Scheduler: picks a node for each new pod
+   |  watch event
+   v
+kubelet on that node: starts the containers, reports status</code></pre>
+    <p>Every arrow is the same pattern: a component watches objects, notices a gap between spec and reality, and writes a small change to the API server. Nobody calls anybody directly. The API server is the shared notice board.</p>
+    <h3>Inside a controller</h3>
+    <p>Real controllers (built with the Go library <code>client-go</code> or <code>controller-runtime</code>) have three parts:</p>
+    <pre><code>  API server
+      |  watch stream (list once, then changes)
+      v
+ +-----------+      +-------------------+      +-------------------+
+ | informer  | ---&gt; | work queue        | ---&gt; | reconcile(name)   |
+ | + local   | key  | "default/orders-db"|     | reads from cache, |
+ |   cache   |      | de-duplicated,    |      | writes to API     |
+ +-----------+      | rate-limited      |      +-------------------+
+                    +-------------------+         |  error? requeue
+                            ^---------------------+  with back-off</code></pre>
+    <ul>
+      <li>The <strong>informer</strong> lists all objects once, then watches for changes, and keeps a local copy (the <strong>cache</strong>). Reads come from the cache, so the controller does not hammer the API server.</li>
+      <li>Every change puts the object's <strong>key</strong> (<code>namespace/name</code>) in the <strong>work queue</strong>, not the change itself. If the same object changes 10 times in a second, the key is in the queue once.</li>
+      <li>The <strong>reconcile</strong> function gets just the name. It reads the current desired and actual state and fixes the difference. If it fails, the key goes back in the queue with a growing delay (back-off).</li>
+    </ul>
+  </section>
+
+  <section id="level">
+    <h2>4. Level-Triggered, Not Edge-Triggered</h2>
+    <p>This is the most important idea on the page.</p>
+    <ul>
+      <li><strong>Edge-triggered:</strong> act on each <em>change</em>. "Replicas went from 3 to 5, so create 2 pods."</li>
+      <li><strong>Level-triggered:</strong> act on the <em>current state</em>. "Desired is 5, I see 3, so create 2."</li>
+    </ul>
+    <p>They look the same until something goes wrong. Say the controller crashes, and while it is down someone scales to 5, then to 4. An edge-triggered controller that missed those two events, or replays them in a strange order, ends up wrong. A level-triggered controller does not care what happened while it was away. It looks: desired 4, actual 3, create 1. Done.</p>
+    <p>The same is true when a human deletes a pod by hand, a node dies, or a network call half-fails. There is no event that says "please fix this"; there is only a world that does not match the spec. Level-triggered reconcilers fix it on the next pass. That is why Kubernetes controllers also <strong>resync</strong> every so often, even with no events, and why a reconciler must never assume it saw every event.</p>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> An edge-triggered thermostat would say "someone opened the window, so heat for 5 minutes". If it misses the "window closed" event, it heats forever. A level-triggered one just reads the thermometer. It cannot get confused by events, because it does not use them for anything except "time to look again".</p>
+    </div>
+  </section>
+
+  <section id="crd">
+    <h2>5. Adding a New Kind: the CRD</h2>
+    <p>Here is a complete CRD for our <code>Database</code> kind. Read the comments; every line matters.</p>
+    <pre><code class="language-yaml">apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.db.example.com        # must be &lt;plural&gt;.&lt;group&gt;
+spec:
+  group: db.example.com                 # your API group (use a domain you own)
+  scope: Namespaced                     # or Cluster
+  names:
+    kind: Database                      # used in YAML "kind:"
+    plural: databases                   # used in URLs and kubectl get
+    singular: database
+    shortNames: [db]                    # kubectl get db
+  versions:
+  - name: v1
+    served: true                        # the API answers for this version
+    storage: true                       # exactly one version is stored in etcd
+    subresources:
+      status: {}                        # status is updated separately from spec
+    additionalPrinterColumns:           # extra columns in kubectl get
+    - name: Replicas
+      type: integer
+      jsonPath: .spec.replicas
+    - name: Ready
+      type: integer
+      jsonPath: .status.readyReplicas
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+    schema:
+      openAPIV3Schema:                  # the API server rejects objects that break this
+        type: object
+        properties:
+          spec:
+            type: object
+            required: [replicas, version]
+            properties:
+              replicas:
+                type: integer
+                minimum: 1
+                maximum: 9
+              version:
+                type: string
+                enum: ["15", "16", "17"]
+              backupSchedule:
+                type: string
+          status:
+            type: object
+            properties:
+              readyReplicas: {type: integer}
+              observedGeneration: {type: integer}
+              conditions:
+                type: array
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true</code></pre>
+    <p>After <code>kubectl apply -f crd.yaml</code>, the API server has a new endpoint, <code>/apis/db.example.com/v1/namespaces/&lt;ns&gt;/databases</code>, stored in etcd like any built-in kind. You can now apply the <code>orders-db</code> YAML from section 1 and see:</p>
+    <pre><code>$ kubectl get db
+NAME        REPLICAS   READY   AGE
+orders-db   3                  5s</code></pre>
+    <p>READY is empty. <strong>Nothing happens yet.</strong> A CRD is only storage plus validation. No pods appear until a controller watches <code>databases</code> and acts. Also try <code>replicas: 20</code>: the API server refuses it, because the schema says at most 9. Validation in the schema catches mistakes before your controller ever sees them.</p>
+    <p>Why <code>subresources: status</code>? It splits the object into two parts with separate write paths. Users (and GitOps tools) write <code>spec</code>; the controller writes <code>status</code> through <code>/status</code>. A user's <code>kubectl apply</code> cannot overwrite status by accident, and RBAC can allow the controller to touch only status.</p>
+  </section>
+
+  <section id="lab">
+    <h2>6. Lab: A Toy Operator</h2>
+    <p>To see the reconcile loop without a cluster, we wrote a toy in plain Python. The "API server" is a dictionary. The reconciler is the real logic, in about 30 lines:</p>
+    <pre><code class="language-python">api = {"crs": {}, "pods": {}, "backups": {}}    # pods: name -&gt; owner
+
+def reconcile(name):
+    cr = api["crs"].get(name)
+    mine = sorted(p for p, owner in api["pods"].items() if owner == name)
+    if cr is None:
+        return "gone"                            # nothing to do
+    if cr.get("deleting"):                       # deletionTimestamp is set
+        if "backup" in cr["finalizers"]:
+            api["backups"][name] = f"backup-of-{name}"   # cleanup work
+            cr["finalizers"].remove("backup")
+        for p in mine:
+            del api["pods"][p]
+        if not cr["finalizers"]:
+            del api["crs"][name]                 # now it can really go
+            return "deleted"
+        return "waiting"
+    if "backup" not in cr["finalizers"]:
+        cr["finalizers"].append("backup")        # add our finalizer first
+    want, have = cr["spec"]["replicas"], len(mine)
+    for _ in range(want - have):                 # too few: create
+        create_pod(owner=name)
+    for p in mine[want:]:                        # too many: delete extras
+        del api["pods"][p]
+    cr["status"] = {"readyReplicas": count_pods(name)}
+    return f"ok, ready={cr['status']['readyReplicas']}/{want}"</code></pre>
+    <p>Notice what it does <em>not</em> do: it never looks at <em>what changed</em>. It only compares "want" with "have". We then played six events at it. This is the real output:</p>
+    <pre><code>1. user applies Database orders-db with replicas: 3
+  create orders-db-pod-1
+  create orders-db-pod-2
+  create orders-db-pod-3
+  reconcile #1: ok, ready=3/3
+2. reconcile again with no change (idempotent?)
+  reconcile #1: ok, ready=3/3
+3. user scales to 2
+  delete orders-db-pod-3
+  reconcile #1: ok, ready=2/2
+4. someone deletes a pod by hand (drift)
+  create orders-db-pod-4
+  reconcile #1: ok, ready=2/2
+5. controller was down; two edits (5 then 4) happened while it was away
+  create orders-db-pod-5
+  create orders-db-pod-6
+  reconcile #1: ok, ready=4/4
+6. user deletes the CR (kubectl delete)
+  finalizer: saved backup, removed finalizer
+  reconcile #1: deleted
+  reconcile #2: gone
+final state: {'backups': {'orders-db': 'backup-of-orders-db'}, 'pods': {}, 'crs': {}}</code></pre>
+    <p>What each step proves:</p>
+    <table>
+      <thead><tr><th>Step</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td>2</td><td><strong>Idempotent.</strong> Running it again with nothing to do did nothing. Controllers run reconcile many times for the same object, so this is required.</td></tr>
+        <tr><td>4</td><td><strong>Heals drift.</strong> No event said "pod-1 was deleted by a human". The count was simply 1 instead of 2, so it made pod-4.</td></tr>
+        <tr><td>5</td><td><strong>Level-triggered.</strong> It never saw "5". It only saw "want 4, have 2" and created 2. An edge-triggered version that replayed "+3 then -1" from a stale count would be wrong.</td></tr>
+        <tr><td>6</td><td><strong>Finalizer.</strong> Delete did not remove the object at once. The controller first saved a backup, then removed its finalizer, and only then did the object disappear. One more reconcile found nothing to do.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="owners">
+    <h2>7. Owner References and Cascading Delete</h2>
+    <p>In the toy, the controller deletes its own pods. In real Kubernetes you rarely need to. When the operator creates a child object, it sets an <strong>owner reference</strong>:</p>
+    <pre><code class="language-yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orders-db
+  ownerReferences:
+  - apiVersion: db.example.com/v1
+    kind: Database
+    name: orders-db
+    uid: 3f6c1a2e-0b7d-4c55-9a51-8d1f2e7c9b10   # the owner's exact uid
+    controller: true             # this owner is THE managing controller
+    blockOwnerDeletion: true</code></pre>
+    <p>Now the built-in <strong>garbage collector</strong> controller knows the StatefulSet belongs to the Database. Delete the Database, and the StatefulSet is deleted too, and then its pods (which are owned by the StatefulSet). This is how deleting a Deployment removes its ReplicaSets and pods.</p>
+    <pre><code>Database orders-db
+   └── StatefulSet orders-db         (owner: Database)
+         └── Pod orders-db-0, -1, -2 (owner: StatefulSet)
+   └── Service orders-db             (owner: Database)
+   └── CronJob orders-db-backup      (owner: Database)</code></pre>
+    <p><code>kubectl delete</code> has three cascade modes: <code>--cascade=background</code> (the default: delete the owner now, children shortly after), <code>foreground</code> (children first, then the owner), and <code>orphan</code> (delete only the owner and leave children running). Owner references only work inside one namespace, or from a cluster-scoped owner; a namespaced object cannot own a cluster-scoped one.</p>
+    <p>Owner references also help the controller: with <code>controller-runtime</code> you write <code>Owns(&amp;appsv1.StatefulSet{})</code>, and a change to any owned StatefulSet puts the <em>owner's</em> key in the work queue. That is how the operator notices "someone scaled my StatefulSet by hand" and puts it back.</p>
+  </section>
+
+  <section id="finalizers">
+    <h2>8. Finalizers, and Objects Stuck in Terminating</h2>
+    <p>Owner references clean up things <em>inside</em> the cluster. But some cleanup is outside: a cloud load balancer, a DNS record, a final backup to S3. For that, use a <strong>finalizer</strong>:</p>
+    <ol>
+      <li>When the controller first sees the object, it adds a string to <code>metadata.finalizers</code>, for example <code>db.example.com/backup</code>.</li>
+      <li>When a user deletes the object, the API server does <em>not</em> delete it. It sets <code>metadata.deletionTimestamp</code> and leaves it there. <code>kubectl get</code> shows it as Terminating.</li>
+      <li>The controller sees the deletion timestamp, does the cleanup, and removes its string from the list.</li>
+      <li>When the list is empty, the API server really deletes the object.</li>
+    </ol>
+    <p>The trap: if the controller is gone (uninstalled, crashing, missing permissions), nobody removes the finalizer and the object is stuck in Terminating forever. This is very common with namespaces that will not delete because some custom resource inside them has a finalizer from an operator that was already removed.</p>
+    <pre><code># find what is holding it
+kubectl get database orders-db -o jsonpath='{.metadata.finalizers}'
+kubectl get database orders-db -o jsonpath='{.metadata.deletionTimestamp}'
+
+# best fix: bring the controller back (reinstall, fix RBAC) and let it finish
+
+# last resort: remove the finalizer by hand. The cleanup it guarded
+# (backup, cloud resource) will NOT happen; do it yourself first.
+kubectl patch database orders-db --type=merge -p '{"metadata":{"finalizers":null}}'</code></pre>
+    <p>Rule of thumb: <strong>uninstall operators last</strong>. Delete their custom resources first, while the controller is still running to process the finalizers. See also <a href="kubernetes-troubleshooting.html#terminating">stuck Terminating pods</a>.</p>
+  </section>
+
+  <section id="status">
+    <h2>9. Status, Conditions and observedGeneration</h2>
+    <p>A good operator tells you what it sees. The common shape is a list of <strong>conditions</strong>:</p>
+    <pre><code class="language-yaml">status:
+  observedGeneration: 7
+  readyReplicas: 2
+  conditions:
+  - type: Ready
+    status: "False"
+    reason: ReplicaNotReady
+    message: "orders-db-2 is failing its readiness probe"
+    lastTransitionTime: "2026-11-28T08:41:10Z"
+  - type: BackupSucceeded
+    status: "True"
+    reason: Completed
+    lastTransitionTime: "2026-11-28T02:00:41Z"</code></pre>
+    <p>Each condition has a <code>type</code>, a <code>status</code> of "True", "False" or "Unknown", a short CamelCase <code>reason</code> for machines, and a <code>message</code> for humans. Tools can wait on them: <code>kubectl wait --for=condition=Ready database/orders-db --timeout=5m</code>.</p>
+    <p><strong>observedGeneration</strong> answers "has the controller seen my latest change yet?" Every time the <code>spec</code> changes, the API server adds 1 to <code>metadata.generation</code>. The controller copies the generation it just processed into <code>status.observedGeneration</code>.</p>
+    <pre><code>metadata.generation = 8, status.observedGeneration = 7
+  -&gt; your latest edit has NOT been processed yet; status describes the old spec
+metadata.generation = 8, status.observedGeneration = 8
+  -&gt; status is about your current spec</code></pre>
+    <p>Without this, a CI pipeline might apply a change, read <code>Ready=True</code> left over from the old version, and announce success too early. Deployments use the same trick, which is how <code>kubectl rollout status</code> knows when to stop waiting.</p>
+  </section>
+
+  <section id="real">
+    <h2>10. A Real Operator in Python (kopf)</h2>
+    <p>Most production operators are written in Go with <strong>kubebuilder</strong> or the <strong>Operator SDK</strong> (both on top of <code>controller-runtime</code>). For learning, the Python framework <strong>kopf</strong> is much shorter. This is a small but real operator that turns a <code>Database</code> into a StatefulSet:</p>
+    <pre><code class="language-python">import kopf, kubernetes
+
+def statefulset_for(name, spec):
+    return {
+        "apiVersion": "apps/v1", "kind": "StatefulSet",
+        "metadata": {"name": name},
+        "spec": {
+            "replicas": spec["replicas"],
+            "serviceName": name,
+            "selector": {"matchLabels": {"app": name}},
+            "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {"containers": [{
+                    "name": "postgres",
+                    "image": f"postgres:{spec['version']}",
+                }]},
+            },
+        },
+    }
+
+@kopf.on.create("db.example.com", "v1", "databases")
+@kopf.on.update("db.example.com", "v1", "databases")
+@kopf.on.resume("db.example.com", "v1", "databases")   # also on operator restart
+def reconcile(spec, name, namespace, body, **_):
+    sts = statefulset_for(name, spec)
+    kopf.adopt(sts, owner=body)          # sets ownerReferences for cascading delete
+    apps = kubernetes.client.AppsV1Api()
+    try:
+        apps.create_namespaced_stateful_set(namespace, sts)
+    except kubernetes.client.ApiException as e:
+        if e.status != 409:              # 409 = already exists
+            raise                        # kopf retries with back-off
+        apps.patch_namespaced_stateful_set(name, namespace, sts)
+
+@kopf.on.delete("db.example.com", "v1", "databases")
+def take_final_backup(name, **_):
+    # kopf adds and removes its own finalizer around this handler
+    print(f"saving a final backup of {name}")</code></pre>
+    <p>Run it on your laptop against any cluster (kind or minikube is fine) with <code>kopf run operator.py</code>; in production, package it in an image and run it as a Deployment. Points to notice:</p>
+    <ul>
+      <li>The handler is <strong>create-or-update</strong>, so running it twice is safe (idempotent).</li>
+      <li><code>@kopf.on.resume</code> runs for every existing object when the operator starts, which covers anything that changed while it was down.</li>
+      <li><code>kopf.adopt</code> writes the owner reference, so deleting the Database deletes the StatefulSet.</li>
+      <li>An exception means "try again later". The framework requeues with back-off.</li>
+    </ul>
+    <p>In Go, the same reconcile function has this famous shape:</p>
+    <pre><code class="language-go">func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    var db dbv1.Database
+    if err := r.Get(ctx, req.NamespacedName, &amp;db); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)   // deleted: nothing to do
+    }
+    sts := buildStatefulSet(&amp;db)
+    ctrl.SetControllerReference(&amp;db, sts, r.Scheme)        // owner reference
+    _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error { ... })
+    if err != nil {
+        return ctrl.Result{}, err                          // requeue with back-off
+    }
+    db.Status.ObservedGeneration = db.Generation
+    return ctrl.Result{}, r.Status().Update(ctx, &amp;db)
+}</code></pre>
+  </section>
+
+  <section id="production">
+    <h2>11. Running an Operator Safely</h2>
+    <h3>11.1 RBAC: only what it needs</h3>
+    <p>An operator is a program with API permissions. Give it exactly what it uses (see <a href="kubernetes-config-security.html">Config, Secrets &amp; Security</a>):</p>
+    <pre><code class="language-yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: database-operator
+rules:
+- apiGroups: ["db.example.com"]
+  resources: ["databases"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: ["db.example.com"]
+  resources: ["databases/status", "databases/finalizers"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]</code></pre>
+    <p>Missing <code>list</code> or <code>watch</code> is the classic first bug: the informer cannot start, and the operator logs "forbidden" and does nothing.</p>
+    <h3>11.2 Conflicts: 409 is normal</h3>
+    <p>Every object has a <code>metadata.resourceVersion</code>. An update must send the version it read. If someone else changed the object in between, the API server answers <strong>409 Conflict</strong>. This is <strong>optimistic concurrency</strong>: no locks, just "your copy is old, read again". The right response is to return an error and let the work queue retry; the next reconcile reads fresh state. Do not loop and retry inside the reconciler.</p>
+    <h3>11.3 One active copy: leader election</h3>
+    <p>For high availability you run 2 replicas of the operator, but only one should act. They compete for a <strong>Lease</strong> object; the holder is the leader and renews it every few seconds. If it dies, the other takes over after the lease expires (about 15 seconds by default in controller-runtime).</p>
+    <h3>11.4 Do not fight other controllers</h3>
+    <p>If your operator sets <code>replicas: 3</code> on a StatefulSet and an HPA (autoscaler) also sets replicas, they will flip it back and forth forever. Decide who owns each field. Server-side apply (<code>kubectl apply --server-side</code>, and the same in client libraries) records a <strong>field manager</strong> for every field and reports a conflict when two managers try to own one field.</p>
+  </section>
+
+  <section id="examples">
+    <h2>12. Operators You Will Meet</h2>
+    <table>
+      <thead><tr><th>Operator</th><th>Custom resources</th><th>What it automates</th></tr></thead>
+      <tbody>
+        <tr><td>cert-manager</td><td><code>Certificate</code>, <code>Issuer</code></td><td>Gets TLS certificates (for example from Let's Encrypt), stores them in Secrets, renews them before expiry. See <a href="../../../CS-Fundamentals/learn/Computer-Networks/cn-tls-https-certificates.html">TLS &amp; certificates</a>.</td></tr>
+        <tr><td>Prometheus Operator</td><td><code>Prometheus</code>, <code>ServiceMonitor</code>, <code>PrometheusRule</code></td><td>Runs Prometheus and builds its scrape config from small per-app objects. See <a href="kubernetes-helm-observability.html">Helm &amp; Observability</a>.</td></tr>
+        <tr><td>CloudNativePG</td><td><code>Cluster</code>, <code>Backup</code>, <code>ScheduledBackup</code></td><td>PostgreSQL with streaming replicas, automatic failover, and backups. See <a href="../../../CS-Fundamentals/learn/Databases/dbms-replication-sharding-cap.html">replication &amp; failover</a>.</td></tr>
+        <tr><td>Argo CD</td><td><code>Application</code></td><td>Keeps the cluster matching a Git repository (GitOps). See <a href="../DevOps/devops-cicd-mlops.html">CI/CD &amp; MLOps</a>.</td></tr>
+        <tr><td>KubeRay</td><td><code>RayCluster</code>, <code>RayJob</code>, <code>RayService</code></td><td>Ray clusters for distributed training and model serving, with autoscaling workers.</td></tr>
+        <tr><td>NVIDIA GPU Operator</td><td><code>ClusterPolicy</code></td><td>Installs GPU drivers, the device plugin and monitoring on GPU nodes. See <a href="kubernetes-gpu-scheduling.html">GPU Scheduling</a>.</td></tr>
+        <tr><td>Kueue</td><td><code>ClusterQueue</code>, <code>LocalQueue</code>, <code>Workload</code></td><td>Queues batch and training jobs and admits them when quota is free.</td></tr>
+      </tbody>
+    </table>
+    <p>When you install one of these, run <code>kubectl get crd</code> to see what it added, and <code>kubectl explain &lt;kind&gt;.spec</code> to read its schema right from the cluster.</p>
+  </section>
+
+  <section id="when-not">
+    <h2>13. When Not to Write One</h2>
+    <p>An operator is code you must test, upgrade and keep secure for years. Before writing one, ask:</p>
+    <ul>
+      <li><strong>Is it just "install these YAML files with some settings"?</strong> Use a Helm chart or Kustomize. Templates do not need a running program.</li>
+      <li><strong>Does a well-known operator already exist?</strong> For databases, queues, certificates and ML platforms, almost always yes. Use it.</li>
+      <li><strong>Does it need ongoing decisions?</strong> Failover, backups on a schedule, ordered upgrades, resizing, reacting to the app's own health: these are what operators are for.</li>
+    </ul>
+    <p>A useful test: if the job description for a human doing this by hand includes "watch it and react when something happens", it might be an operator. If it says "run these commands once", it is a chart or a script.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Edge-triggered logic.</strong> "On update, add the difference" breaks after missed events. Always compare desired with actual.</li>
+      <li><strong>Not idempotent.</strong> "Create" that fails with 409 on the second run, or a backup taken on every reconcile. Use create-or-update, and record what was done in status.</li>
+      <li><strong>Hot loops.</strong> Writing status on every pass (with a new timestamp each time) creates a watch event, which triggers another reconcile, forever. Only write when something really changed.</li>
+      <li><strong>Writing the user's spec.</strong> The controller should own <code>status</code> and child objects, not rewrite the user's <code>spec</code>; GitOps tools will fight it.</li>
+      <li><strong>No owner references.</strong> Children are left behind (orphans) when the custom resource is deleted.</li>
+      <li><strong>Finalizer with no way out.</strong> If cleanup can fail forever (a cloud API that is gone), the object is stuck forever. Add a timeout or an escape hatch, and log loudly.</li>
+      <li><strong>Uninstalling the operator before its resources.</strong> Finalizers can then never be removed; namespaces hang in Terminating.</li>
+      <li><strong>Breaking CRD versions.</strong> Removing a field from a served version breaks every user. Add a new version (v1beta1 to v1) with a conversion webhook, and migrate slowly.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>15. Practice Problems</h2>
+    <h3>Problem 1: edge vs level</h3>
+    <p>A controller keeps a counter in memory. On each "scale" event it adds or removes the difference between the old and new value. It restarts (losing its counter) while the user changes replicas 3 to 6 to 2. After restart, it sees only the final object with replicas 2, and 3 pods exist. What does a level-triggered controller do? What can go wrong with the edge-triggered one?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Level-triggered: desired 2, actual 3, delete 1. Correct. Edge-triggered: its counter is gone, and it saw no events while down. It may do nothing (still 3 pods), or, if it replays events from a stale starting point, create and delete the wrong numbers. It has no reliable way to know the truth except by looking, which is what level-triggered means.</p>
+    </details>
+    <h3>Problem 2: the stuck namespace</h3>
+    <p><code>kubectl delete namespace team-a</code> has said Terminating for an hour. <code>kubectl get databases -n team-a</code> shows one object with a deletion timestamp and finalizer <code>db.example.com/backup</code>. The database operator was uninstalled yesterday. What happened and what do you do?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The namespace waits for every object inside it to be deleted. The Database object waits for its finalizer, and the only program that would remove it is gone. Best: reinstall the operator so it can take the backup and remove the finalizer itself. If that is not possible, take the backup by hand, then patch <code>metadata.finalizers</code> to null on the Database. The namespace then finishes deleting.</p>
+    </details>
+    <h3>Problem 3: observedGeneration</h3>
+    <p>A CI job applies a Database with <code>version: "17"</code>, then immediately reads <code>Ready=True</code> and reports success. The rollout later fails. The object shows <code>generation: 12</code> and <code>observedGeneration: 11</code> at the time CI read it. Explain and fix.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The status was still about generation 11 (the old version). The controller had not processed the new spec yet. CI must wait until <code>observedGeneration == generation</code> <em>and</em> <code>Ready=True</code>. For example: loop until both hold, or use <code>kubectl wait --for=jsonpath='{.status.observedGeneration}'=12</code> and then wait on the condition.</p>
+    </details>
+    <h3>Problem 4: hot loop</h3>
+    <p>An operator's CPU is at 100% and the API server shows thousands of status updates per minute for one object. The reconciler ends with <code>status.lastChecked = now()</code> and an update. Why is this a loop, and what is the fix?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Each status update changes the object, which sends a watch event, which queues the key, which runs reconcile, which writes a new <code>lastChecked</code>, and so on. Fix: compare the new status with the old one and only write if something meaningful changed. Drop <code>lastChecked</code> or update it on a timer (for example by returning "requeue after 5 minutes").</p>
+    </details>
+    <h3>Problem 5: who deletes what</h3>
+    <p>A Database owns a StatefulSet and a Service (owner references set). The StatefulSet owns 3 pods. A PersistentVolumeClaim was created by the StatefulSet's volume template and has no owner reference. What remains after <code>kubectl delete database orders-db</code> with the default cascade?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The StatefulSet, the Service and the 3 pods are garbage-collected. The PVCs <strong>remain</strong>, because nothing owns them. This is on purpose: StatefulSets keep PVCs by default so data is not lost by accident. If the operator should delete data too, it must do so explicitly (for example in a finalizer, after a backup), or set the StatefulSet's <code>persistentVolumeClaimRetentionPolicy</code>.</p>
+    </details>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <pre><code># the loop
+reconcile(name): read desired (spec) + actual (children) -&gt; fix the gap -&gt; write status
+must be: level-triggered, idempotent, quick; errors -&gt; requeue with back-off
+
+# inspect operators and their kinds
+kubectl get crd
+kubectl explain database.spec
+kubectl get db -A
+kubectl get database orders-db -o yaml          # spec, status, finalizers, generation
+
+# conditions and readiness
+kubectl wait --for=condition=Ready database/orders-db --timeout=5m
+
+# stuck in Terminating
+kubectl get &lt;kind&gt; &lt;name&gt; -o jsonpath='{.metadata.finalizers}'
+# fix the controller first; last resort (cleanup is skipped):
+kubectl patch &lt;kind&gt; &lt;name&gt; --type=merge -p '{"metadata":{"finalizers":null}}'
+
+# delete modes
+kubectl delete database orders-db --cascade=background   # default
+kubectl delete database orders-db --cascade=foreground   # children first
+kubectl delete database orders-db --cascade=orphan       # keep children
+
+# CRD must-haves
+schema (openAPIV3Schema) with required fields and limits
+subresources.status, additionalPrinterColumns
+one storage version; new version + conversion for breaking changes
+
+# operator must-haves
+owner references on children   finalizer only for outside cleanup
+status.conditions + observedGeneration
+least-privilege RBAC (list + watch!)   leader election for 2+ replicas
+uninstall order: custom resources first, operator last</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/operator/" rel="noopener noreferrer">Kubernetes: Operator pattern</a> &middot; <a href="https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/" rel="noopener noreferrer">Kubernetes: Extend the API with CRDs</a> &middot; <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/" rel="noopener noreferrer">Kubernetes: Owners and dependents</a> &middot; <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/" rel="noopener noreferrer">Kubernetes: Finalizers</a> &middot; <a href="https://book.kubebuilder.io/" rel="noopener noreferrer">The Kubebuilder Book</a> &middot; <a href="https://kopf.readthedocs.io/" rel="noopener noreferrer">kopf documentation</a> &middot; <a href="https://github.com/kubernetes/community/blob/master/contributors/devel/sig-api-machinery/controllers.md" rel="noopener noreferrer">Kubernetes: Writing controllers</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="kubernetes-troubleshooting.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Debugging Pods: Pending, CrashLoopBackOff, ImagePullBackOff</span></a>
+    <a class="prev-next-next" href="kubernetes-gpu-scheduling.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">GPU Scheduling on Kubernetes</span></a>
+    <p class="prev-next-step">Page 14 of 18 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="kubernetes-architecture.html">Kubernetes Architecture</a> &middot; <a href="kubernetes-workloads.html">Workloads</a> &middot; <a href="kubernetes-troubleshooting.html">Debugging Pods</a> &middot; <a href="../DevOps/devops-infrastructure-as-code.html">Infrastructure as Code</a></p>
+    <p><a href="../docker-kubernetes-learn.html">Back to Docker &amp; Kubernetes Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../docker-kubernetes.html">Back to Docker &amp; Kubernetes</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Memory Allocation &amp; Garbage Collection | CS Fundamentals</title>
+  <meta name="description" content="How programs get and give back memory, from zero: the stack and the heap, stack frames traced by hand, how malloc and free really work (chunks, free lists, size classes, brk and mmap), fragmentation with a lab where freeing half the data gave back 0 KB, memory bugs, reference counting, mark and sweep by hand, generational GC, a GC pause lab (1,000,000 cycles took about 200 ms to collect), and GC settings in containers.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Memory Allocation &amp; Garbage Collection</p>
+  </nav>
+  <h1>Memory Allocation &amp; Garbage Collection</h1>
+  <p>Every time your code makes a list, a string, or an object, someone has to find room for it in memory. Later, someone has to give that room back. This page shows who does that and how: the stack, the heap, <code>malloc</code> and <code>free</code>, and the garbage collectors in Python, Java, Go and Node. It builds on <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a>, and every number comes from a run you can repeat.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why">Why This Matters</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#map">The Memory Map of a Process</a></li>
+    <li><a href="#stack">The Stack, Traced by Hand</a></li>
+    <li><a href="#heap">The Heap: How malloc and free Work</a></li>
+    <li><a href="#fragmentation">Fragmentation</a></li>
+    <li><a href="#lab-malloc">Lab: Speed and Fragmentation in C</a></li>
+    <li><a href="#bugs">Bugs of Manual Memory</a></li>
+    <li><a href="#refcount">Reference Counting</a></li>
+    <li><a href="#tracing">Tracing GC: Mark and Sweep by Hand</a></li>
+    <li><a href="#generational">Generational GC</a></li>
+    <li><a href="#lab-gc">Lab: Python's Collector at Work</a></li>
+    <li><a href="#runtimes">Java, Go, Node and Rust</a></li>
+    <li><a href="#production">GC in Production and in Containers</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="why">
+    <h2>1. Why This Matters</h2>
+    <p>Three real problems come straight from this topic:</p>
+    <ul>
+      <li>A service frees most of its data after a busy hour, but its memory graph never goes down. The team thinks it is a leak. It is not. It is <strong>fragmentation</strong> (section 6).</li>
+      <li>A Java or Go API has a fine average latency, but every few seconds a request takes 300 ms. That is often a <strong>garbage collection pause</strong> (section 11).</li>
+      <li>A container is killed with OOMKilled even though the language runtime "thinks" it has plenty of room. The runtime did not know about the container limit (section 14, and the <a href="../Scenarios/scenario-pod-oomkilled-memory-leak.html">OOMKilled scenario</a>).</li>
+    </ul>
+    <p>You can only fix these if you know where memory comes from and who gives it back.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>Allocate.</strong> Ask for a piece of memory to hold some data.</li>
+      <li><strong>Free</strong> (or <strong>release</strong>). Say "I am done with this piece; it can be reused."</li>
+      <li><strong>Stack.</strong> A region of memory for function calls. Each call gets a slice; the slice is thrown away when the call returns. Fast and automatic, but small.</li>
+      <li><strong>Heap.</strong> A big region for data that must live longer than one function call, or whose size is only known at run time. You (or a garbage collector) must free it.</li>
+      <li><strong>Allocator.</strong> The code that hands out heap memory. In C it is <code>malloc</code> and <code>free</code>, usually from glibc on Linux.</li>
+      <li><strong>Pointer</strong> (or <strong>reference</strong>). A value that holds the address of some data. "A points to B" means A knows where B lives.</li>
+      <li><strong>Leak.</strong> Memory you no longer need but never freed. It stays used until the process dies.</li>
+      <li><strong>Garbage.</strong> Heap data that nothing can reach any more. No pointer leads to it.</li>
+      <li><strong>Garbage collector (GC).</strong> Code inside a language runtime that finds garbage and frees it for you.</li>
+      <li><strong>RSS</strong> (resident set size). How much real RAM a process is using right now. This is what <code>top</code> shows and what container limits count.</li>
+      <li><strong>Pause</strong> (or <strong>stop-the-world</strong>). A moment when the GC stops your code so it can work safely.</li>
+    </ul>
+  </section>
+
+  <section id="map">
+    <h2>3. The Memory Map of a Process</h2>
+    <p>From <a href="os-virtual-memory-paging.html">virtual memory</a> you know that each process sees its own private address space. Here is how that space is laid out on Linux, low addresses at the bottom:</p>
+    <pre><code>high addresses
+ +-----------------------------+
+ |  stack                      |  grows DOWN, one frame per call
+ |      |                      |  (default limit often 8 MB per thread)
+ |      v                      |
+ |                             |
+ |  mmap area                  |  big malloc blocks, shared libraries,
+ |                             |  memory-mapped files
+ |      ^                      |
+ |      |                      |
+ |  heap                       |  grows UP (brk), small malloc blocks
+ +-----------------------------+
+ |  data / bss                 |  global variables
+ +-----------------------------+
+ |  text                       |  your machine code (read-only)
+ +-----------------------------+
+low addresses</code></pre>
+    <p>You can see this for any running process: <code>cat /proc/&lt;pid&gt;/maps</code> lists every region, and <code>[heap]</code> and <code>[stack]</code> are labeled. The stack limit is shown by <code>ulimit -s</code> (in KB).</p>
+  </section>
+
+  <section id="stack">
+    <h2>4. The Stack, Traced by Hand</h2>
+    <p>Each function call gets a <strong>stack frame</strong>: a slice of the stack that holds its local variables, its arguments, and the address to go back to when it returns. Take this C code:</p>
+    <pre><code>int square(int x) {
+    int r = x * x;
+    return r;
+}
+
+int main(void) {
+    int a = 3;
+    int b = square(a);
+    return b;
+}</code></pre>
+    <p>Here is the stack at each step. Each box is a frame; the newest frame is on top.</p>
+    <pre><code>step 1: main starts      step 2: main calls square   step 3: square returns
+                         +--------------------+
+                         | square             |
+                         |   x = 3            |
+                         |   r = 9            |
+                         |   return to main   |
++------------------+     +--------------------+      +------------------+
+| main             |     | main               |      | main             |
+|   a = 3          |     |   a = 3            |      |   a = 3          |
+|   b = ?          |     |   b = ?            |      |   b = 9          |
++------------------+     +--------------------+      +------------------+</code></pre>
+    <p>When <code>square</code> returns, its frame is simply "popped". Nothing is erased; the stack pointer (a CPU register that marks the top) just moves back. That is why stack allocation is almost free: making room is one subtraction, and freeing is one addition.</p>
+    <p>Two limits follow:</p>
+    <ul>
+      <li><strong>Data on the stack dies when the function returns.</strong> If <code>square</code> returned the address of <code>r</code>, the caller would hold a pointer into a dead frame. The next call would overwrite it. This is a classic C bug.</li>
+      <li><strong>The stack is small.</strong> A recursion that is 1,000,000 calls deep, or a 50 MB local array, runs past the end. You get a <strong>stack overflow</strong> (on Linux, a segmentation fault; in Python, a <code>RecursionError</code> first, because Python limits depth to 1,000 by default).</li>
+    </ul>
+    <div class="callout callout-intuition">
+      <p><strong>Intuition.</strong> The stack is a pile of plates. You can only add or remove the top plate, which makes it very fast and very tidy. The heap is a big warehouse. You can store anything of any size for as long as you like, but someone must keep track of what is where and clear out what is no longer needed.</p>
+    </div>
+  </section>
+
+  <section id="heap">
+    <h2>5. The Heap: How malloc and free Work</h2>
+    <p>When data must outlive a function, or its size is only known at run time (a file you just read, a list that grows), it goes on the heap:</p>
+    <pre><code>char *buf = malloc(100);   /* ask for 100 bytes          */
+/* ... use buf ... */
+free(buf);                 /* give them back             */</code></pre>
+    <h3>5.1 Where the allocator gets memory</h3>
+    <p>The allocator gets big pieces from the kernel and cuts them into small pieces for you. It uses two <a href="os-system-calls.html">system calls</a>:</p>
+    <ul>
+      <li><code>brk</code> moves the top of the heap region up, to grow it. glibc uses this for small requests.</li>
+      <li><code>mmap</code> asks for a brand new region anywhere in the address space. glibc uses this for big requests: by default anything of 128 KB or more (this threshold can grow on its own, up to 32 MB on 64-bit systems).</li>
+    </ul>
+    <p>System calls are slow compared with normal code, so the allocator asks the kernel rarely and reuses freed pieces as much as it can.</p>
+
+    <h3>5.2 Chunks and headers</h3>
+    <p>Each piece the allocator hands out is a <strong>chunk</strong>. Just before your bytes, it keeps a small <strong>header</strong> that records the chunk size. That is how <code>free(buf)</code> knows how much to give back, even though you only passed a pointer.</p>
+    <pre><code>      header        your 100 bytes                 padding
+   +----------+-------------------------------------+------+
+   | size=112 |  buf points here                    |      |
+   +----------+-------------------------------------+------+
+     8 bytes              100 bytes                  4 bytes</code></pre>
+    <p>On 64-bit glibc, a chunk is the request plus an 8-byte header, rounded up to a multiple of 16. So <code>malloc(100)</code> uses 100 + 8 = 108, rounded up to <strong>112 bytes</strong>. Keep that number; the lab uses it.</p>
+
+    <h3>5.3 Free lists, worked by hand</h3>
+    <p>Freed chunks are kept on <strong>free lists</strong>, so the next <code>malloc</code> can reuse them. Here is a tiny 64-byte heap, to see the idea (real allocators are fancier, but the logic is the same). We use <strong>first fit</strong>: take the first free piece that is big enough.</p>
+    <pre><code>start:            [ free 64                                        ]
+A = malloc(16):   [ A 16 ][ free 48                                ]
+B = malloc(24):   [ A 16 ][ B 24          ][ free 24               ]
+C = malloc(16):   [ A 16 ][ B 24          ][ C 16 ][ free 8 ]
+free(B):          [ A 16 ][ free 24       ][ C 16 ][ free 8 ]
+D = malloc(20):   [ A 16 ][ D 20      ][f4][ C 16 ][ free 8 ]
+E = malloc(12):   fails! 4 + 8 = 12 bytes are free, but not in one piece</code></pre>
+    <p>The last line is the key. There are 12 free bytes in total, but they are split in two holes, so a 12-byte request cannot be served. This is <strong>external fragmentation</strong> (next section).</p>
+    <p>When two free neighbors sit side by side, a good allocator <strong>coalesces</strong> them (joins them into one bigger free piece). That is why freeing in big solid runs works much better than freeing scattered pieces.</p>
+
+    <h3>5.4 Size classes and per-thread caches</h3>
+    <p>Real allocators keep separate free lists for common sizes (16, 32, 48 ... bytes). These are <strong>size classes</strong> or <strong>bins</strong>. A request for 100 bytes goes straight to the 112-byte list: no searching. glibc also keeps a small cache per thread (the <strong>tcache</strong>), so most <code>malloc</code>/<code>free</code> pairs never touch a lock. Other allocators, like jemalloc and tcmalloc (used by many databases, browsers and Go-style runtimes), push this idea further to cut fragmentation and lock contention.</p>
+  </section>
+
+  <section id="fragmentation">
+    <h2>6. Fragmentation</h2>
+    <p>There are two kinds of waste:</p>
+    <table>
+      <thead><tr><th>Kind</th><th>What it means</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Internal</strong></td><td>Waste <em>inside</em> a chunk: you got more than you asked for</td><td><code>malloc(100)</code> uses 112 bytes; 12 bytes (about 11%) are header and padding</td></tr>
+        <tr><td><strong>External</strong></td><td>Waste <em>between</em> chunks: free space exists but is split into holes too small to use</td><td>The failed 12-byte request in section 5.3</td></tr>
+      </tbody>
+    </table>
+    <p>There is a third effect that surprises people in production. The kernel gives memory to a process in <strong>pages</strong> of 4 KB. The allocator can only give a page back to the kernel if <em>the whole page</em> is free. One live 112-byte chunk in a 4 KB page keeps the whole page in RAM. So "I freed half my objects" can mean "I gave back zero pages". The lab shows this.</p>
+  </section>
+
+  <section id="lab-malloc">
+    <h2>7. Lab: Speed and Fragmentation in C</h2>
+    <p>We ran a small C program on Linux (glibc, compiled with <code>gcc -O0</code> so the compiler cannot remove the work). It reads its own RSS from <code>/proc/self/status</code> after each step.</p>
+    <h3>7.1 Stack vs heap speed</h3>
+    <p>Ten million calls of each:</p>
+    <table>
+      <thead><tr><th>Operation</th><th>Time per call (two runs)</th></tr></thead>
+      <tbody>
+        <tr><td>Function with a 64-byte local array (stack)</td><td>1.86 to 2.06 ns</td></tr>
+        <tr><td><code>malloc(64)</code>, touch it, <code>free</code></td><td>6.88 to 7.62 ns</td></tr>
+      </tbody>
+    </table>
+    <p>The heap is about 3 to 4 times slower here, and this is the <em>best case</em>: one thread, the same size again and again, always served from the tcache. With many threads, mixed sizes and cache misses, heap allocation costs much more. That is why hot loops avoid allocating, and why reusing buffers is a common speed-up.</p>
+    <h3>7.2 Freeing half the data gave back nothing</h3>
+    <pre><code>int M = 1000000;
+for (i = 0; i &lt; M; i++) a[i] = malloc(100);   /* 1,000,000 chunks of 112 bytes */
+for (i = 0; i &lt; M; i += 2) free(a[i]);         /* free every OTHER chunk        */
+malloc_trim(0);                                 /* ask glibc to return free pages */</code></pre>
+    <table>
+      <thead><tr><th>Step</th><th>RSS</th></tr></thead>
+      <tbody>
+        <tr><td>Start</td><td>1,716 KB</td></tr>
+        <tr><td>After 1,000,000 &times; <code>malloc(100)</code></td><td>118,904 KB</td></tr>
+        <tr><td>After freeing every other chunk (half the data)</td><td><strong>118,904 KB</strong></td></tr>
+        <tr><td>After <code>malloc_trim(0)</code></td><td><strong>118,904 KB</strong></td></tr>
+        <tr><td>After freeing the rest, then <code>malloc_trim(0)</code></td><td>9,528 KB</td></tr>
+        <tr><td>Allocate 1,000,000 again, free the <em>first half</em> (one solid run), trim</td><td>64,220 KB</td></tr>
+        <tr><td>One <code>malloc</code> of 200 MB, touched</td><td>269,024 KB</td></tr>
+        <tr><td>After freeing that one block</td><td>64,220 KB</td></tr>
+      </tbody>
+    </table>
+    <p>Check the first number: 1,000,000 &times; 112 bytes = 112,000,000 bytes, about 109,000 KB. Add 7,800 KB for the array of pointers (<code>a</code> itself, 8 bytes &times; 1,000,000) and a little for the program: about 118,900 KB. It matches.</p>
+    <p>Now the lesson:</p>
+    <ul>
+      <li>Freeing <strong>every other</strong> chunk freed half the data but <strong>0 KB</strong> of RSS. Each 4 KB page holds about 36 chunks, and every page still had live chunks in it. Even <code>malloc_trim</code> could not return a single page.</li>
+      <li>Freeing the <strong>first half</strong> as one solid run returned about half the memory (118,904 to 64,220 KB), because whole pages became empty and could be given back.</li>
+      <li>The 200 MB block came from <code>mmap</code> (it is above the 128 KB threshold), so <code>free</code> handed it straight back to the kernel.</li>
+    </ul>
+    <div class="callout">
+      <p><strong>The headline.</strong> "Memory did not go down after the spike" is not proof of a leak. If the live objects are scattered across many pages, the allocator cannot return those pages. The memory is free inside the process and will be reused for new allocations, but RSS stays high. A real leak keeps <em>growing</em> under the same load; fragmentation goes up and then stays flat.</p>
+    </div>
+  </section>
+
+  <section id="bugs">
+    <h2>8. Bugs of Manual Memory</h2>
+    <p>In C and C++ you free memory yourself. Four bugs come from that:</p>
+    <table>
+      <thead><tr><th>Bug</th><th>What happens</th><th>Tiny example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Leak</strong></td><td>You lose the last pointer without freeing. Memory grows forever.</td><td><code>p = malloc(10); p = malloc(20);</code> (the first 10 bytes are lost)</td></tr>
+        <tr><td><strong>Use after free</strong></td><td>You keep using memory after freeing it. Someone else may now own it. Data gets corrupted, or an attacker takes control.</td><td><code>free(p); p[0] = 1;</code></td></tr>
+        <tr><td><strong>Double free</strong></td><td>You free the same chunk twice. The free list gets corrupted.</td><td><code>free(p); free(p);</code></td></tr>
+        <tr><td><strong>Buffer overflow</strong></td><td>You write past the end of a chunk and smash the next chunk's header or data.</td><td><code>p = malloc(8); strcpy(p, "much longer than 8");</code></td></tr>
+      </tbody>
+    </table>
+    <p>Tools catch these: compile with <code>-fsanitize=address</code> (AddressSanitizer) and run your tests, or run the program under <code>valgrind</code>. Both report the exact line. A large share of serious security bugs in big C and C++ projects are memory-safety bugs like these, which is why newer systems code is often written in memory-safe languages.</p>
+  </section>
+
+  <section id="refcount">
+    <h2>9. Reference Counting</h2>
+    <p>The simplest automatic scheme: every object keeps a <strong>count</strong> of how many references point to it. Add a reference: count up. Remove one: count down. When the count hits 0, nobody can reach the object, so free it right away. CPython (the normal Python), Swift and C++ <code>shared_ptr</code> work this way.</p>
+    <pre><code>a = Node()      # Node count = 1  (a)
+b = a           # Node count = 2  (a, b)
+del b           # Node count = 1
+del a           # Node count = 0  -&gt; freed immediately</code></pre>
+    <p>Good: memory is freed at once, in small steps, so there are no long pauses. Bad: every assignment does extra work, and it has one big hole: <strong>cycles</strong>.</p>
+    <pre><code>x = Node(); y = Node()
+x.other = y          # y count = 2 (y, x.other)
+y.other = x          # x count = 2 (x, y.other)
+del x, y             # both counts drop to 1, never 0
+
+   +------+  other   +------+
+   |  X   | -------&gt; |  Y   |      nothing outside points to X or Y,
+   |  1   | &lt;------- |  1   |      but each keeps the other at count 1
+   +------+  other   +------+</code></pre>
+    <p>The two nodes are garbage (no variable can reach them), but their counts never reach 0. Pure reference counting leaks them forever. Python adds a second tool, a cycle-finding GC, to clean these up. The lab in section 12 shows it.</p>
+  </section>
+
+  <section id="tracing">
+    <h2>10. Tracing GC: Mark and Sweep by Hand</h2>
+    <p>Most runtimes (Java, Go, JavaScript, C#) do not count references. They <strong>trace</strong>: start from things that are surely alive, follow every pointer, and treat everything not reached as garbage.</p>
+    <p>The starting points are the <strong>roots</strong>: global variables, local variables on every thread's stack, and CPU registers.</p>
+    <h3>Worked example</h3>
+    <pre><code>roots: [ r1 ]  [ r2 ]
+          |       |
+          v       v
+          A ----&gt; B ----&gt; C          E ----&gt; F
+                  |                  ^       |
+                  v                  |       |
+                  D                  +-------+   (E and F point to each other)</code></pre>
+    <p><strong>Mark phase.</strong> Start at the roots and color everything you can reach.</p>
+    <ol>
+      <li>From r1, reach A. Mark A.</li>
+      <li>From A, reach B. Mark B. (r2 also points to B; it is already marked, so skip.)</li>
+      <li>From B, reach C and D. Mark both.</li>
+      <li>No more pointers to follow. Marked: A, B, C, D.</li>
+    </ol>
+    <p><strong>Sweep phase.</strong> Walk the whole heap. Anything not marked is garbage: <strong>E and F</strong>. Free them, and clear the marks for next time.</p>
+    <p>Notice that E and F form a cycle, and tracing handles it with no special effort. Being in a cycle does not matter; only being reachable from a root matters.</p>
+    <h3>Variations</h3>
+    <ul>
+      <li><strong>Mark-compact.</strong> After marking, slide the live objects together so free space is one solid block. This removes fragmentation, but pointers must be updated, so the program must pause (or the GC must be clever).</li>
+      <li><strong>Copying.</strong> Split memory into two halves. Copy live objects from the full half to the empty half, then treat the old half as empty. Cost depends on live data, not on garbage, which is great when most objects die young.</li>
+      <li><strong>Concurrent.</strong> Do most of the marking while your program keeps running, using a "write barrier" (a few extra instructions on each pointer write) so the GC is told about changes. Go and modern Java collectors work this way to keep pauses short.</li>
+    </ul>
+  </section>
+
+  <section id="generational">
+    <h2>11. Generational GC</h2>
+    <p>People measured real programs and found the <strong>weak generational hypothesis</strong>: most objects die young. A request handler makes hundreds of small objects (strings, dicts, temporary lists), and nearly all are garbage when the request ends. A few objects (caches, config, connection pools) live for hours.</p>
+    <p>So the heap is split into <strong>generations</strong>:</p>
+    <pre><code>  new objects
+       |
+       v
+ +-------------+   survives a few   +-------------+   survives more   +-------------+
+ |   young     | -----------------&gt; |   middle    | ----------------&gt; |    old      |
+ | (collected  |                    | (collected  |                   | (collected  |
+ |  very often,|                    |  less often)|                   |  rarely,    |
+ |  cheap)     |                    |             |                   |  expensive) |
+ +-------------+                    +-------------+                   +-------------+</code></pre>
+    <p>Collecting only the young generation is quick, because there is little live data in it. Objects that survive are <strong>promoted</strong> to an older generation, which is collected rarely. The trap: an object in the old generation that points to a young one must still keep the young one alive. Runtimes track this with a write barrier and a "remembered set" (a list of old objects that point into the young area).</p>
+    <p>Python's cycle GC has three generations. In Python 3.13 (used in the lab), <code>gc.get_threshold()</code> returns <code>(2000, 10, 10)</code>: a young collection runs after about 2,000 new tracked objects, a middle one after 10 young ones, and an old one after 10 middle ones.</p>
+  </section>
+
+  <section id="lab-gc">
+    <h2>12. Lab: Python's Collector at Work</h2>
+    <p>Run with Python 3.13.5 on Linux:</p>
+    <pre><code class="language-python">import gc, sys, weakref
+
+class Node:
+    def __init__(self):
+        self.other = None
+        self.data = bytearray(1000)
+
+a = Node()
+print(sys.getrefcount(a))   # 2  (a, plus the temporary argument)
+b = a
+print(sys.getrefcount(a))   # 3
+del b
+print(sys.getrefcount(a))   # 2
+
+r = weakref.ref(a)          # a weak reference does not keep it alive
+del a
+print(r() is not None)      # False: freed the moment the count hit 0
+
+gc.disable()
+x, y = Node(), Node()
+x.other, y.other = y, x
+rx = weakref.ref(x)
+del x, y
+print(rx() is not None)     # True: the cycle is still in memory
+print(gc.collect())         # 9 unreachable objects found
+print(rx() is not None)     # False: the cycle GC freed it</code></pre>
+    <p>Then we built many cycles and timed a full collection (<code>gc.collect()</code>):</p>
+    <table>
+      <thead><tr><th>Cycles (2 objects each)</th><th>Full collect, all still alive</th><th>Full collect after dropping them</th><th>Objects freed</th></tr></thead>
+      <tbody>
+        <tr><td>100,000</td><td>13 ms</td><td>19 ms</td><td>199,998</td></tr>
+        <tr><td>1,000,000</td><td>169 ms</td><td>200 ms</td><td>1,999,998</td></tr>
+      </tbody>
+    </table>
+    <p>Three lessons:</p>
+    <ul>
+      <li><strong>Cost grows with the number of objects.</strong> Ten times the objects took about ten times as long. A full collection over millions of objects is a pause your users feel.</li>
+      <li><strong>Live objects cost time too.</strong> Even when nothing was garbage, the GC spent 169 ms walking 2,000,000 live objects. Big long-lived caches of small Python objects make every full collection slower.</li>
+      <li><strong>Why 1,999,998 and not 2,000,000?</strong> The loop variables <code>p</code> and <code>q</code> still pointed at the last pair, so those two were still reachable. The GC is exact about reachability.</li>
+    </ul>
+    <p>A common trick in big Python services: after loading a large, permanent data set at startup, call <code>gc.freeze()</code>. This moves everything into a permanent generation that later collections skip.</p>
+  </section>
+
+  <section id="runtimes">
+    <h2>13. Java, Go, Node and Rust</h2>
+    <table>
+      <thead><tr><th>Runtime</th><th>How memory is freed</th><th>Main knob</th></tr></thead>
+      <tbody>
+        <tr><td>CPython</td><td>Reference counting, plus a generational cycle collector</td><td><code>gc.set_threshold</code>, <code>gc.freeze()</code></td></tr>
+        <tr><td>Java (JVM)</td><td>Generational tracing. G1 is the default collector; ZGC and Shenandoah aim for pauses of a few milliseconds even on very big heaps</td><td><code>-Xmx</code> (max heap) or <code>-XX:MaxRAMPercentage</code></td></tr>
+        <tr><td>Go</td><td>Concurrent mark and sweep, not generational, does not move objects</td><td><code>GOGC</code> (default 100: start a cycle when the heap has grown 100% since the last one) and <code>GOMEMLIMIT</code> (a soft cap on total memory)</td></tr>
+        <tr><td>Node.js (V8)</td><td>Generational: a copying collector for the young space, mark-compact for the old space</td><td><code>--max-old-space-size</code> (in MB)</td></tr>
+        <tr><td>Rust</td><td>No GC. The compiler tracks who <strong>owns</strong> each value and inserts the free when the owner goes out of scope. Shared ownership uses reference counting (<code>Rc</code>, <code>Arc</code>)</td><td>None needed</td></tr>
+      </tbody>
+    </table>
+    <p>Go's <code>GOGC</code> rule, worked: after a GC, 200 MB is live. With <code>GOGC=100</code>, the next cycle starts at 200 + 100% &times; 200 = 400 MB. With <code>GOGC=50</code>, at 300 MB (more GC work, less memory). With <code>GOGC=200</code>, at 600 MB (less GC work, more memory). It is always a trade of CPU for RAM.</p>
+  </section>
+
+  <section id="production">
+    <h2>14. GC in Production and in Containers</h2>
+    <h3>14.1 Pauses show up in p99, not in the average</h3>
+    <p>Say a service handles 1,000 requests per second, each in 5 ms. Every 10 seconds the GC pauses for 150 ms. In those 150 ms, about 150 requests arrive and wait. That is 150 out of 10,000, or 1.5% of requests, each delayed by up to 150 ms. The average barely moves. The p99 (the time that 99% of requests beat) jumps from about 5 ms to well over 100 ms. When p99 has a spike pattern every few seconds, check GC logs first.</p>
+    <h3>14.2 Tell the runtime about the container limit</h3>
+    <p>A container limit is enforced by the kernel through a <a href="../../../Docker-Kubernetes/learn/Docker/containers-under-the-hood.html">cgroup</a>. If the runtime's own heap limit is bigger than the container limit, the runtime happily grows past the limit and the kernel kills it (OOMKilled). Leave room for things outside the heap too: thread stacks, native libraries, buffers, and the allocator's own fragmentation.</p>
+    <table>
+      <thead><tr><th>Runtime</th><th>Setting for a 1 GiB container</th></tr></thead>
+      <tbody>
+        <tr><td>Java</td><td><code>-XX:MaxRAMPercentage=75</code> (heap up to about 768 MiB). Modern JVMs read the cgroup limit; the default is only 25%.</td></tr>
+        <tr><td>Go</td><td><code>GOMEMLIMIT=800MiB</code>. The GC works harder as it nears this number instead of growing past it.</td></tr>
+        <tr><td>Node.js</td><td><code>--max-old-space-size=768</code></td></tr>
+        <tr><td>Python</td><td>No heap cap. Watch RSS, avoid giant caches of small objects, and consider <code>gc.freeze()</code> after startup.</td></tr>
+      </tbody>
+    </table>
+    <h3>14.3 Leak or fragmentation? A quick test</h3>
+    <ol>
+      <li>Put the service under steady, constant load for an hour.</li>
+      <li>If RSS keeps <strong>climbing</strong> in a straight line, it is a leak. Find it with a heap profiler (<code>tracemalloc</code> in Python, a heap dump in Java, <code>pprof</code> in Go). The <a href="../Scenarios/scenario-pod-oomkilled-memory-leak.html">OOMKilled scenario</a> walks through one.</li>
+      <li>If RSS jumps during a spike and then stays <strong>flat</strong>, it is likely fragmentation or the runtime keeping freed memory for reuse. Fixes: reuse buffers, avoid many tiny long-lived objects, try jemalloc (for C/C++/Python with <code>LD_PRELOAD</code>), or set <code>MALLOC_ARENA_MAX=2</code> for glibc programs with many threads.</li>
+    </ol>
+  </section>
+
+  <section id="pitfalls">
+    <h2>15. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Returning a pointer to a local variable</strong> in C. The frame is gone when the function returns.</li>
+      <li><strong>Calling "it did not go down" a leak.</strong> Check whether it keeps going up under steady load.</li>
+      <li><strong>Unbounded caches.</strong> A dict used as a cache with no size limit is a leak with a nice name. Use an LRU cache with a <code>maxsize</code>.</li>
+      <li><strong>Calling <code>gc.collect()</code> in a request path.</strong> A full collection over millions of objects took 200 ms in our lab.</li>
+      <li><strong>Heap limit equal to the container limit.</strong> The heap is not the only memory. Leave 20 to 25% for everything else.</li>
+      <li><strong>Allocating in a hot loop.</strong> Making a new buffer per item is slower than reusing one, and it feeds the GC.</li>
+      <li><strong>Forgetting that closures and listeners hold references.</strong> An event listener that is never removed keeps its whole object graph alive, even in GC languages.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>16. Practice Problems</h2>
+    <h3>Problem 1: chunk sizes</h3>
+    <p>On 64-bit glibc, what chunk size does <code>malloc(24)</code> use? And <code>malloc(40)</code>? (Hint: add 8, round up to a multiple of 16, and the smallest chunk is 32.)</p>
+    <details>
+      <summary>Solution</summary>
+      <p><code>malloc(24)</code>: 24 + 8 = 32, already a multiple of 16, so <strong>32 bytes</strong>. (glibc can also borrow 8 bytes from the next chunk's header area, which is why 24 fits exactly.) <code>malloc(40)</code>: 40 + 8 = 48, so <strong>48 bytes</strong>.</p>
+    </details>
+    <h3>Problem 2: first fit</h3>
+    <p>A 100-byte heap. Run: A = malloc(30), B = malloc(30), C = malloc(30), free(A), free(C), D = malloc(40). Ignore headers. Does D succeed?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>After the frees the layout is [free 30][B 30][free 30][free 10]. The last two holes are neighbors, so a coalescing allocator joins them: [free 30][B 30][free 40]. D = 40 fits in that last hole. <strong>Yes</strong>, but only because of coalescing. Without it, the biggest hole is 30 and D fails, even though 70 bytes are free.</p>
+    </details>
+    <h3>Problem 3: mark and sweep</h3>
+    <p>Roots point to P. P points to Q. Q points to P. R points to S. S points to Q. Which objects are freed?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Marked from the root: P, then Q (and Q back to P, already marked). Not reached: <strong>R and S</strong>. They are freed. S points to Q, but that does not matter: pointers <em>into</em> live objects do not keep the pointer's owner alive.</p>
+    </details>
+    <h3>Problem 4: reference counting</h3>
+    <p>Which of these does pure reference counting free? (a) A list that nothing points to. (b) A list that contains itself (<code>L.append(L)</code>) after <code>del L</code>. (c) Two objects that point to each other while a global variable points to one of them.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>(a) Yes, count 0. (b) No: the list points to itself, so its count stays 1. It is a cycle of one; the cycle GC must clean it. (c) Neither is garbage: the global keeps one alive, and that one keeps the other alive. Nothing should be freed.</p>
+    </details>
+    <h3>Problem 5: Go GOGC</h3>
+    <p>After a GC, 300 MB is live. <code>GOGC=100</code> and <code>GOMEMLIMIT=500MiB</code>. When does the next cycle start, roughly?</p>
+    <details>
+      <summary>Solution</summary>
+      <p><code>GOGC</code> alone says 300 + 300 = 600 MB. But the memory limit is about 500 MiB, so the GC starts earlier to stay under it, at roughly 500 MiB (a little less, since other runtime memory counts too). The limit wins when it is lower.</p>
+    </details>
+    <h3>Problem 6: leak or not</h3>
+    <p>A Python service: RSS goes from 300 MB to 900 MB during a nightly import, then stays at 900 MB all day with normal traffic. Leak?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Probably not. A leak would keep growing during the day. Flat after a spike points to memory that was freed inside the process but not returned (fragmentation, like the lab), or to objects the import left in a global. Check with <code>tracemalloc</code> snapshots before and after the import. If the import keeps a reference to its data, drop it. If not, run the import in a separate worker process that exits when done, so all its memory goes back to the kernel.</p>
+    </details>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>17. Cheat Sheet</h2>
+    <pre><code># where memory lives
+stack   per call, freed on return, fast, small (ulimit -s)
+heap    malloc/new, lives until freed or collected
+mmap    big blocks (&gt;= 128 KB in glibc), returned at once on free
+
+# glibc chunk size (64-bit)
+size = roundup16(request + 8), minimum 32
+malloc(100) -&gt; 112 bytes
+
+# leak vs fragmentation (steady load)
+RSS keeps climbing          -&gt; leak, use a heap profiler
+RSS jumps, then flat        -&gt; fragmentation or retained free memory
+
+# who frees memory
+C / C++     you (free / delete), or smart pointers
+CPython     ref counting + cycle GC (thresholds 2000, 10, 10 in 3.13)
+Java        generational tracing (G1 default; ZGC for tiny pauses)
+Go          concurrent mark-sweep; GOGC, GOMEMLIMIT
+Node        generational; --max-old-space-size
+Rust        ownership; Rc / Arc when shared
+
+# container settings (1 GiB limit)
+-XX:MaxRAMPercentage=75   GOMEMLIMIT=800MiB   --max-old-space-size=768
+
+# tools
+cat /proc/PID/maps     cat /proc/PID/status (VmRSS)
+valgrind ./app         gcc -fsanitize=address
+python: tracemalloc, gc.collect(), gc.freeze()</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://sourceware.org/glibc/wiki/MallocInternals" rel="noopener noreferrer">glibc wiki: Malloc internals</a> &middot; <a href="https://man7.org/linux/man-pages/man3/mallopt.3.html" rel="noopener noreferrer">mallopt(3): M_MMAP_THRESHOLD</a> &middot; <a href="https://docs.python.org/3/library/gc.html" rel="noopener noreferrer">Python gc module</a> &middot; <a href="https://go.dev/doc/gc-guide" rel="noopener noreferrer">A Guide to the Go Garbage Collector</a> &middot; <a href="https://docs.oracle.com/en/java/javase/21/gctuning/" rel="noopener noreferrer">Java 21 GC tuning guide</a> &middot; <a href="https://v8.dev/blog/trash-talk" rel="noopener noreferrer">V8: Trash talk (the Orinoco GC)</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="os-virtual-memory-paging.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Virtual Memory &amp; Paging</span></a>
+    <a class="prev-next-next" href="os-cpu-caches-memory-hierarchy.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">CPU Caches &amp; the Memory Hierarchy</span></a>
+    <p class="prev-next-step">Page 4 of 27 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="os-virtual-memory-paging.html">Virtual Memory &amp; Paging</a> &middot; <a href="os-cpu-caches-memory-hierarchy.html">CPU Caches &amp; the Memory Hierarchy</a> &middot; <a href="os-system-calls.html">System Calls</a> &middot; <a href="../Scenarios/scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

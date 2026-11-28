@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>Scenario: The Disk Is Full | CS Fundamentals</title>
+  <meta name="description" content="A production scenario: No space left on device at 3 AM. The first five minutes, why df and du disagree (a lab where deleting a 64 MB log freed 0 bytes until the process let go), inode exhaustion (a lab that failed at file 2,046 with 57 MB still free), reserved blocks, hidden files under mount points, the usual culprits (logs and log rotation, journald, Docker images and container logs, Kubernetes ephemeral storage and DiskPressure eviction, a PostgreSQL replication slot holding WAL), time-to-full math, safe fixes in order, and alerts that fire before it happens.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; Scenario: The Disk Is Full</p>
+  </nav>
+  <h1>Scenario: The Disk Is Full</h1>
+  <p>At 03:10 the pager goes off. The API returns errors, the database log says "No space left on device", and someone already deleted a big log file but the disk is still at 100%. This page walks through that night step by step, with two labs you can run yourself, the usual culprits on Linux servers, Docker hosts, Kubernetes nodes and PostgreSQL, and the alerts that would have woken you up two days earlier. It builds on <a href="../Operating-Systems/os-file-systems-io.html">File Systems &amp; Disk I/O</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#incident">The Incident</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#first-five">The First Five Minutes</a></li>
+    <li><a href="#deleted-open">Lab 1: Deleted, but Still Using Space</a></li>
+    <li><a href="#inodes">Lab 2: Full With Space Left (Inodes)</a></li>
+    <li><a href="#other-gaps">Other Reasons df and du Disagree</a></li>
+    <li><a href="#find">Finding What Is Big</a></li>
+    <li><a href="#culprits">The Usual Culprits</a></li>
+    <li><a href="#postgres">The Database Case: WAL That Will Not Go Away</a></li>
+    <li><a href="#math">Time-to-Full Math</a></li>
+    <li><a href="#fix">The Fix, in Order</a></li>
+    <li><a href="#prevent">Prevention and Alerts</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="incident">
+    <h2>1. The Incident</h2>
+    <pre><code>03:10  alert: api error rate 34%
+03:11  api logs:  OSError: [Errno 28] No space left on device: '/var/lib/app/uploads/tmp...'
+03:12  postgres:  PANIC: could not write to file "pg_wal/xlogtemp.123": No space left on device
+03:14  on-call runs df -h:   /dev/nvme0n1p1  100G  100G  0  100%  /
+03:16  on-call deletes /var/log/app/app.log (41 GB)
+03:17  df -h still says 100%.  Nothing changed.</code></pre>
+    <p>Two facts look impossible at 03:17. A 41 GB file was deleted and no space came back. Later, after things are fixed, <code>du</code> will say the whole disk only holds 52 GB of files, but <code>df</code> says 100 GB is used. Both make sense once you know how files are stored. Errno 28 (<code>ENOSPC</code>) is the error code behind "No space left on device", and you will see it from every program that tries to write.</p>
+    <p>Why does a full disk break so much at once? Almost everything writes: databases write their log before every commit, apps write temp files and logs, package managers and containers unpack files. When the disk is full, all of them fail together, and often in confusing ways (a database may even shut itself down to protect your data).</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>File system.</strong> The structure on a disk that stores files and folders (ext4, XFS, tmpfs). Each one is <strong>mounted</strong> at a folder, like <code>/</code> or <code>/var/lib/docker</code>.</li>
+      <li><strong>Block.</strong> The unit of disk space, usually 4 KB. A 1-byte file still uses one block.</li>
+      <li><strong>Inode.</strong> A small record for each file that holds its size, owner, permissions and where its blocks are. The file's name is <em>not</em> in the inode; names live in directories and point to inodes. Many file systems create a fixed number of inodes when they are formatted.</li>
+      <li><strong>Link count.</strong> How many names point to an inode. <code>rm</code> removes a name and lowers the count. The data is only freed when the count is 0 <em>and</em> no process has the file open.</li>
+      <li><strong>File descriptor.</strong> A number a process uses to refer to a file it has open. While a descriptor is open, the file's data stays, even with no name.</li>
+      <li><strong><code>df</code></strong> asks the file system "how many blocks are used in total?" <strong><code>du</code></strong> walks the folders, adds up the files it can find by name. They answer different questions.</li>
+      <li><strong>Ephemeral storage.</strong> In Kubernetes, the node's local disk that pods use for logs, writable container layers and <code>emptyDir</code> volumes. It disappears with the pod.</li>
+    </ul>
+  </section>
+
+  <section id="first-five">
+    <h2>3. The First Five Minutes</h2>
+    <p>Do these in order. Each one takes seconds.</p>
+    <pre><code># 1. which file system is full? (bytes)
+df -h
+
+# 2. is it really inodes?
+df -i
+
+# 3. which top-level folder is big? (-x: do not cross into other file systems)
+sudo du -xh --max-depth=1 / 2&gt;/dev/null | sort -h | tail -15
+
+# 4. does du add up to much less than df? look for deleted-but-open files
+sudo lsof +L1 2&gt;/dev/null | sort -k7 -n | tail
+
+# 5. what is still writing right now?
+sudo iotop -o -b -n 3      # or: pidstat -d 1 5</code></pre>
+    <p>Step 1 tells you <em>where</em>. Step 2 tells you <em>what kind</em> of full. Step 3 finds normal big files. Step 4 finds the invisible ones. Step 5 tells you what will refill the disk two minutes after you clean it, which matters more than anything you delete.</p>
+    <div class="callout">
+      <p><strong>Priority.</strong> First, stop the bleeding: free a few GB safely so the database and app can write again (section 11). Then find the root cause. Do not start by deleting things you do not understand under <code>/var/lib</code>.</p>
+    </div>
+  </section>
+
+  <section id="deleted-open">
+    <h2>4. Lab 1: Deleted, but Still Using Space</h2>
+    <p>This is what happened at 03:16. We reproduced it on Linux with a small 64 MB file system (a <code>tmpfs</code> mounted at <code>/mnt/lab</code>), so it fills in seconds:</p>
+    <pre><code class="language-bash">sudo mount -t tmpfs -o size=64M,nr_inodes=2048,uid=$(id -u) tmpfs /mnt/lab
+
+# a "logger" that keeps the file open and writes 1 MB at a time until it fails
+python3 - &lt;&lt;'EOF' &amp;
+f = open('/mnt/lab/app.log', 'wb')
+try:
+    while True: f.write(b'x' * 1048576); f.flush()
+except OSError as e: print("writer error:", e)
+import time; time.sleep(60)          # keep the file open, like a real server
+EOF</code></pre>
+    <p>The real output, step by step:</p>
+    <pre><code>writer error: [Errno 28] No space left on device
+
+$ df -h /mnt/lab
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            64M   64M     0 100% /mnt/lab
+
+$ echo hello &gt; /mnt/lab/new.txt
+echo: write error: No space left on device
+
+$ rm /mnt/lab/app.log           # "delete the big log"
+
+$ df -h /mnt/lab
+tmpfs            64M   64M     0 100% /mnt/lab      &lt;- still full!
+
+$ du -sh /mnt/lab
+0       /mnt/lab                                     &lt;- du sees nothing
+
+$ sudo lsof +L1 /mnt/lab
+COMMAND   PID   USER  FD  TYPE DEVICE  SIZE/OFF NLINK NODE NAME
+python3 67144   box   3w  REG  0,51    67108864     0    2 /mnt/lab/app.log (deleted)</code></pre>
+    <p>Read the <code>lsof</code> line: process 67144 has the file open as descriptor 3, for writing (<code>3w</code>). Its size is 67,108,864 bytes (64 MB). <code>NLINK 0</code> means no name points to it any more. That is why <code>du</code>, which finds files by name, sees 0, while <code>df</code>, which counts used blocks, sees 64 MB.</p>
+    <pre><code>  before rm                         after rm
+  directory /mnt/lab                directory /mnt/lab
+    "app.log" --&gt; inode 2             (no entry)       inode 2   &lt;-- fd 3 of PID 67144
+                    |                                    |
+                 64 MB of blocks                      64 MB of blocks  (still used!)</code></pre>
+    <p>Two ways to get the space back:</p>
+    <pre><code class="language-bash"># A: truncate the file through the process's descriptor (no restart needed)
+: &gt; /proc/67144/fd/3
+df -h /mnt/lab
+tmpfs            64M     0   64M   0% /mnt/lab       &lt;- space is back
+
+# B: restart (or signal) the process so it closes the file
+kill 67144              # or: systemctl restart app, or send SIGHUP if it reopens logs</code></pre>
+    <p>Option A gave back all 64 MB instantly in our lab. Use it for log files, never for database files. Option B is the real fix: a process should not hold a deleted log open. That happens when a log is deleted (or rotated) by hand but the program is never told to reopen it.</p>
+    <div class="callout">
+      <p><strong>The headline.</strong> Deleting a file that a process still has open frees <strong>nothing</strong> until the process closes it. To empty a live log, truncate it (<code>: &gt; app.log</code> or <code>truncate -s 0 app.log</code>) instead of deleting it. If you already deleted it, find it with <code>lsof +L1</code>.</p>
+    </div>
+  </section>
+
+  <section id="inodes">
+    <h2>5. Lab 2: Full With Space Left (Inodes)</h2>
+    <p>Same 64 MB file system, which has room for only 2,048 inodes. We created many tiny files, as a session store or a mail queue would:</p>
+    <pre><code class="language-bash">mkdir /mnt/lab/sess
+for i in $(seq 1 2100); do echo s &gt; /mnt/lab/sess/s$i || { echo "failed at file $i"; break; }; done</code></pre>
+    <pre><code>bash: /mnt/lab/sess/s2046: No space left on device
+failed at file 2046
+
+$ df -h /mnt/lab
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            64M  8.0M   57M  13% /mnt/lab        &lt;- 57 MB free!
+
+$ df -i /mnt/lab
+Filesystem     Inodes IUsed IFree IUse% Mounted on
+tmpfs            2048  2048     0  100% /mnt/lab       &lt;- no inodes left</code></pre>
+    <p>The same error message, "No space left on device", with 57 MB free. Every file needs one inode; the root folder and the <code>sess</code> folder used 2, so file number 2,046 was the first one with no inode left. The 8 MB used is 2,045 files &times; one 4 KB page each.</p>
+    <p>On real ext4 disks the inode count is set when the disk is formatted (by default about one inode per 16 KB of space), and you cannot add more later without reformatting. Fixes: delete the tiny files (old sessions, cache entries, a stuck mail queue), find which folder has millions of them, and change the app to store them in a database or a few big files. XFS and Btrfs allocate inodes on demand, so this is mostly an ext4 problem.</p>
+    <pre><code class="language-bash"># which folders hold the most files (inodes)?
+sudo du --inodes -x / 2&gt;/dev/null | sort -n | tail -10</code></pre>
+  </section>
+
+  <section id="other-gaps">
+    <h2>6. Other Reasons df and du Disagree</h2>
+    <table>
+      <thead><tr><th>Cause</th><th>What you see</th><th>How to check</th></tr></thead>
+      <tbody>
+        <tr><td>Deleted-but-open files</td><td>df much higher than du</td><td><code>lsof +L1</code></td></tr>
+        <tr><td><strong>Reserved blocks</strong> (ext4 keeps 5% for root by default)</td><td>Size minus Used is more than Avail. On a 1 TB disk, 50 GB is held back. Normal users get ENOSPC while root can still write</td><td><code>sudo tune2fs -l /dev/sdX1 | grep -i reserved</code></td></tr>
+        <tr><td><strong>Files hidden under a mount point</strong></td><td>Something wrote into <code>/data</code> before the disk was mounted there. The mount now covers those files, so du cannot see them, but they use space on the root disk</td><td><code>sudo mount --bind / /mnt/rootonly</code>, then <code>du -sh /mnt/rootonly/data</code></td></tr>
+        <tr><td>Sparse files</td><td>du lower than <code>ls -l</code> says (a VM disk image of "100 GB" that only uses 3 GB)</td><td><code>du -h --apparent-size</code> vs <code>du -h</code></td></tr>
+        <tr><td>Snapshots (Btrfs, ZFS, LVM)</td><td>Deleted files still in an old snapshot</td><td>The file system's snapshot list</td></tr>
+      </tbody>
+    </table>
+    <p>The reserved 5% is there on purpose: it lets root log in and clean up, and keeps system services alive when users fill the disk. On a big data-only disk you can lower it with <code>sudo tune2fs -m 1 /dev/sdX1</code> (1%).</p>
+  </section>
+
+  <section id="find">
+    <h2>7. Finding What Is Big</h2>
+    <pre><code class="language-bash"># biggest folders, one level at a time (drill down by changing the path)
+sudo du -xh --max-depth=1 /var 2&gt;/dev/null | sort -h | tail
+
+# biggest single files on this file system
+sudo find / -xdev -type f -size +1G -printf '%s\t%p\n' 2&gt;/dev/null | sort -n | tail | numfmt --field=1 --to=iec
+
+# files changed in the last hour (what is growing right now?)
+sudo find /var -xdev -type f -mmin -60 -size +100M -ls 2&gt;/dev/null
+
+# interactive browser, if installed
+sudo ncdu -x /</code></pre>
+    <p>The <code>-x</code> / <code>-xdev</code> flag is important. Without it, <code>du /</code> also walks other mounted disks, network shares and <code>/proc</code>, which is slow and confusing. You want only the full file system.</p>
+  </section>
+
+  <section id="culprits">
+    <h2>8. The Usual Culprits</h2>
+    <h3>8.1 Application logs and broken rotation</h3>
+    <p><strong>Log rotation</strong> means: every day (or every 100 MB), rename the current log, start a new one, compress old ones, and delete the oldest. On Linux, <code>logrotate</code> does this. There are two styles, and the wrong one causes Lab 1:</p>
+    <table>
+      <thead><tr><th>Style</th><th>How it works</th><th>Catch</th></tr></thead>
+      <tbody>
+        <tr><td><code>create</code> (default)</td><td>Rename <code>app.log</code> to <code>app.log.1</code>, create a new empty <code>app.log</code>, then run <code>postrotate</code> (usually a signal like SIGHUP) so the app reopens its log</td><td>If the app ignores the signal, it keeps writing to <code>app.log.1</code>, which is later deleted while still open</td></tr>
+        <tr><td><code>copytruncate</code></td><td>Copy <code>app.log</code> to <code>app.log.1</code>, then truncate <code>app.log</code> to 0 in place</td><td>Works with apps that never reopen. Lines written between the copy and the truncate are lost, and the copy briefly needs double the space</td></tr>
+      </tbody>
+    </table>
+    <pre><code># /etc/logrotate.d/app
+/var/log/app/*.log {
+    daily
+    rotate 7            # keep 7 old files
+    maxsize 500M        # rotate early if a file passes 500 MB
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate        # the app cannot reopen its log on a signal
+}</code></pre>
+    <p>A debug log level left on after an incident is the classic source: 10 times more lines, and nobody notices until the disk fills.</p>
+    <h3>8.2 The systemd journal</h3>
+    <pre><code>journalctl --disk-usage                     # how big is it?
+sudo journalctl --vacuum-size=1G            # shrink it now
+# keep it capped: in /etc/systemd/journald.conf
+SystemMaxUse=1G</code></pre>
+    <h3>8.3 Docker hosts</h3>
+    <pre><code>docker system df                            # images, containers, volumes, build cache
+docker image prune -a --filter "until=168h" # unused images older than 7 days
+docker builder prune                        # build cache (often many GB on CI runners)
+sudo du -sh /var/lib/docker/containers/*/*-json.log | sort -h | tail   # container logs</code></pre>
+    <p>The default Docker log driver (<code>json-file</code>) does <strong>not</strong> rotate. A chatty container can write a 50 GB log under <code>/var/lib/docker/containers/</code>. Cap it for new containers in <code>/etc/docker/daemon.json</code>:</p>
+    <pre><code class="language-json">{ "log-driver": "json-file", "log-opts": { "max-size": "10m", "max-file": "3" } }</code></pre>
+    <p>See <a href="../../../Docker-Kubernetes/learn/Docker/docker-advanced.html">Advanced Docker</a> for smaller images, which also means less disk.</p>
+    <h3>8.4 Kubernetes nodes</h3>
+    <p>The kubelet watches the node's disk and acts before it is completely full. Default hard eviction thresholds on Linux:</p>
+    <table>
+      <thead><tr><th>Signal</th><th>Default threshold</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>nodefs.available</code></td><td>&lt; 10%</td><td>The node's main disk (logs, emptyDir, kubelet data)</td></tr>
+        <tr><td><code>imagefs.available</code></td><td>&lt; 15%</td><td>Where container images and writable layers live</td></tr>
+        <tr><td><code>nodefs.inodesFree</code></td><td>&lt; 5%</td><td>Inodes on the main disk</td></tr>
+      </tbody>
+    </table>
+    <p>When a threshold is crossed:</p>
+    <ol>
+      <li>The node gets the condition <code>DiskPressure=True</code> and a taint, so no new pods are scheduled there.</li>
+      <li>The kubelet deletes unused images. Separately, image cleanup also runs whenever image disk use passes 85% (<code>imageGCHighThresholdPercent</code>), until it is back to 80%.</li>
+      <li>If that is not enough, it <strong>evicts pods</strong>, starting with those using the most disk compared to what they requested. The pod's status says <code>The node was low on resource: ephemeral-storage</code>.</li>
+    </ol>
+    <pre><code class="language-yaml">resources:
+  requests:
+    ephemeral-storage: "1Gi"
+  limits:
+    ephemeral-storage: "4Gi"     # this pod is evicted if it uses more
+volumes:
+- name: scratch
+  emptyDir:
+    sizeLimit: 2Gi               # cap one emptyDir</code></pre>
+    <p>Set these so one noisy pod (a model download, a runaway debug log, a big temp file) is evicted alone, instead of filling the node and getting everything evicted. The kubelet also rotates container logs (by default at 10 Mi, keeping 5 files), so <code>kubectl logs</code> output is bounded per container. See <a href="../../../Docker-Kubernetes/learn/Kubernetes/kubernetes-scheduling.html">Scheduling</a> for eviction order and taints.</p>
+  </section>
+
+  <section id="postgres">
+    <h2>9. The Database Case: WAL That Will Not Go Away</h2>
+    <p>Back to our incident. After freeing space, <code>du</code> shows <code>/var/lib/postgresql/17/main/pg_wal</code> at 38 GB. Normally it is 1 to 2 GB.</p>
+    <p>PostgreSQL writes every change to its <strong>write-ahead log</strong> (WAL) before changing the data files (see <a href="../Databases/dbms-transactions-isolation-mvcc.html">Transactions</a>). Old WAL files are deleted once they are no longer needed. Two things can make them "needed" forever:</p>
+    <ul>
+      <li>A <strong>replication slot</strong> whose replica is gone. A slot promises "I will keep all WAL until this replica has read it" (see <a href="../Databases/dbms-replication-sharding-cap.html">Replication</a>). If the replica was deleted months ago but the slot was not, WAL piles up without limit.</li>
+      <li>A failing <strong>archive_command</strong> (the command that copies WAL to backup storage). WAL is kept until it has been archived successfully.</li>
+    </ul>
+    <pre><code class="language-sql">-- which slots hold WAL, and how much?
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots;
+
+--  slot_name        | active | retained
+-- ------------------+--------+----------
+--  replica_old_dc   | f      | 36 GB      &lt;- inactive, holding 36 GB
+
+-- is archiving failing?
+SELECT archived_count, failed_count, last_failed_wal, last_failed_time
+FROM pg_stat_archiver;</code></pre>
+    <p>The fix for a dead slot is to drop it, after confirming no replica uses it: <code>SELECT pg_drop_replication_slot('replica_old_dc');</code>. PostgreSQL then removes the old WAL at the next checkpoint. To stop it from happening again, set <code>max_slot_wal_keep_size</code> (for example <code>'20GB'</code>): a slot that falls further behind is invalidated instead of filling the disk.</p>
+    <div class="callout">
+      <p><strong>Never delete files in <code>pg_wal</code> by hand.</strong> Those files may be needed to recover after a crash. Deleting them can corrupt the database. The same goes for MySQL binary logs (use <code>PURGE BINARY LOGS</code>) and Kafka segments (use retention settings).</p>
+    </div>
+  </section>
+
+  <section id="math">
+    <h2>10. Time-to-Full Math</h2>
+    <p>The night could have been a calm afternoon. Here is the simple math an alert can do.</p>
+    <pre><code>disk size            100 GB
+free right now        20 GB
+growth (last 6 h)      2 GB per hour
+
+time to full  =  free / growth  =  20 / 2  =  10 hours</code></pre>
+    <p>A fixed threshold ("alert at 90%") is a poor fit for both slow and fast growth. On a disk that grows 1 GB a month, 90% might be a year away. On a disk filling at 10 GB an hour, 90% gives you one hour, at night. Alert on <em>time to full</em> instead. In Prometheus with node_exporter:</p>
+    <pre><code># fire if, at the trend of the last 6 hours, the disk is full within 24 hours
+predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[6h], 24 * 3600) &lt; 0
+
+# and the inode version
+predict_linear(node_filesystem_files_free{fstype!~"tmpfs|overlay"}[6h], 24 * 3600) &lt; 0</code></pre>
+    <p><code>predict_linear</code> draws a straight line through the last 6 hours of free space and asks where it will be in 24 hours. Pair it with a plain "free &lt; 5%" alert as a safety net for sudden jumps.</p>
+  </section>
+
+  <section id="fix">
+    <h2>11. The Fix, in Order</h2>
+    <ol>
+      <li><strong>Make a little room safely.</strong> Truncate (do not delete) the biggest live log: <code>sudo truncate -s 0 /var/log/app/app.log</code>. Vacuum the journal. Prune unused Docker images. A few GB is enough to let the database and app write again.</li>
+      <li><strong>Stop the source.</strong> Find what is writing (<code>iotop</code>, <code>pidstat -d</code>, files with recent <code>-mmin</code>). Turn the debug log level off, stop the runaway job, or cap it.</li>
+      <li><strong>Release deleted-but-open files.</strong> <code>lsof +L1</code>, then restart or signal those processes (or truncate through <code>/proc/&lt;pid&gt;/fd/&lt;n&gt;</code> for logs).</li>
+      <li><strong>Check the database.</strong> Did it shut down? Is WAL held by a slot or failed archiving? Fix with SQL, not <code>rm</code>.</li>
+      <li><strong>Grow the disk if needed.</strong> Cloud disks can usually be enlarged live: grow the volume, then the partition (<code>growpart</code>), then the file system (<code>resize2fs</code> for ext4, <code>xfs_growfs</code> for XFS).</li>
+      <li><strong>Write down the cause and add the alert</strong> that would have caught it (section 12).</li>
+    </ol>
+    <p>In our incident: truncating the app log freed 41 GB (it had been deleted while open, so we truncated it through <code>/proc</code>), the debug flag was turned off, the old replication slot was dropped (36 GB back), and <code>max_slot_wal_keep_size</code> and a time-to-full alert were added the next morning.</p>
+  </section>
+
+  <section id="prevent">
+    <h2>12. Prevention and Alerts</h2>
+    <ul>
+      <li><strong>Separate disks for separate jobs.</strong> Put database data, logs and Docker storage on their own file systems. A runaway log then fills the log disk, not the database disk.</li>
+      <li><strong>Cap every log.</strong> logrotate with <code>maxsize</code>, journald <code>SystemMaxUse</code>, Docker <code>max-size</code>, and send app logs to a central system (stdout in containers) rather than local files.</li>
+      <li><strong>Limits on pods.</strong> <code>ephemeral-storage</code> requests and limits, and <code>emptyDir.sizeLimit</code>.</li>
+      <li><strong>Alerts on time to full</strong>, for bytes and inodes, plus a "slot inactive" and "archiver failing" alert for PostgreSQL.</li>
+      <li><strong>Clean up by policy.</strong> Retention for backups, build caches and temp folders (systemd-tmpfiles, object-storage lifecycle rules), not by hand at 3 AM.</li>
+      <li><strong>Practice.</strong> Fill a test disk on purpose (Lab 1 takes a minute) and see how each service fails. Some fail loudly, some silently drop data.</li>
+    </ul>
+  </section>
+
+  <section id="pitfalls">
+    <h2>13. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Deleting a live log.</strong> It frees nothing while the process holds it open. Truncate instead.</li>
+      <li><strong>Checking only <code>df -h</code>.</strong> "No space left" with free space means inodes. Run <code>df -i</code>.</li>
+      <li><strong>Running <code>du /</code> without <code>-x</code>.</strong> It crosses into other disks and <code>/proc</code>, and lies about where the space is.</li>
+      <li><strong>Deleting database files.</strong> Never <code>rm</code> WAL, binlogs or data files. Use the database's own commands.</li>
+      <li><strong>Cleaning without stopping the source.</strong> The disk refills in minutes and you lose the evidence.</li>
+      <li><strong>Forgetting reserved blocks and mounts.</strong> "Avail" is not "Size minus Used", and files can hide under a mount point.</li>
+      <li><strong><code>docker system prune -a --volumes</code> in a hurry.</strong> It also deletes unused volumes, which may hold data you wanted. Prune images and build cache first.</li>
+      <li><strong>Thresholds instead of trends.</strong> "90% full" is too late on a fast disk and too noisy on a slow one.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>14. Practice Problems</h2>
+    <h3>Problem 1</h3>
+    <p><code>df -h /</code> shows 200G size, 200G used, 0 available. <code>sudo du -xsh /</code> shows 120G. List three possible reasons for the 80 GB gap and the command to check each.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>(1) Deleted-but-open files: <code>sudo lsof +L1</code>. (2) Files hidden under a mount point: bind-mount <code>/</code> to <code>/mnt/rootonly</code> and run <code>du</code> there. (3) Snapshots on Btrfs/ZFS/LVM: list them. (Reserved blocks do not explain it here, because they show up as "Avail" being lower than "Size minus Used", not as "Used" being higher than du.)</p>
+    </details>
+    <h3>Problem 2</h3>
+    <p>An app says "No space left on device". <code>df -h</code> shows 40% used. What do you run next, and what are you likely to find?</p>
+    <details>
+      <summary>Solution</summary>
+      <p><code>df -i</code>. Likely 100% inode use from millions of tiny files: a session folder, a cache, a mail queue, or a temp folder nobody cleans. Find it with <code>sudo du --inodes -x / | sort -n | tail</code>.</p>
+    </details>
+    <h3>Problem 3</h3>
+    <p>A disk has 300 GB free and is filling at 25 GB per hour since a deploy 2 hours ago. When will it be full? Would an "85% full" alert on a 1 TB disk have fired yet?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>300 / 25 = <strong>12 hours</strong>. Used space is 1,000 - 300 = 700 GB = 70%, so the 85% alert has not fired. It will fire at 850 GB used, which is (850 - 700) / 25 = 6 hours from now, leaving only 6 hours. A <code>predict_linear</code> alert with a 24-hour look-ahead would already be firing.</p>
+    </details>
+    <h3>Problem 4</h3>
+    <p>A Kubernetes pod shows <code>Status: Failed, Reason: Evicted, Message: The node was low on resource: ephemeral-storage. Container trainer was using 38Gi, request is 0</code>. Explain and fix.</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The container wrote 38 GiB to local disk (probably model checkpoints or a dataset in its writable layer or an <code>emptyDir</code>). The node crossed its disk eviction threshold, and this pod was evicted first because it used the most disk compared with its request (0). Fix: write big files to a PersistentVolume or object storage, set <code>ephemeral-storage</code> requests and limits, and set <code>sizeLimit</code> on any <code>emptyDir</code>.</p>
+    </details>
+    <h3>Problem 5</h3>
+    <p>A colleague suggests freeing space on the database server with <code>rm /var/lib/postgresql/17/main/pg_wal/0000000100000A2*</code>. What do you say, and what do you check instead?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Stop: deleting WAL by hand can make the database unrecoverable after a crash and break replicas. Check <code>pg_replication_slots</code> for inactive slots holding WAL and <code>pg_stat_archiver</code> for failing archiving. Drop the dead slot or fix the archive command, and PostgreSQL removes old WAL itself at the next checkpoint.</p>
+    </details>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>15. Cheat Sheet</h2>
+    <pre><code># what is full?
+df -h                  bytes per file system
+df -i                  inodes per file system
+
+# where?
+sudo du -xh --max-depth=1 /path | sort -h | tail
+sudo du --inodes -x / | sort -n | tail
+sudo find / -xdev -type f -size +1G -ls
+sudo lsof +L1          deleted but still open (NLINK 0)
+
+# safe quick wins
+sudo truncate -s 0 /var/log/app/app.log       (never rm a live log)
+: &gt; /proc/PID/fd/N                             (log already deleted, still open)
+sudo journalctl --vacuum-size=1G
+docker image prune -a; docker builder prune
+
+# never
+rm on pg_wal, binlogs, database data files
+
+# PostgreSQL
+SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
+FROM pg_replication_slots;
+SELECT pg_drop_replication_slot('dead_slot');
+max_slot_wal_keep_size = '20GB'
+
+# Kubernetes
+kubectl describe node NODE | grep -i pressure
+resources.limits.ephemeral-storage, emptyDir.sizeLimit
+evictionHard defaults: nodefs.available&lt;10% imagefs.available&lt;15% nodefs.inodesFree&lt;5%
+
+# alert
+predict_linear(node_filesystem_avail_bytes[6h], 24*3600) &lt; 0</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://man7.org/linux/man-pages/man8/lsof.8.html" rel="noopener noreferrer">lsof(8)</a> &middot; <a href="https://man7.org/linux/man-pages/man8/logrotate.8.html" rel="noopener noreferrer">logrotate(8)</a> &middot; <a href="https://docs.docker.com/engine/logging/drivers/json-file/" rel="noopener noreferrer">Docker: json-file logging driver</a> &middot; <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" rel="noopener noreferrer">Kubernetes: Node-pressure eviction</a> &middot; <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage" rel="noopener noreferrer">Kubernetes: Local ephemeral storage</a> &middot; <a href="https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE" rel="noopener noreferrer">PostgreSQL: max_slot_wal_keep_size</a> &middot; <a href="https://prometheus.io/docs/prometheus/latest/querying/functions/#predict_linear" rel="noopener noreferrer">Prometheus: predict_linear</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="scenario-retry-storm.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Scenario: A Retry Storm Takes the Service Down</span></a>
+    <p class="prev-next-step">Page 27 of 27 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="../Operating-Systems/os-file-systems-io.html">File Systems &amp; Disk I/O</a> &middot; <a href="scenario-pod-oomkilled-memory-leak.html">Scenario: A Pod Keeps Getting OOMKilled</a> &middot; <a href="scenario-slow-api-debugging.html">Debugging a Slow API</a> &middot; <a href="../Databases/dbms-replication-sharding-cap.html">Replication, Sharding &amp; CAP</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -147,6 +147,14 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     <p>with RoPE applied inside the attention step to \(Q\) and \(K\) before the dot product, a causal mask applied to the scores, and GQA sharing K/V heads across groups of query heads for memory efficiency. Stack this block \(L\) times (32, 80, or more in production LLMs), and finish with a final normalization layer plus a linear projection to vocabulary-sized logits, and you have the complete architecture underlying essentially every modern LLM.</p>
   </section>
 
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="ai-engineering-foundations.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Neural Network and Deep Learning Foundations</span></a>
+    <a class="prev-next-next" href="ai-engineering-tokenization.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Tokenization</span></a>
+    <p class="prev-next-step">Page 5 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
   <nav class="page-footer-nav">
     <p><a class="interview-link" href="../../interview/Foundations-and-Architecture/ai-engineering-interview-transformers.html">Interview questions on Transformers</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>

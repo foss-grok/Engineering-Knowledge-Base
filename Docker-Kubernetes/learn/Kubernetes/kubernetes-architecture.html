@@ -372,7 +372,7 @@ spec:
     </ol>
 
     <h3>Level-triggered vs edge-triggered</h3>
-    <p>Kubernetes controllers are <strong>level-triggered</strong>: they reconcile the full desired state on every loop, not just the last change. If a Pod is deleted manually, the ReplicaSet controller recreates it without a new event. This makes the system resilient to missed events or restarts.</p>
+    <p>Kubernetes controllers are <strong>level-triggered</strong>: they reconcile the full desired state on every loop, not just the last change. If a Pod is deleted manually, the ReplicaSet controller recreates it without a new event. This makes the system resilient to missed events or restarts. You can write your own controllers for your own resource kinds; see <a href="kubernetes-operators-crds.html">Operators &amp; Custom Resources</a>.</p>
 
     <h3>Finalizers</h3>
     <p>Objects with <code>metadata.finalizers</code> cannot be deleted until each finalizer is removed by its controller. Used for graceful cleanup (e.g. removing LoadBalancer IPs, volume detachment).</p>
@@ -448,7 +448,7 @@ kubectl get pods -A</code></pre>
     <nav class="prev-next" aria-label="Reading order">
       <a class="prev-next-prev" href="../Docker/docker-advanced.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Advanced Docker</span></a>
       <a class="prev-next-next" href="kubernetes-workloads.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Kubernetes Workloads</span></a>
-      <p class="prev-next-step">Page 5 of 17 in the suggested reading order</p>
+      <p class="prev-next-step">Page 5 of 18 in the suggested reading order</p>
     </nav>
     <!-- prev-next:end -->
 

@@ -961,6 +961,17 @@ main section[id] {
   text-align: center;
 }
 
+/* Long reading orders on wide hub pages: two columns on big screens */
+@media (min-width: 1100px) {
+  main.wide .learning-path {
+    columns: 2;
+    column-gap: 2.5rem;
+  }
+  main.wide .learning-path li {
+    break-inside: avoid;
+  }
+}
+
 /* Section link ("#") after learn-page h2 headings (added by assets/site.js) */
 .learn-page .heading-anchor {
   margin-left: 0.45rem;

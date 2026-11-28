@@ -218,6 +218,14 @@ model.print_trainable_parameters()  # commonly ~0.05-0.5% of total weights</code
     <p>For hosted fine-tuning APIs (where a provider abstracts away the training infrastructure), the provider typically owns the training loop, hardware, and checkpoint storage, but you still own dataset quality, evaluation methodology, and rollback strategy - if a new fine-tune regresses a production metric after deployment, you need your own held-out evaluation suite and a fast rollback path to the previous checkpoint or adapter version, independent of whatever the provider offers.</p>
   </section>
 
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="ai-engineering-pretraining.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Pretraining</span></a>
+    <a class="prev-next-next" href="ai-engineering-post-training.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Post-Training and Alignment</span></a>
+    <p class="prev-next-step">Page 10 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
   <nav class="page-footer-nav">
     <p><a class="interview-link" href="../../interview/Training-Pipeline/ai-engineering-interview-fine-tuning.html">Interview questions on Fine-Tuning</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>
