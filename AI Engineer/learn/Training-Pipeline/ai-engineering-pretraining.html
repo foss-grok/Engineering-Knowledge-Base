@@ -260,6 +260,14 @@ v_t = &beta;2 v_{t-1} + (1-&beta;2) g_t^2
     <p>The pretrained checkpoint is a raw text-completion engine: prompted with a question, it is as likely to continue with a related but unhelpful continuation (e.g., a list of similar questions, as would appear on a web page) as with a direct answer. Converting it into a deployable assistant requires post-training, most commonly a pipeline of: <strong>supervised fine-tuning (SFT)</strong> on curated instruction-response pairs to establish the assistant "shape" of interaction; <strong>preference-based alignment</strong> (RLHF, or direct preference optimization variants) to shape style, helpfulness, and refusal behavior according to human or model-based preference judgments; and often further specialized stages (tool-use training, long-context fine-tuning, safety-specific fine-tuning) layered on top. Because pretraining sets the ceiling on latent capability, weaknesses introduced at the pretraining stage - gaps in domain coverage, tokenizer inefficiencies for a target language, insufficient code representation, contamination-inflated apparent capability - cannot be fully corrected by post-training, which motivates the very large engineering investment described in the sections above going into the pretraining stage itself.</p>
   </section>
 
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="../Foundations-and-Architecture/ai-engineering-decoding-sampling.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">Decoding &amp; Sampling: How an LLM Picks Each Token</span></a>
+    <a class="prev-next-next" href="ai-engineering-fine-tuning.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Fine-Tuning</span></a>
+    <p class="prev-next-step">Page 9 of 16 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
   <nav class="page-footer-nav">
     <p><a class="interview-link" href="../../interview/Training-Pipeline/ai-engineering-interview-pretraining.html">Interview questions on Pretraining</a></p>
     <p><a href="../../ai-engineering.html">Back to AI Engineering</a></p>

@@ -53,18 +53,18 @@ Open [http://localhost:8080](http://localhost:8080).
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`AI Engineer/ai-engineering.html`](AI%20Engineer/ai-engineering.html) | 1 |
-| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 33 |
+| Learn | [`AI Engineer/learn/`](AI%20Engineer/learn/) | 34 |
 | Interview | [`AI Engineer/interview/`](AI%20Engineer/interview/) | 24 |
 | Research | [`AI Engineer/research/`](AI%20Engineer/research/) | 2 |
 
-Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and-Retrieval/`).
+Topics are grouped by category (for example `Training-Pipeline/`, `Prompting-and-Retrieval/`). The learn hub has a suggested reading order from classical ML to LLM apps, and pages on it have Previous / Next links.
 
 ### CS Fundamentals
 
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`CS-Fundamentals/cs-fundamentals.html`](CS-Fundamentals/cs-fundamentals.html) | 1 |
-| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 24 |
+| Learn | [`CS-Fundamentals/learn/`](CS-Fundamentals/learn/) | 27 |
 
 Operating systems, databases, and computer networks from zero, grouped by subject (`Operating-Systems/`, `Databases/`, `Computer-Networks/`), plus end-to-end walkthroughs in `Scenarios/`. Pages in the suggested reading order have Previous / Next links, written by `scripts/update-prev-next.py`.
 
@@ -73,11 +73,11 @@ Operating systems, databases, and computer networks from zero, grouped by subjec
 | Track | Path | Pages |
 |-------|------|------:|
 | Hub | [`Docker-Kubernetes/docker-kubernetes.html`](Docker-Kubernetes/docker-kubernetes.html) | 1 |
-| Learn | [`Docker-Kubernetes/learn/`](Docker-Kubernetes/learn/) | 17 |
+| Learn | [`Docker-Kubernetes/learn/`](Docker-Kubernetes/learn/) | 18 |
 | Interview | [`Docker-Kubernetes/interview/`](Docker-Kubernetes/interview/) | 9 |
 | Cheat sheets | [`Docker-Kubernetes/cheatsheets/`](Docker-Kubernetes/cheatsheets/) | 3 |
 
-Docker, Kubernetes (architecture, workloads, scheduling, autoscaling, networking, storage, security, observability, GPUs, debugging broken pods), and DevOps/MLOps (`DevOps/`, including infrastructure as code). The learn pages have a suggested reading order with Previous / Next links.
+Docker, Kubernetes (architecture, workloads, scheduling, autoscaling, networking, storage, security, observability, GPUs, debugging broken pods, operators and custom resources), and DevOps/MLOps (`DevOps/`, including infrastructure as code). The learn pages have a suggested reading order with Previous / Next links.
 
 ### Graph Machine Learning
 

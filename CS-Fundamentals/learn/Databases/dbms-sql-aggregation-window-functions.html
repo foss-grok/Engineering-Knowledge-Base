@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../../assets/logo.svg" type="image/svg+xml">
+  <title>SQL Aggregation, GROUP BY &amp; Window Functions | CS Fundamentals</title>
+  <meta name="description" content="SQL summaries from zero on an 8-row table: COUNT, SUM and AVG with NULLs, GROUP BY drawn as buckets, WHERE vs HAVING and the order a query really runs in, window functions that keep every row, ROW_NUMBER vs RANK vs DENSE_RANK with ties, running totals, LAG and moving averages, the ROWS vs RANGE trap, top-N per group, hash vs sort aggregation, and a lab where a correlated subquery took 77 seconds and a window function took 34 ms.">
+  <link rel="stylesheet" href="../../../styles.css">
+</head>
+<body class="learn-page">
+
+<header>
+  <nav aria-label="Breadcrumb">
+    <p><a href="../../../index.html">Home</a> &rsaquo; <a href="../../cs-fundamentals.html">CS Fundamentals</a> &rsaquo; <a href="../cs-fundamentals-learn.html">Learn</a> &rsaquo; SQL Aggregation, GROUP BY &amp; Window Functions</p>
+  </nav>
+  <h1>SQL Aggregation, GROUP BY &amp; Window Functions</h1>
+  <p>Most questions people ask of data are summaries. "How much did each city sell?" "Who is our top customer?" "What was the running total by day?" "What was each customer's biggest order?" This page answers all of them on one tiny table you can check by hand, then shows how the database computes them and why one way of writing the same question can be 2,000 times slower than another. It builds on <a href="dbms-joins-execution.html">SQL Joins</a> and <a href="dbms-indexing-btrees-query-plans.html">Indexing &amp; Query Plans</a>.</p>
+</header>
+
+<nav class="article-toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#idea">The Idea: Many Rows In, Fewer Rows Out</a></li>
+    <li><a href="#words">Words You Need</a></li>
+    <li><a href="#table">The Sample Table</a></li>
+    <li><a href="#aggregates">Aggregate Functions and NULL</a></li>
+    <li><a href="#group-by">GROUP BY, Drawn as Buckets</a></li>
+    <li><a href="#having">WHERE vs HAVING, and the Real Order of a Query</a></li>
+    <li><a href="#windows">Window Functions: Keep Every Row</a></li>
+    <li><a href="#ranking">Ranking: ROW_NUMBER, RANK, DENSE_RANK</a></li>
+    <li><a href="#frames">Running Totals, LAG, and Frames</a></li>
+    <li><a href="#top-n">Top-N per Group</a></li>
+    <li><a href="#engine">How the Engine Computes It</a></li>
+    <li><a href="#lab">Lab: 77 Seconds vs 34 Milliseconds</a></li>
+    <li><a href="#real-world">Real-World Walkthroughs</a></li>
+    <li><a href="#pitfalls">Common Pitfalls</a></li>
+    <li><a href="#practice">Practice Problems</a></li>
+    <li><a href="#cheat-sheet">Cheat Sheet</a></li>
+  </ol>
+</nav>
+
+<main class="article">
+
+  <section id="idea">
+    <h2>1. The Idea: Many Rows In, Fewer Rows Out</h2>
+    <p>A table of orders may have millions of rows. A manager does not want to read them. They want a few numbers. SQL has two tools for that:</p>
+    <pre><code>GROUP BY (aggregation)                     window function
+many rows  -&gt;  one row per group           many rows  -&gt;  the SAME rows,
+                                                         each with an extra
+ Pune  300 \                                             column computed
+ Pune  200  \                                            from its group
+ Pune  700   &gt;  Pune  2300
+ Pune  400  /                               Pune 300 | Pune total 2300
+ Pune  700 /                                Pune 200 | Pune total 2300
+                                            Pune 700 | Pune total 2300
+ Delhi 500 \                                ...
+ Delhi 100  &gt;  Delhi  600
+ Delhi NULL/</code></pre>
+    <p><strong>GROUP BY squashes</strong> each group into one row. A <strong>window function keeps</strong> every row and adds a value computed over related rows. Most real reports need one or the other, and many need both.</p>
+  </section>
+
+  <section id="words">
+    <h2>2. Words You Need</h2>
+    <ul>
+      <li><strong>Aggregate function.</strong> A function that takes many values and returns one: <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code>.</li>
+      <li><strong>Group.</strong> A set of rows that share the same value in the <code>GROUP BY</code> columns.</li>
+      <li><strong>NULL.</strong> SQL's "unknown" or "missing" value. It is not zero and not an empty string.</li>
+      <li><strong>Window.</strong> The set of rows a window function looks at for the current row.</li>
+      <li><strong>Partition.</strong> A window function's version of a group: <code>PARTITION BY city</code> means "look only at rows with the same city". Unlike <code>GROUP BY</code>, rows are not squashed.</li>
+      <li><strong>Frame.</strong> A sliding part of the partition, like "from the first row up to this one" (for running totals) or "the 2 rows before this one and this one" (for moving averages).</li>
+      <li><strong>Correlated subquery.</strong> A query inside a query that uses a value from the outer row, so it runs again for every outer row.</li>
+    </ul>
+  </section>
+
+  <section id="table">
+    <h2>3. The Sample Table</h2>
+    <p>Every result on this page was produced by running the query in SQLite 3.46. The same SQL works in PostgreSQL and MySQL 8.</p>
+    <pre><code class="language-sql">CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, city TEXT,
+                    day TEXT, amount INTEGER, coupon TEXT);
+INSERT INTO orders VALUES
+(1,'asha','Pune', '2026-11-01',300,NULL),
+(2,'ben', 'Delhi','2026-11-01',500,'NEW10'),
+(3,'asha','Pune', '2026-11-02',200,NULL),
+(4,'chen','Pune', '2026-11-02',700,'NEW10'),
+(5,'ben', 'Delhi','2026-11-03',100,NULL),
+(6,'dev', 'Delhi','2026-11-03',NULL,NULL),
+(7,'asha','Pune', '2026-11-04',400,'BIG50'),
+(8,'chen','Pune', '2026-11-04',700,NULL);</code></pre>
+    <pre><code> id | customer | city  | day        | amount | coupon
+----+----------+-------+------------+--------+-------
+  1 | asha     | Pune  | 2026-11-01 |    300 | NULL
+  2 | ben      | Delhi | 2026-11-01 |    500 | NEW10
+  3 | asha     | Pune  | 2026-11-02 |    200 | NULL
+  4 | chen     | Pune  | 2026-11-02 |    700 | NEW10
+  5 | ben      | Delhi | 2026-11-03 |    100 | NULL
+  6 | dev      | Delhi | 2026-11-03 |   NULL | NULL     &lt;- amount unknown
+  7 | asha     | Pune  | 2026-11-04 |    400 | BIG50
+  8 | chen     | Pune  | 2026-11-04 |    700 | NULL</code></pre>
+    <p>Order 6 has no amount (maybe the payment is still pending). That one row will teach us most of the NULL rules.</p>
+  </section>
+
+  <section id="aggregates">
+    <h2>4. Aggregate Functions and NULL</h2>
+    <pre><code class="language-sql">SELECT COUNT(*), COUNT(amount), COUNT(coupon), SUM(amount), AVG(amount)
+FROM orders;</code></pre>
+    <pre><code>COUNT(*)  COUNT(amount)  COUNT(coupon)  SUM(amount)  AVG(amount)
+       8              7              3         2900     414.2857</code></pre>
+    <p>Read it slowly:</p>
+    <ul>
+      <li><code>COUNT(*)</code> counts <strong>rows</strong>: 8.</li>
+      <li><code>COUNT(amount)</code> counts <strong>non-NULL values</strong> in that column: 7, because order 6 is NULL.</li>
+      <li><code>COUNT(coupon)</code>: only 3 orders used a coupon.</li>
+      <li><code>SUM</code> skips NULLs: 300 + 500 + 200 + 700 + 100 + 400 + 700 = 2,900.</li>
+      <li><code>AVG</code> also skips NULLs: 2,900 / <strong>7</strong> = 414.29, not 2,900 / 8 = 362.5.</li>
+    </ul>
+    <div class="callout">
+      <p><strong>Rule.</strong> Every aggregate except <code>COUNT(*)</code> ignores NULLs. If a missing amount should count as 0, say so: <code>AVG(COALESCE(amount, 0))</code> gives 362.5. Neither answer is "right"; they answer different questions. Decide which one the report needs.</p>
+    </div>
+    <p>One more edge case: <code>SUM</code> over zero rows (or only NULLs) returns <strong>NULL</strong>, not 0. <code>COUNT</code> over zero rows returns 0. Wrap sums in <code>COALESCE(SUM(x), 0)</code> when a report must show 0.</p>
+  </section>
+
+  <section id="group-by">
+    <h2>5. GROUP BY, Drawn as Buckets</h2>
+    <pre><code class="language-sql">SELECT city, COUNT(*) AS orders, SUM(amount) AS total
+FROM orders
+GROUP BY city;</code></pre>
+    <p>Picture the database dropping each row into a bucket labeled with its city, then running the aggregates once per bucket:</p>
+    <pre><code>bucket "Delhi"           bucket "Pune"
+  id 2   500               id 1   300
+  id 5   100               id 3   200
+  id 6   NULL              id 4   700
+                           id 7   400
+                           id 8   700
+COUNT(*)  = 3            COUNT(*)  = 5
+SUM       = 600          SUM       = 2300</code></pre>
+    <pre><code>city   orders  total
+Delhi       3    600
+Pune        5   2300</code></pre>
+    <h3>The one rule of GROUP BY</h3>
+    <p>After grouping, each output row stands for a whole bucket. So every column in <code>SELECT</code> must be either <strong>in the GROUP BY</strong> (the same for the whole bucket) or <strong>inside an aggregate</strong> (one value computed from the bucket).</p>
+    <pre><code class="language-sql">-- Wrong: which customer should the "Pune" row show? asha or chen?
+SELECT city, customer, SUM(amount) FROM orders GROUP BY city;</code></pre>
+    <p>PostgreSQL rejects this with "column orders.customer must appear in the GROUP BY clause or be used in an aggregate function". SQLite and old MySQL settings quietly pick some row's value, which is worse: you get a random-looking answer with no error.</p>
+    <h3>NULL is a group too</h3>
+    <pre><code class="language-sql">SELECT coupon, COUNT(*) FROM orders GROUP BY coupon;</code></pre>
+    <pre><code>coupon  COUNT(*)
+NULL           5
+BIG50          1
+NEW10          2</code></pre>
+    <p>In <code>GROUP BY</code>, all NULLs go into one bucket. (This is different from joins, where NULL never equals NULL; see <a href="dbms-joins-execution.html#nulls">NULL keys do not match</a>.)</p>
+  </section>
+
+  <section id="having">
+    <h2>6. WHERE vs HAVING, and the Real Order of a Query</h2>
+    <p>"Which customers spent more than 600 in total?"</p>
+    <pre><code class="language-sql">SELECT customer, SUM(amount) AS total
+FROM orders
+GROUP BY customer
+HAVING SUM(amount) &gt; 600
+ORDER BY total DESC;</code></pre>
+    <pre><code>customer  total
+chen       1400
+asha        900</code></pre>
+    <p>Why <code>HAVING</code> and not <code>WHERE</code>? Because SQL does not run in the order you write it. It runs in this order:</p>
+    <pre><code>1. FROM / JOIN      which rows exist
+2. WHERE            keep or drop single ROWS       (no totals exist yet)
+3. GROUP BY         drop rows into buckets
+4. HAVING           keep or drop whole GROUPS      (totals exist now)
+5. SELECT           compute output columns, including window functions
+6. DISTINCT
+7. ORDER BY         sort (can use SELECT aliases like "total")
+8. LIMIT / OFFSET</code></pre>
+    <p><code>WHERE SUM(amount) &gt; 600</code> fails because at step 2 there are no sums yet. Use this order to answer most "why does this not work?" questions:</p>
+    <ul>
+      <li>You cannot use a <code>SELECT</code> alias in <code>WHERE</code> (aliases are made at step 5).</li>
+      <li>You <em>can</em> use it in <code>ORDER BY</code> (step 7).</li>
+      <li>You cannot filter on a window function in <code>WHERE</code> (windows are computed at step 5). Wrap the query and filter outside; section 10 shows how.</li>
+    </ul>
+    <p><strong>Speed tip:</strong> filter rows in <code>WHERE</code> whenever you can. <code>WHERE city = 'Pune'</code> throws rows away before grouping. <code>HAVING city = 'Pune'</code> gives the same answer but groups everything first.</p>
+  </section>
+
+  <section id="windows">
+    <h2>7. Window Functions: Keep Every Row</h2>
+    <p>"For each order, show the customer's total, and what percent of it this order is." With <code>GROUP BY</code> you would lose the individual orders. A window function keeps them:</p>
+    <pre><code class="language-sql">SELECT id, customer, amount,
+       SUM(amount) OVER (PARTITION BY customer) AS cust_total,
+       ROUND(100.0 * amount / SUM(amount) OVER (PARTITION BY customer), 1) AS pct
+FROM orders
+WHERE amount IS NOT NULL
+ORDER BY customer, id;</code></pre>
+    <pre><code>id  customer  amount  cust_total   pct
+ 1  asha         300         900  33.3
+ 3  asha         200         900  22.2
+ 7  asha         400         900  44.4
+ 2  ben          500         600  83.3
+ 5  ben          100         600  16.7
+ 4  chen         700        1400  50.0
+ 8  chen         700        1400  50.0</code></pre>
+    <p>How to read <code>SUM(amount) OVER (PARTITION BY customer)</code>: "for this row, sum <code>amount</code> over all rows with the same customer". Seven rows went in, seven rows came out. Asha's three orders each see her total of 900, and 300 / 900 = 33.3%.</p>
+    <p>The parts of <code>OVER (...)</code>:</p>
+    <pre><code>func(...) OVER ( PARTITION BY ...   which rows are "related" (like a group)
+                 ORDER BY ...       order inside the partition
+                 ROWS BETWEEN ... ) which slice of the partition (the frame)</code></pre>
+    <p>All three parts are optional. <code>OVER ()</code> with nothing inside means "all rows": <code>SUM(amount) OVER ()</code> puts the grand total 2,900 on every row.</p>
+  </section>
+
+  <section id="ranking">
+    <h2>8. Ranking: ROW_NUMBER, RANK, DENSE_RANK</h2>
+    <p>"Rank orders by size within each city." Pune has a tie: two orders of 700.</p>
+    <pre><code class="language-sql">SELECT id, city, amount,
+       ROW_NUMBER() OVER w AS rn,
+       RANK()       OVER w AS rnk,
+       DENSE_RANK() OVER w AS drnk
+FROM orders
+WHERE amount IS NOT NULL
+WINDOW w AS (PARTITION BY city ORDER BY amount DESC)
+ORDER BY city, rn;</code></pre>
+    <pre><code>id  city   amount  rn  rnk  drnk
+ 2  Delhi     500   1    1     1
+ 5  Delhi     100   2    2     2
+ 4  Pune      700   1    1     1
+ 8  Pune      700   2    1     1     &lt;- tie
+ 7  Pune      400   3    3     2
+ 1  Pune      300   4    4     3
+ 3  Pune      200   5    5     4</code></pre>
+    <table>
+      <thead><tr><th>Function</th><th>On a tie</th><th>Next number after a 2-way tie at 1</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><code>ROW_NUMBER</code></td><td>Breaks it (which one wins is arbitrary unless you add a tiebreaker column)</td><td>2</td><td>"Exactly one row per group", de-duplication</td></tr>
+        <tr><td><code>RANK</code></td><td>Same rank, then skips</td><td>3 (like a sports table: 1, 1, 3)</td><td>Competitions, "position"</td></tr>
+        <tr><td><code>DENSE_RANK</code></td><td>Same rank, no gaps</td><td>2</td><td>"Top 3 distinct amounts"</td></tr>
+      </tbody>
+    </table>
+    <p>The <code>WINDOW w AS (...)</code> clause just names a window so you do not repeat it. It works in PostgreSQL, MySQL 8 and SQLite.</p>
+  </section>
+
+  <section id="frames">
+    <h2>9. Running Totals, LAG, and Frames</h2>
+    <p>"Daily sales, a running total, and yesterday's number next to today's":</p>
+    <pre><code class="language-sql">SELECT day,
+       SUM(amount)                            AS daily,
+       SUM(SUM(amount)) OVER (ORDER BY day)   AS running,
+       LAG(SUM(amount)) OVER (ORDER BY day)   AS prev_day
+FROM orders
+GROUP BY day
+ORDER BY day;</code></pre>
+    <pre><code>day         daily  running  prev_day
+2026-11-01    800      800      NULL
+2026-11-02    900     1700       800
+2026-11-03    100     1800       900
+2026-11-04   1100     2900       100</code></pre>
+    <p>Three ideas in one query:</p>
+    <ul>
+      <li><code>SUM(SUM(amount))</code> looks odd but follows the query order. The inner <code>SUM</code> is the <code>GROUP BY</code> aggregate (one value per day). The outer <code>SUM ... OVER</code> is a window over those daily rows. Grouping happens first, then windows run over the grouped rows.</li>
+      <li><code>ORDER BY day</code> inside <code>OVER</code> turns a total into a <strong>running</strong> total: each row sums from the first day up to itself.</li>
+      <li><code>LAG(x)</code> reads <code>x</code> from the previous row in the window. <code>LEAD(x)</code> reads the next row. The first row has no previous row, so <code>LAG</code> gives NULL. Day-over-day change is <code>daily - LAG(daily)</code>.</li>
+    </ul>
+    <p>Note 2026-11-03: the daily sum is 100, because order 6's NULL is skipped.</p>
+
+    <h3>9.1 Moving averages with ROWS</h3>
+    <pre><code class="language-sql">SELECT id, amount,
+       AVG(amount) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS avg3
+FROM orders WHERE amount IS NOT NULL;</code></pre>
+    <pre><code>id  amount   avg3
+ 1     300  300.0        only 1 row so far
+ 2     500  400.0        (300+500)/2
+ 3     200  333.3        (300+500+200)/3
+ 4     700  466.7        (500+200+700)/3
+ 5     100  333.3        (200+700+100)/3
+ 7     400  400.0        (700+100+400)/3
+ 8     700  400.0        (100+400+700)/3</code></pre>
+    <p><code>ROWS BETWEEN 2 PRECEDING AND CURRENT ROW</code> means "this row and the 2 before it". The window slides one row at a time. Near the start there are fewer rows, so the first two averages use 1 and 2 rows.</p>
+
+    <h3>9.2 The ROWS vs RANGE trap</h3>
+    <p>When you write <code>ORDER BY</code> in a window and no frame, SQL uses a default frame: <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. <strong>RANGE</strong> means "all rows whose ORDER BY value is up to mine, <em>including ties</em>". On raw orders (not grouped by day), two orders share each day:</p>
+    <pre><code class="language-sql">SELECT id, day, amount,
+       SUM(amount) OVER (ORDER BY day)                      AS range_default,
+       SUM(amount) OVER (ORDER BY day ROWS UNBOUNDED PRECEDING) AS rows_frame
+FROM orders WHERE amount IS NOT NULL ORDER BY id;</code></pre>
+    <pre><code>id  day         amount  range_default  rows_frame
+ 1  2026-11-01     300            800         300
+ 2  2026-11-01     500            800         800
+ 3  2026-11-02     200           1700        1000
+ 4  2026-11-02     700           1700        1700
+ 5  2026-11-03     100           1800        1800
+ 7  2026-11-04     400           2900        2200
+ 8  2026-11-04     700           2900        2900</code></pre>
+    <p>With the default, both orders on 11-01 show 800, because ties are included together. With <code>ROWS</code>, the total grows one row at a time. Neither is a bug, but many "my running total is wrong" questions are this. If you want a strict row-by-row running total, write <code>ROWS UNBOUNDED PRECEDING</code> and give a unique tiebreaker: <code>ORDER BY day, id</code>.</p>
+  </section>
+
+  <section id="top-n">
+    <h2>10. Top-N per Group</h2>
+    <p>"Each customer's single biggest order." This is one of the most common real queries (latest status per order, newest version per document, best score per player). Rank inside each group, then keep rank 1:</p>
+    <pre><code class="language-sql">SELECT *
+FROM (
+  SELECT customer, id, amount,
+         ROW_NUMBER() OVER (PARTITION BY customer
+                            ORDER BY amount DESC, id) AS rn
+  FROM orders
+  WHERE amount IS NOT NULL
+) ranked
+WHERE rn = 1;</code></pre>
+    <pre><code>customer  id  amount  rn
+asha       7     400   1
+ben        2     500   1
+chen       4     700   1</code></pre>
+    <p>Step by step:</p>
+    <ol>
+      <li>The inner query numbers each customer's orders from biggest to smallest.</li>
+      <li>Chen has a tie (orders 4 and 8, both 700). The extra <code>id</code> in <code>ORDER BY</code> breaks it the same way every time, so order 4 always wins. Without a tiebreaker, the winner could change between runs.</li>
+      <li>The outer query keeps <code>rn = 1</code>. The filter must be outside, because window functions do not exist yet at the <code>WHERE</code> step (section 6).</li>
+    </ol>
+    <p>For "top 3 per group" change it to <code>rn &lt;= 3</code>. Use <code>RANK</code> instead if ties should all be kept. PostgreSQL also has a shortcut for "one row per group": <code>SELECT DISTINCT ON (customer) ... ORDER BY customer, amount DESC</code>.</p>
+  </section>
+
+  <section id="engine">
+    <h2>11. How the Engine Computes It</h2>
+    <p>A database has two main ways to do <code>GROUP BY</code>. They are the same two ideas you saw for joins.</p>
+    <h3>Hash aggregation</h3>
+    <pre><code>read each row once:
+  key = city
+  look up key in a hash table; if missing, add {count:0, sum:0}
+  update count and sum
+
+rows:  (Pune,300) (Delhi,500) (Pune,200) (Pune,700) ...
+table: Pune  -&gt; {count 1, sum 300}
+       Delhi -&gt; {count 1, sum 500}
+       Pune  -&gt; {count 2, sum 500}  ...</code></pre>
+    <p>One pass over the data, memory proportional to the number of <em>groups</em> (not rows). Great when there are few groups. If there are too many groups to fit in memory, the engine spills to disk, which is slower. In PostgreSQL the plan node is called <code>HashAggregate</code>, and its memory budget is <code>work_mem</code>.</p>
+    <h3>Sort (group) aggregation</h3>
+    <pre><code>sort rows by city:  Delhi 500, Delhi 100, Delhi NULL, Pune 300, Pune 200, ...
+walk the sorted list; when the city changes, output the finished group</code></pre>
+    <p>Sorting costs more (about n log n), but if the rows already come out of an index in order, there is no sort at all, and the engine can stream groups out one by one. PostgreSQL calls this <code>GroupAggregate</code>. In our SQLite lab, adding an index on <code>(customer, amount)</code> changed the plan from <code>USE TEMP B-TREE FOR GROUP BY</code> (sort into a temporary structure) to <code>SCAN big USING COVERING INDEX big_cust</code> (read the index in order, no sort).</p>
+    <h3>Window functions</h3>
+    <p>A window function needs rows grouped by the <code>PARTITION BY</code> columns and ordered by the window's <code>ORDER BY</code>. So the engine sorts by <code>(partition columns, order columns)</code>, then walks the sorted rows once, keeping a small running state (a counter for <code>ROW_NUMBER</code>, a running sum, the previous row for <code>LAG</code>). PostgreSQL shows this as a <code>Sort</code> under a <code>WindowAgg</code> node. An index that already matches that order removes the sort.</p>
+  </section>
+
+  <section id="lab">
+    <h2>12. Lab: 77 Seconds vs 34 Milliseconds</h2>
+    <p>We made a table with 50,000 random orders for 2,000 customers and asked one question three ways: "how many orders are their customer's biggest order?" (that is, top-1 per group, counting ties).</p>
+    <pre><code class="language-sql">-- A: correlated subquery
+SELECT COUNT(*) FROM big b
+WHERE amount = (SELECT MAX(amount) FROM big b2 WHERE b2.customer = b.customer);
+
+-- B: window function
+SELECT COUNT(*) FROM (
+  SELECT amount, MAX(amount) OVER (PARTITION BY customer) AS m FROM big
+) WHERE amount = m;
+
+-- C: GROUP BY, then join back
+SELECT COUNT(*) FROM big b
+JOIN (SELECT customer, MAX(amount) AS m FROM big GROUP BY customer) g
+  ON g.customer = b.customer AND b.amount = g.m;</code></pre>
+    <table>
+      <thead><tr><th>Query</th><th>No index</th><th>With index on (customer, amount)</th><th>Rows</th></tr></thead>
+      <tbody>
+        <tr><td>A: correlated subquery</td><td><strong>77,484 ms</strong></td><td>17.6 ms</td><td>2,023</td></tr>
+        <tr><td>B: window function</td><td><strong>34 ms</strong></td><td>15.2 ms</td><td>2,023</td></tr>
+        <tr><td>C: GROUP BY + join</td><td>32 ms</td><td>3.6 ms</td><td>2,023</td></tr>
+      </tbody>
+    </table>
+    <p>All three return the same 2,023 rows (a little more than 2,000 customers' worth, because of ties). The times are wildly different:</p>
+    <ul>
+      <li><strong>A without an index</strong> runs the inner query once for each of the 50,000 outer rows, and each run scans all 50,000 rows: 50,000 &times; 50,000 = 2.5 billion row visits. That is 77 seconds, about 2,300 times slower than B.</li>
+      <li><strong>B and C</strong> read the table a small, fixed number of times (one sort or one hash pass), so they finish in tens of milliseconds even with no index.</li>
+      <li><strong>With the index</strong>, A becomes 50,000 quick index lookups, and everything is fast. C wins because the index already holds rows sorted by customer and amount, so the <code>MAX</code> per customer is just "read the last entry".</li>
+    </ul>
+    <div class="callout">
+      <p><strong>The headline.</strong> A correlated subquery hides a loop. With a supporting index it can be fine. Without one, it is a nested loop over the whole table, and it gets 4 times slower every time the table doubles. Window functions and GROUP BY read the data once. When a report query suddenly takes minutes, look for a subquery that mentions the outer table.</p>
+    </div>
+  </section>
+
+  <section id="real-world">
+    <h2>13. Real-World Walkthroughs</h2>
+    <h3>13.1 Daily active users</h3>
+    <p>Table <code>events(user_id, ts)</code>. "How many different users were active each day?"</p>
+    <pre><code class="language-sql">SELECT DATE(ts) AS day, COUNT(DISTINCT user_id) AS dau
+FROM events
+GROUP BY DATE(ts)
+ORDER BY day;</code></pre>
+    <p><code>COUNT(DISTINCT x)</code> counts unique values. <code>COUNT(user_id)</code> would count events, so one busy user with 500 clicks would count as 500 "users".</p>
+    <h3>13.2 Remove duplicate rows, keep the newest</h3>
+    <p>A sync job inserted some customers twice. Keep the newest row per email:</p>
+    <pre><code class="language-sql">DELETE FROM customers
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY email ORDER BY updated_at DESC, id DESC) AS rn
+    FROM customers
+  ) t
+  WHERE rn &gt; 1
+);</code></pre>
+    <p>Run the inner <code>SELECT</code> first and look at the rows it would delete. Then run the <code>DELETE</code> inside a transaction, check the count, and commit. Then add a unique index on <code>email</code> so it cannot happen again (see <a href="dbms-normalization-schema-design.html">schema design</a>).</p>
+    <h3>13.3 Percent change week over week</h3>
+    <pre><code class="language-sql">WITH weekly AS (
+  SELECT DATE_TRUNC('week', ts) AS week, SUM(amount) AS revenue   -- PostgreSQL
+  FROM payments GROUP BY 1
+)
+SELECT week, revenue,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY week))
+             / NULLIF(LAG(revenue) OVER (ORDER BY week), 0), 1) AS pct_change
+FROM weekly ORDER BY week;</code></pre>
+    <p><code>WITH ... AS</code> (a <strong>CTE</strong>, common table expression) names a sub-result so the main query reads cleanly. <code>NULLIF(x, 0)</code> turns 0 into NULL, so a week with zero revenue gives NULL instead of a divide-by-zero error.</p>
+    <h3>13.4 The fan-out trap in a dashboard</h3>
+    <p>A dashboard showed revenue per customer twice as high as finance's number. The query was:</p>
+    <pre><code class="language-sql">SELECT c.name, SUM(o.amount)
+FROM customers c
+JOIN orders o   ON o.customer_id = c.id
+JOIN tickets t  ON t.customer_id = c.id     -- added later for a "tickets" column
+GROUP BY c.name;</code></pre>
+    <p>A customer with 3 orders and 2 support tickets produces 3 &times; 2 = 6 joined rows, so each order is summed twice. The fix is to aggregate each table <em>before</em> joining:</p>
+    <pre><code class="language-sql">SELECT c.name, o.revenue, t.tickets
+FROM customers c
+LEFT JOIN (SELECT customer_id, SUM(amount) AS revenue FROM orders  GROUP BY customer_id) o ON o.customer_id = c.id
+LEFT JOIN (SELECT customer_id, COUNT(*)    AS tickets FROM tickets GROUP BY customer_id) t ON t.customer_id = c.id;</code></pre>
+    <p>The <a href="dbms-joins-execution.html">joins page</a> explains why many-to-many joins multiply rows.</p>
+  </section>
+
+  <section id="pitfalls">
+    <h2>14. Common Pitfalls</h2>
+    <ul>
+      <li><strong>Forgetting that AVG skips NULLs.</strong> Decide whether missing means "unknown" (skip) or "zero" (<code>COALESCE</code>).</li>
+      <li><strong>Integer division.</strong> In PostgreSQL, <code>SUM(int_col) / COUNT(*)</code> is integer division: 7 / 2 = 3. Multiply by <code>100.0</code> or cast to <code>numeric</code> first.</li>
+      <li><strong>Selecting a column that is not grouped.</strong> Some databases allow it and return an arbitrary value.</li>
+      <li><strong>Filtering a window function in WHERE.</strong> It does not exist yet at that step. Wrap the query.</li>
+      <li><strong>ROW_NUMBER without a tiebreaker.</strong> Results can change between runs. Add a unique column to the window's <code>ORDER BY</code>.</li>
+      <li><strong>The default RANGE frame.</strong> Ties are included together in running totals. Use <code>ROWS</code> for row-by-row.</li>
+      <li><strong>Joining before aggregating.</strong> Two one-to-many joins multiply rows and inflate sums.</li>
+      <li><strong>COUNT(col) when you meant COUNT(*).</strong> They differ whenever the column has NULLs.</li>
+      <li><strong>A correlated subquery with no index.</strong> It is a hidden nested loop: 77 seconds in our lab.</li>
+    </ul>
+  </section>
+
+  <section id="practice">
+    <h2>15. Practice Problems</h2>
+    <p>Use the 8-row <code>orders</code> table from section 3 for problems 1 to 4.</p>
+    <h3>Problem 1</h3>
+    <p>What does <code>SELECT city, AVG(amount), AVG(COALESCE(amount,0)) FROM orders GROUP BY city</code> return for Delhi?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>Delhi has 500, 100 and NULL. <code>AVG(amount)</code> = (500 + 100) / 2 = <strong>300</strong>. <code>AVG(COALESCE(amount,0))</code> = (500 + 100 + 0) / 3 = <strong>200</strong>.</p>
+    </details>
+    <h3>Problem 2</h3>
+    <p>Write a query for "cities with at least 4 orders that have a known amount".</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code class="language-sql">SELECT city, COUNT(amount) AS n
+FROM orders
+GROUP BY city
+HAVING COUNT(amount) &gt;= 4;</code></pre>
+      <p>Only Pune (5). Delhi has 2 known amounts. <code>COUNT(amount)</code> skips order 6; <code>COUNT(*)</code> would have counted it.</p>
+    </details>
+    <h3>Problem 3</h3>
+    <p>For each order with a known amount, show <code>amount - AVG(amount)</code> over the same city. What is the value for order 1?</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code class="language-sql">SELECT id, amount - AVG(amount) OVER (PARTITION BY city) AS diff
+FROM orders WHERE amount IS NOT NULL;</code></pre>
+      <p>Pune's average is 2,300 / 5 = 460. Order 1: 300 - 460 = <strong>-160</strong>.</p>
+    </details>
+    <h3>Problem 4</h3>
+    <p>Give <code>ROW_NUMBER</code>, <code>RANK</code> and <code>DENSE_RANK</code> for the amounts 900, 700, 700, 700, 500 sorted from high to low.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>amount  ROW_NUMBER  RANK  DENSE_RANK
+   900           1     1           1
+   700           2     2           2
+   700           3     2           2
+   700           4     2           2
+   500           5     5           3</code></pre>
+    </details>
+    <h3>Problem 5</h3>
+    <p>Table <code>logins(user_id, ts)</code>. Find users whose time between two logins in a row was ever more than 30 days. Use <code>LAG</code>.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code class="language-sql">SELECT DISTINCT user_id
+FROM (
+  SELECT user_id, ts,
+         LAG(ts) OVER (PARTITION BY user_id ORDER BY ts) AS prev_ts
+  FROM logins
+) t
+WHERE ts - prev_ts &gt; INTERVAL '30 days';   -- PostgreSQL</code></pre>
+      <p>Partition by user so <code>LAG</code> never reads another user's login. The first login of each user has <code>prev_ts</code> NULL, and the comparison with NULL is not true, so it is dropped.</p>
+    </details>
+    <h3>Problem 6</h3>
+    <p>A report runs <code>WHERE price &gt; (SELECT AVG(price) FROM products p2 WHERE p2.category = p.category)</code> on 200,000 products and takes minutes. Rewrite it.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code class="language-sql">SELECT * FROM (
+  SELECT p.*, AVG(price) OVER (PARTITION BY category) AS cat_avg
+  FROM products p
+) t
+WHERE price &gt; cat_avg;</code></pre>
+      <p>One sort by category and one pass, instead of re-running an average for every product. An index on <code>(category, price)</code> would also make the original fast, but the window version is fast with or without it.</p>
+    </details>
+  </section>
+
+  <section id="cheat-sheet">
+    <h2>16. Cheat Sheet</h2>
+    <pre><code># query order
+FROM -&gt; WHERE -&gt; GROUP BY -&gt; HAVING -&gt; SELECT (windows) -&gt; DISTINCT -&gt; ORDER BY -&gt; LIMIT
+
+# NULL rules
+COUNT(*) counts rows; every other aggregate skips NULL
+SUM of no rows = NULL  -&gt;  COALESCE(SUM(x), 0)
+GROUP BY puts all NULLs in one group
+
+# GROUP BY rule
+every SELECT column is grouped or aggregated
+
+# window shapes
+SUM(x) OVER (PARTITION BY g)                       group total on every row
+SUM(x) OVER (ORDER BY t ROWS UNBOUNDED PRECEDING)  running total, row by row
+AVG(x) OVER (ORDER BY t ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)  7-row moving avg
+LAG(x) / LEAD(x) OVER (PARTITION BY g ORDER BY t)  previous / next row
+
+# ranking with ties 700,700,500
+ROW_NUMBER 1,2,3   RANK 1,1,3   DENSE_RANK 1,1,2
+
+# top-N per group
+SELECT * FROM (SELECT ..., ROW_NUMBER() OVER (PARTITION BY g ORDER BY x DESC, id) rn
+               FROM t) s WHERE rn &lt;= N
+
+# engine
+HashAggregate   one pass, memory per group (work_mem)
+GroupAggregate  needs sorted input (or a matching index)
+WindowAgg       sort by (partition, order), then one pass</code></pre>
+    <p class="refer-link"><small>Refer: <a href="https://www.postgresql.org/docs/current/tutorial-window.html" rel="noopener noreferrer">PostgreSQL tutorial: Window functions</a> &middot; <a href="https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS" rel="noopener noreferrer">PostgreSQL: Window function calls and frames</a> &middot; <a href="https://www.postgresql.org/docs/current/functions-aggregate.html" rel="noopener noreferrer">PostgreSQL: Aggregate functions</a> &middot; <a href="https://www.sqlite.org/windowfunctions.html" rel="noopener noreferrer">SQLite: Window functions</a> &middot; <a href="https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html" rel="noopener noreferrer">MySQL 8: Window function concepts</a></small></p>
+  </section>
+
+  <!-- prev-next:start -->
+  <nav class="prev-next" aria-label="Reading order">
+    <a class="prev-next-prev" href="dbms-joins-execution.html" rel="prev"><span class="prev-next-label">&larr; Previous</span><span class="prev-next-title">SQL Joins &amp; How the Database Executes Them</span></a>
+    <a class="prev-next-next" href="dbms-replication-sharding-cap.html" rel="next"><span class="prev-next-label">Next &rarr;</span><span class="prev-next-title">Replication, Sharding &amp; the CAP Theorem</span></a>
+    <p class="prev-next-step">Page 13 of 27 in the suggested reading order</p>
+  </nav>
+  <!-- prev-next:end -->
+
+  <nav class="page-footer-nav">
+    <p>Related: <a href="dbms-joins-execution.html">SQL Joins &amp; How the Database Executes Them</a> &middot; <a href="dbms-indexing-btrees-query-plans.html">Indexing, B+ Trees &amp; Query Plans</a> &middot; <a href="dbms-normalization-schema-design.html">Normalization &amp; Schema Design</a> &middot; <a href="../Scenarios/scenario-slow-api-debugging.html">Scenario: Debugging a Slow API</a></p>
+    <p><a href="../cs-fundamentals-learn.html">Back to CS Fundamentals Learn</a></p>
+  </nav>
+</main>
+
+<footer>
+  <p><small><a href="../../cs-fundamentals.html">Back to CS Fundamentals</a> &middot; <a href="../../../index.html">Home</a></small></p>
+</footer>
+
+<script src="../../../assets/site.js"></script>
+<script src="../../../assets/search.js" defer></script>
+</body>
+</html>

@@ -112,6 +112,9 @@
     <loc>https://engineering.msaqlain.com/AI%20Engineer/learn/Foundations-and-Architecture/ai-engineering-trees-ensembles.html</loc>
   </url>
   <url>
+    <loc>https://engineering.msaqlain.com/AI%20Engineer/learn/Foundations-and-Architecture/ai-engineering-unsupervised-learning.html</loc>
+  </url>
+  <url>
     <loc>https://engineering.msaqlain.com/AI%20Engineer/learn/Frameworks/ai-engineering-frameworks-langchain.html</loc>
   </url>
   <url>
@@ -223,6 +226,9 @@
     <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Databases/dbms-replication-sharding-cap.html</loc>
   </url>
   <url>
+    <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Databases/dbms-sql-aggregation-window-functions.html</loc>
+  </url>
+  <url>
     <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Databases/dbms-transactions-isolation-mvcc.html</loc>
   </url>
   <url>
@@ -238,6 +244,9 @@
     <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Operating-Systems/os-io-models-event-loops.html</loc>
   </url>
   <url>
+    <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Operating-Systems/os-memory-allocation-gc.html</loc>
+  </url>
+  <url>
     <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Operating-Systems/os-processes-threads-scheduling.html</loc>
   </url>
   <url>
@@ -248,6 +257,9 @@
   </url>
   <url>
     <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Scenarios/scenario-database-lock-waits.html</loc>
+  </url>
+  <url>
+    <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Scenarios/scenario-disk-full.html</loc>
   </url>
   <url>
     <loc>https://engineering.msaqlain.com/CS-Fundamentals/learn/Scenarios/scenario-errors-during-deploys.html</loc>
@@ -350,6 +362,9 @@
   </url>
   <url>
     <loc>https://engineering.msaqlain.com/Docker-Kubernetes/learn/Kubernetes/kubernetes-networking.html</loc>
+  </url>
+  <url>
+    <loc>https://engineering.msaqlain.com/Docker-Kubernetes/learn/Kubernetes/kubernetes-operators-crds.html</loc>
   </url>
   <url>
     <loc>https://engineering.msaqlain.com/Docker-Kubernetes/learn/Kubernetes/kubernetes-scheduling.html</loc>
